@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""SRR external ingest strategy: a YouTube channel's Atom feed -> SRR items.
+
+YouTube already serves a valid Atom feed, but #rss leaves the body empty because
+the description/thumbnail live one level down inside <media:group>. This command
+fetches that feed and synthesizes a clickable-thumbnail + description body that
+survives #sanitize (no <iframe>; img src / a href are allowlisted).
+
+Subscribe with the channel's Atom URL, e.g.:
+  srrb chan add -t "Veritasium" \
+    -u "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA" \
+    -i "srr-youtube"
+"""
+import sys, json, html, urllib.request, urllib.error
+import xml.etree.ElementTree as ET
+
+NS = {
+    "a":  "http://www.w3.org/2005/Atom",
+    "m":  "http://search.yahoo.com/mrss/",
+    "yt": "http://www.youtube.com/xml/schemas/2015",
+}
+
+
+def fnv1a32(s: str) -> int:
+    h = 0x811C9DC5
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+req = json.load(sys.stdin)            # {"url","etag","last_modified","max_size","asset_dir"}
+# asset_dir is deliberately unused: thumbnails (like the videos themselves) stay
+# hotlinked at their original i.ytimg.com URLs — this strategy downloads nothing
+# but the feed XML, and the store hosts no assets for it.
+
+hdr = {"User-Agent": "SRR-youtube"}
+if req.get("etag"):
+    hdr["If-None-Match"] = req["etag"]
+if req.get("last_modified"):
+    hdr["If-Modified-Since"] = req["last_modified"]
+
+try:
+    r = urllib.request.urlopen(urllib.request.Request(req["url"], headers=hdr))
+except urllib.error.HTTPError as e:
+    if e.code == 304:                 # nothing new since our cursor
+        json.dump({"not_modified": True}, sys.stdout)
+        sys.exit(0)
+    raise
+
+body = r.read(req.get("max_size") or 8_000_000)
+
+
+# Thumbnail quality ladder: the Atom feed always declares hqdefault.jpg (480x360),
+# but most videos have larger variants on the same CDN. Probe with HEAD requests
+# (zero image bytes — thumbnails stay hotlinked, never downloaded) and keep the
+# first that exists; a 404 means the uploader never provided that size. Any other
+# failure (timeout, DNS) latches probing off for the rest of the run so a CDN
+# hiccup degrades quality once instead of stalling on every item.
+THUMB_VARIANTS = ("maxresdefault", "sddefault")   # 1280x720, 640x480
+probing = True
+
+
+def best_thumb(vid: str, feed_url: str) -> str:
+    global probing
+    for v in THUMB_VARIANTS:
+        if not probing or not vid:
+            break
+        u = f"https://i.ytimg.com/vi/{vid}/{v}.jpg"
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(u, method="HEAD", headers={"User-Agent": "SRR-youtube"}),
+                timeout=5)
+            return u
+        except urllib.error.HTTPError:
+            continue          # this size doesn't exist for this video
+        except OSError:
+            probing = False   # network trouble, not a missing size
+    return feed_url
+
+
+items = []
+for e in ET.fromstring(body).findall("a:entry", NS):
+    vid = e.findtext("yt:videoId", "", NS)
+    title = e.findtext("a:title", "", NS)
+    pub = e.findtext("a:published", None, NS)     # already RFC 3339
+    watch = f"https://www.youtube.com/watch?v={vid}"
+    g = e.find("m:group", NS)
+    tnode = g.find("m:thumbnail", NS) if g is not None else None
+    thumb = best_thumb(vid, tnode.get("url") or "") if tnode is not None else ""
+    desc = g.findtext("m:description", "", NS) if g is not None else ""
+
+    content = (
+        f'<p><a href="{html.escape(watch)}">'
+        f'<img src="{html.escape(thumb)}" alt="{html.escape(title)}"></a></p>'
+        f'<p>{html.escape(desc).replace(chr(10), "<br>")}</p>'
+    )
+    items.append({
+        "guid": fnv1a32(vid or watch),            # stable per-video dedup key
+        "title": title,
+        "content": content,
+        "link": watch,
+        "published": pub,
+    })
+
+json.dump({
+    "items": items,
+    "etag": r.headers.get("ETag", ""),
+    "last_modified": r.headers.get("Last-Modified", ""),
+}, sys.stdout)

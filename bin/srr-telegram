@@ -1,0 +1,435 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "telethon>=1.43,<2",
+#     "cryptg>=0.4",
+# ]
+# ///
+"""SRR external ingest strategy: a Telegram channel (incl. PRIVATE) -> SRR items.
+
+Reads a private/public Telegram channel via MTProto (your own user account, the
+Telethon library) and turns each message — or each album — into an SRR article,
+self-hosting its photos and videos into the SRR store.
+
+Dependencies are declared inline (PEP 723) and managed by `uv`: the shebang runs
+the script via `uv run --script`, which resolves Telethon + cryptg into a cached
+environment on first run (see uv.lock for the pinned versions). `uv` must be on
+PATH — including the PATH of whatever runs the SRR fetch loop.
+
+Why a user account and not a bot: a bot can only see channels it has been added
+to (as admin), can't read history before it joined, and the Bot API caps media
+downloads at ~20 MB. A user session reads any channel/group YOU are a member of
+and downloads media of any size.
+
+ONE-TIME SETUP
+--------------
+1. Install uv (https://docs.astral.sh/uv/) if it isn't already.
+2. Get an API id + hash from https://my.telegram.org  ->  "API development tools".
+3. Mint a login session (interactive: phone number, login code, optional 2FA):
+
+     export SRR_TG_API_ID=1234567
+     export SRR_TG_API_HASH=0123456789abcdef0123456789abcdef
+     srr-telegram login            # prints a StringSession + the env lines to keep
+
+   Save the three SRR_TG_* values where the SRR fetch loop can see them (e.g. the
+   srrb-prod-fetch service environment, or an env file it sources). The session
+   string is a credential — treat it like a password.
+
+SUBSCRIBE A CHANNEL
+-------------------
+The channel's SRR `url` is any of: a private link `https://t.me/c/<id>` (open the
+channel in Telegram Web/Desktop to read the id off the URL), a public
+`https://t.me/<username>` / `@username`, an invite link `https://t.me/+<hash>`
+(you must already be a member), or a bare numeric id (`-100…`).
+
+     srrb chan add -t "My private channel" \
+       -u "https://t.me/c/1234567890" \
+       -i "srr-telegram"
+
+Preview without deploying (media is NOT downloaded in preview — placeholders shown):
+     SRR_TG_API_ID=… SRR_TG_API_HASH=… SRR_TG_SESSION=… \
+       srrb preview "https://t.me/c/1234567890" -i "srr-telegram" -a 127.0.0.1:8098
+
+ENVIRONMENT
+-----------
+  SRR_TG_API_ID        (required) numeric API id from my.telegram.org
+  SRR_TG_API_HASH      (required) API hash from my.telegram.org
+  SRR_TG_SESSION       StringSession string from `srr-telegram login`
+  SRR_TG_SESSION_FILE  alternative: path to a file holding that string
+  SRR_TG_BACKFILL      first-run: how many recent messages to ingest (default 20)
+  SRR_TG_MAX_BATCH     max messages (albums count as members) per fetch (default 200)
+  SRR_TG_INCLUDE_DOCS  "true" to also self-host non-image/video documents as links
+
+The media size cap is NOT configured here: srrb sends its --max-asset-size as the
+per-request max_asset_size, and media over that is skipped with a "[… skipped: too
+large]" note in place of it. Keeping one cap (srrb's) avoids two drifting apart.
+
+This is protocol boilerplate around Telethon; the SRR external-ingest contract is
+documented in ~/ws/srr/backend/README.md (Ingest Strategies).
+"""
+import asyncio
+import html as htmllib
+import json
+import os
+import re
+import sys
+
+try:
+    from telethon import TelegramClient
+    from telethon.errors import FloodWaitError
+    from telethon.sessions import StringSession
+    from telethon.tl import functions, types
+except ModuleNotFoundError:
+    sys.exit("srr-telegram: Telethon not available — run this script via `uv run` "
+             "(its shebang does this) so the inline PEP 723 dependencies are "
+             "installed; do not invoke it with a bare `python3`.")
+
+VERSION = "1.0"
+
+
+# --- config -----------------------------------------------------------------
+
+def env_int(name, default):
+    v = (os.environ.get(name) or "").strip()
+    return int(v) if v else default
+
+
+def env_bool(name):
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+BACKFILL = env_int("SRR_TG_BACKFILL", 20)
+MAX_BATCH = env_int("SRR_TG_MAX_BATCH", 200)
+INCLUDE_DOCS = env_bool("SRR_TG_INCLUDE_DOCS")
+
+
+def fnv1a32(s: str) -> int:
+    h = 0x811C9DC5
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def log(*a):
+    print("srr-telegram:", *a, file=sys.stderr)
+
+
+def credentials():
+    api_id = (os.environ.get("SRR_TG_API_ID") or "").strip()
+    api_hash = (os.environ.get("SRR_TG_API_HASH") or "").strip()
+    if not api_id or not api_hash:
+        sys.exit("srr-telegram: SRR_TG_API_ID and SRR_TG_API_HASH must be set "
+                 "(get them from https://my.telegram.org)")
+    return int(api_id), api_hash
+
+
+def load_session():
+    s = (os.environ.get("SRR_TG_SESSION") or "").strip()
+    if s:
+        return s
+    path = (os.environ.get("SRR_TG_SESSION_FILE") or "").strip()
+    if path and os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    sys.exit("srr-telegram: no session — set SRR_TG_SESSION (or SRR_TG_SESSION_FILE) "
+             "from the output of `srr-telegram login`")
+
+
+# --- entity resolution ------------------------------------------------------
+
+def short_channel_id(marked: int) -> int:
+    """Telethon PeerChannel wants the bare channel id, not the -100… peer id."""
+    s = str(marked)
+    if s.startswith("-100"):
+        return int(s[4:])
+    return abs(marked)
+
+
+async def channel_by_id(client, short_id):
+    peer = types.PeerChannel(short_id)
+    try:
+        return await client.get_entity(peer)
+    except (ValueError, TypeError):
+        # access_hash not cached yet — refresh the dialog list once (this caches
+        # every channel we're a member of) and retry.
+        await client.get_dialogs()
+        return await client.get_entity(peer)
+
+
+async def channel_by_invite(client, invite_hash):
+    res = await client(functions.messages.CheckChatInviteRequest(invite_hash))
+    chat = getattr(res, "chat", None)
+    if chat is None:
+        sys.exit("srr-telegram: not a member of that invite link — join the "
+                 "channel in Telegram first, then re-fetch")
+    return chat
+
+
+async def resolve_entity(client, url):
+    u = (url or "").strip()
+    m = re.match(r"^(?:https?://)?(?:t|telegram)\.me/(.+)$", u, re.I)
+    if m:
+        path = m.group(1)
+        if path.startswith("c/"):
+            return await channel_by_id(client, int(path.split("/")[1]))
+        if path.startswith("s/"):
+            path = path[2:]
+        if path.startswith("+"):
+            return await channel_by_invite(client, path[1:].split("/")[0])
+        if path.startswith("joinchat/"):
+            return await channel_by_invite(client, path.split("/", 1)[1].split("/")[0])
+        username = path.split("/")[0].split("?")[0]
+        return await client.get_entity(username)
+    if u.startswith("@"):
+        return await client.get_entity(u)
+    if re.match(r"^-?\d+$", u):
+        n = int(u)
+        if str(n).startswith("-100"):
+            return await channel_by_id(client, short_channel_id(n))
+        return await client.get_entity(n)
+    return await client.get_entity(u)
+
+
+# --- content building -------------------------------------------------------
+
+URL_RE = re.compile(r'(https?://[^\s<>"]+)')
+
+
+PARA_SPLIT_RE = re.compile(r"\n[ \t]*\n+")
+
+
+def linkify_escape(text):
+    """HTML-escape text and turn bare URLs into <a> links. Newlines preserved."""
+    out, pos = [], 0
+    for m in URL_RE.finditer(text):
+        out.append(htmllib.escape(text[pos:m.start()]))
+        link = m.group(1)
+        out.append('<a href="%s">%s</a>' % (htmllib.escape(link, quote=True),
+                                             htmllib.escape(link)))
+        pos = m.end()
+    out.append(htmllib.escape(text[pos:]))
+    return "".join(out)
+
+
+def text_to_html(text):
+    # Telegram separates paragraphs with a blank line (\n\n) and uses a lone \n
+    # as a soft line break. Map each paragraph to its own <p> and only soft
+    # breaks to a single <br>, so blank lines never become duplicated <br><br>.
+    parts = []
+    for para in PARA_SPLIT_RE.split((text or "").strip()):
+        para = para.strip()
+        if not para:
+            continue
+        parts.append("<p>%s</p>" % linkify_escape(para).replace("\n", "<br>"))
+    return "".join(parts)
+
+
+def classify_media(msg):
+    """Return (kind, ext, size) for a downloadable photo/video/doc, else None."""
+    if msg.sticker or msg.voice or msg.audio:
+        return None
+    f = msg.file
+    if f is None:
+        return None
+    ext = f.ext or ""
+    mime = (f.mime_type or "")
+    if isinstance(msg.media, types.MessageMediaPhoto) or mime.startswith("image/"):
+        return ("image", ext or ".jpg", f.size)
+    if mime.startswith("video/") or msg.video or msg.video_note or msg.gif:
+        return ("video", ext or ".mp4", f.size)
+    if INCLUDE_DOCS:
+        return ("file", ext or ".bin", f.size)
+    return None
+
+
+async def media_element(client, msg, chan_id, asset_dir, max_media):
+    info = classify_media(msg)
+    if info is None:
+        return None
+    kind, ext, size = info
+    if not asset_dir:
+        # preview / self-hosting off: there is no public URL for private media.
+        return "<p><em>[%s]</em></p>" % kind
+    if max_media and size and size > max_media:
+        log("skip %s msg %d: %d bytes > cap %d" % (kind, msg.id, size, max_media))
+        return "<p><em>[%s skipped: too large]</em></p>" % kind
+
+    rel = "tg/%d/%d%s" % (chan_id, msg.id, ext)
+    dest = os.path.join(asset_dir, rel)
+    if not (os.path.exists(dest) and os.path.getsize(dest) > 0):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        got = await client.download_media(msg, file=dest)
+        if not got:
+            return None
+
+    marker = "#/" + rel
+    if kind == "image":
+        return '<p><img src="%s" alt=""></p>' % marker
+    if kind == "video":
+        return ('<p><video src="%s" controls preload="metadata" playsinline>'
+                '</video></p>' % marker)
+    name = (msg.file.name or os.path.basename(rel))
+    return '<p><a href="%s">%s</a></p>' % (marker, htmllib.escape(name))
+
+
+def make_title(caption, chan_title, date_iso):
+    for line in (caption or "").splitlines():
+        line = line.strip()
+        if line:
+            return (line[:117] + "…") if len(line) > 118 else line
+    base = chan_title or "Telegram"
+    return "%s · %s" % (base, date_iso[:10])
+
+
+def make_link(entity, msg_id):
+    uname = getattr(entity, "username", None)
+    if uname:
+        return "https://t.me/%s/%d" % (uname, msg_id)
+    return "https://t.me/c/%d/%d" % (entity.id, msg_id)
+
+
+def group_messages(msgs):
+    """Collapse album messages (shared grouped_id) into one logical post."""
+    groups, cur = [], None
+    for m in msgs:
+        gid = m.grouped_id
+        if gid and cur is not None and cur["gid"] == gid:
+            cur["msgs"].append(m)
+        else:
+            cur = {"gid": gid, "msgs": [m]}
+            groups.append(cur)
+    return groups
+
+
+async def collect_messages(client, entity, cursor):
+    """New messages in ascending id order, bounded by MAX_BATCH (plus a little
+    slack so an album straddling the boundary stays whole)."""
+    msgs = []
+    hard = MAX_BATCH + 32
+    if cursor > 0:
+        async for m in client.iter_messages(entity, min_id=cursor, reverse=True):
+            if not isinstance(m, types.MessageService) and (m.message or m.media):
+                msgs.append(m)
+            if len(msgs) >= hard:
+                break
+    else:
+        async for m in client.iter_messages(entity, limit=BACKFILL):
+            if not isinstance(m, types.MessageService) and (m.message or m.media):
+                msgs.append(m)
+        msgs.reverse()
+    return msgs
+
+
+async def run_ingest(req):
+    api_id, api_hash = credentials()
+    session = load_session()
+    asset_dir = req.get("asset_dir") or ""
+    # srrb's --max-asset-size cap, sent per request as max_asset_size (bytes); 0 = no cap.
+    max_media = int(req.get("max_asset_size") or 0)
+    # Our cursor is the highest message id seen, stored as the etag. A
+    # non-numeric etag (e.g. a leftover HTTP etag from a prior #rss strategy)
+    # is treated as a first run.
+    try:
+        cursor = int(req.get("etag") or 0)
+    except (TypeError, ValueError):
+        cursor = 0
+
+    client = TelegramClient(StringSession(session), api_id, api_hash)
+    await client.connect()
+    try:
+        if not await client.is_user_authorized():
+            sys.exit("srr-telegram: session is not authorized — re-run "
+                     "`srr-telegram login`")
+        entity = await resolve_entity(client, req["url"])
+        chan_title = getattr(entity, "title", None) or getattr(entity, "username", "")
+        msgs = await collect_messages(client, entity, cursor)
+
+        groups = group_messages(msgs)[:MAX_BATCH]
+        items, max_id = [], cursor
+        for g in groups:
+            gm = g["msgs"]
+            first = gm[0]
+            caption = next((m.message for m in gm if m.message), "")
+            parts = []
+            for m in gm:
+                el = await media_element(client, m, entity.id, asset_dir, max_media)
+                if el:
+                    parts.append(el)
+                max_id = max(max_id, m.id)
+            body = text_to_html(caption)
+            content = "".join(parts) + body
+            if not content.strip():
+                content = "<p><em>(no content)</em></p>"
+            date_iso = first.date.isoformat()
+            items.append({
+                "guid": fnv1a32("%d:%d" % (entity.id, first.id)),
+                "title": make_title(caption, chan_title, date_iso),
+                "content": content,
+                "link": make_link(entity, first.id),
+                "published": date_iso,
+            })
+    finally:
+        await client.disconnect()
+
+    if not items:
+        # Nothing new: not_modified preserves the stored cursor + dedup state.
+        return {"not_modified": True} if cursor > 0 else {"items": []}
+    return {"items": items, "etag": str(max_id)}
+
+
+def cmd_ingest():
+    try:
+        req = json.load(sys.stdin)
+    except json.JSONDecodeError as e:
+        sys.exit("srr-telegram: could not parse request on stdin: %s" % e)
+
+    try:
+        result = asyncio.run(run_ingest(req))
+    except FloodWaitError as e:
+        sys.exit("srr-telegram: Telegram rate limit, wait %ds before retrying"
+                 % e.seconds)
+    json.dump(result, sys.stdout)
+
+
+# --- login (interactive) ----------------------------------------------------
+
+def cmd_login(argv):
+    api_id = (os.environ.get("SRR_TG_API_ID") or "").strip()
+    api_hash = (os.environ.get("SRR_TG_API_HASH") or "").strip()
+    if not api_id:
+        api_id = input("Telegram API id (my.telegram.org): ").strip()
+    if not api_hash:
+        api_hash = input("Telegram API hash: ").strip()
+
+    client = TelegramClient(StringSession(), int(api_id), api_hash)
+    log("a login code will be sent to your Telegram app…")
+    client.start()  # interactive: phone number, login code, optional 2FA password
+    me = client.loop.run_until_complete(client.get_me())
+    session = client.session.save()
+    client.disconnect()
+
+    print("\nLogged in as: %s (id %s)\n" % (
+        " ".join(filter(None, [me.first_name, me.last_name])) or me.username, me.id))
+    print("Save these where the SRR fetch loop can read them "
+          "(keep SRR_TG_SESSION secret):\n")
+    print("export SRR_TG_API_ID=%s" % api_id)
+    print("export SRR_TG_API_HASH=%s" % api_hash)
+    print("export SRR_TG_SESSION='%s'" % session)
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "login":
+        return cmd_login(argv[1:])
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if argv and argv[0] in ("version", "--version", "-V"):
+        print("srr-telegram", VERSION)
+        return
+    cmd_ingest()
+
+
+if __name__ == "__main__":
+    main()

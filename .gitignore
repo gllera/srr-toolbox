@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Secrets — Telegram API id/hash + login session
+.env
+
+# Runtime media cache downloaded by srr-telegram (large, per-run)
+tg/
