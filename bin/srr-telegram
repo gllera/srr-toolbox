@@ -243,6 +243,27 @@ def classify_media(msg):
     return None
 
 
+class PartialDownload(Exception):
+    """A media download ended with fewer bytes than Telegram advertised."""
+
+
+def unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def cache_complete(dest, size):
+    """A cached file counts only when its size matches Telegram's advertised
+    size (fall back to non-empty when the size is unknown) — a leftover from an
+    interrupted run must be re-downloaded, never reused."""
+    if not os.path.exists(dest):
+        return False
+    have = os.path.getsize(dest)
+    return have == size if size else have > 0
+
+
 async def media_element(client, msg, chan_id, asset_dir, max_media):
     info = classify_media(msg)
     if info is None:
@@ -257,11 +278,33 @@ async def media_element(client, msg, chan_id, asset_dir, max_media):
 
     rel = "tg/%d/%d%s" % (chan_id, msg.id, ext)
     dest = os.path.join(asset_dir, rel)
-    if not (os.path.exists(dest) and os.path.getsize(dest) > 0):
+    if cache_complete(dest, size):
+        # Refresh the mtime so srrb's post-cycle age-based cache sweep never
+        # deletes a file a live feed still consumes (e.g. while a big backlog
+        # warms up across failing cycles).
+        os.utime(dest, None)
+    else:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        got = await client.download_media(msg, file=dest)
+        # Download to a .part file and rename into place only once complete, so
+        # a run killed mid-download (srrb cmd-timeout, crash, dropped
+        # connection) can never leave a truncated file at dest for a later
+        # cycle to reuse and publish (the prod chron-437 moov-less mp4 bug).
+        part = dest + ".part"
+        try:
+            got = await client.download_media(msg, file=part)
+        except BaseException:
+            unlink_quiet(part)
+            raise
         if not got:
+            unlink_quiet(part)
             return None
+        have = os.path.getsize(part)
+        if size and have != size:
+            unlink_quiet(part)
+            raise PartialDownload(
+                "%s msg %d: downloaded %d bytes, Telegram advertises %d"
+                % (kind, msg.id, have, size))
+        os.replace(part, dest)
 
     marker = "#/" + rel
     if kind == "image":
@@ -389,6 +432,10 @@ def cmd_ingest():
     except FloodWaitError as e:
         sys.exit("srr-telegram: Telegram rate limit, wait %ds before retrying"
                  % e.seconds)
+    except PartialDownload as e:
+        # Fail the cycle so the cursor stays put and the next fetch retries;
+        # publishing an article that references a truncated file is permanent.
+        sys.exit("srr-telegram: partial download, failing cycle to retry: %s" % e)
     json.dump(result, sys.stdout)
 
 
