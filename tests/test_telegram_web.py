@@ -1,9 +1,8 @@
 """Unit tests for srr-telegram's web (no-account) mode: URL/username parsing,
 rich-text cleaning, and t.me/s widget parsing.
 
-Run with the script's deps available:
-    uv run --with "telethon>=1.43,<2" --with cryptg --with beautifulsoup4 \
-        python tests/test_telegram_web.py
+Run in the repo's uv project venv (deps come from pyproject.toml):
+    uv run tests/test_telegram_web.py
 """
 import importlib.machinery
 import importlib.util

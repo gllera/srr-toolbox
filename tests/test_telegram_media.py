@@ -4,8 +4,8 @@ A fetch cycle killed mid-download (cmd-timeout, crash, dropped connection) must
 never leave a truncated file that a later cycle reuses and publishes — the bug
 behind prod chron 437 (t.me/AltRightEspana/14047, moov-less 9.3 MB mp4 in R2).
 
-Run with the script's deps available:
-    uv run --with "telethon>=1.43,<2" --with cryptg python tests/test_telegram_media.py
+Run in the repo's uv project venv (deps come from pyproject.toml):
+    uv run tests/test_telegram_media.py
 """
 import asyncio
 import importlib.machinery

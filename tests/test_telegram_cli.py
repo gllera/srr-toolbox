@@ -1,8 +1,8 @@
 """Unit tests for srr-telegram's CLI request building (parameters instead of
 the stdin JSON that srrb normally sends).
 
-Run with the script's deps available:
-    uv run --with "telethon>=1.43,<2" --with cryptg python tests/test_telegram_cli.py
+Run in the repo's uv project venv (deps come from pyproject.toml):
+    uv run tests/test_telegram_cli.py
 """
 import importlib.machinery
 import importlib.util

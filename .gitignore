@@ -1,11 +1,15 @@
 __pycache__/
 *.pyc
 
+# uv-managed project venv (deps in pyproject.toml, pinned by uv.lock)
+.venv/
+
 # Secrets — Telegram API id/hash + login session
 .env
 
-# Runtime media cache downloaded by srr-telegram (large, per-run)
+# Runtime media caches downloaded by srr-telegram / srr-youtube --selfhost
 tg/
+yt/
 
 # Superpowers design specs — local working notes, not shipped
 docs/

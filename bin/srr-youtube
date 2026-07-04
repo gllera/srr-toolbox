@@ -1,5 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env srr-uvrun
 """SRR external ingest strategy: a YouTube channel's Atom feed -> SRR items.
+
+Runs in the toolbox's shared uv project venv (repo-root pyproject.toml, via
+the srr-uvrun shebang wrapper) like every bin/ script, though it needs
+nothing beyond the standard library.
 
 YouTube already serves a valid Atom feed, but #rss leaves the body empty because
 the description/thumbnail live one level down inside <media:group>. This command
@@ -7,11 +11,48 @@ fetches that feed and synthesizes a clickable-thumbnail + description body that
 survives #sanitize (no <iframe>; img src / a href are allowlisted).
 
 Subscribe with the channel's Atom URL, e.g.:
-  srrb chan add -t "Veritasium" \
+  srr dev chan add -t "Veritasium" \
     -u "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA" \
     -i "srr-youtube"
+
+SELF-HOSTING THUMBNAILS — --selfhost
+------------------------------------
+By default thumbnails (like the videos themselves) stay hotlinked at their
+original i.ytimg.com URLs — the strategy downloads nothing but the feed XML,
+and the store hosts no assets for it. Add --selfhost to download each video's
+poster thumbnail into the SRR store instead, still picking the best quality
+the ladder finds (the video itself is never downloaded in either mode — the
+poster links out to youtube.com):
+
+  srr dev chan add -t "Veritasium" \
+    -u "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA" \
+    -i "srr-youtube --selfhost"
+
+A thumbnail that can't be downloaded (CDN hiccup, over srrb's --max-asset-size
+cap) falls back to its hotlink: unlike Telegram's token-signed preview CDN,
+i.ytimg.com URLs are public and stable, so degrading beats failing the cycle.
+`srr dev preview` sends no asset_dir (self-hosting off), so previews hotlink too.
+
+MANUAL RUNS (parameters instead of stdin)
+-----------------------------------------
+Normally srrb drives this script by writing a JSON request to stdin. To test a
+feed by hand, pass the URL as an argument instead — the request is built from
+parameters and the result is pretty-printed:
+
+  srr-youtube "https://www.youtube.com/feeds/videos.xml?channel_id=UC..."
+  srr-youtube --selfhost "https://www.youtube.com/feeds/videos.xml?channel_id=UC..." \
+    --asset-dir /tmp/store
+
+  <url>                     the channel's Atom feed URL
+  --etag <value>            HTTP ETag from the previous run (sent as
+                            If-None-Match; unchanged feed -> not_modified)
+  --last-modified <value>   HTTP Last-Modified from the previous run
+                            (sent as If-Modified-Since)
+  --asset-dir <dir>         store dir to download thumbnails into (what srrb
+                            sends as asset_dir; only used with --selfhost)
+  --max-asset-size <bytes>  per-file thumbnail cap (absent/0 = no cap)
 """
-import sys, json, html, urllib.request, urllib.error
+import sys, os, json, html, urllib.request, urllib.error
 import xml.etree.ElementTree as ET
 
 NS = {
@@ -19,6 +60,11 @@ NS = {
     "m":  "http://search.yahoo.com/mrss/",
     "yt": "http://www.youtube.com/xml/schemas/2015",
 }
+
+VERSION = "1.0"
+
+UA = {"User-Agent": "SRR-youtube"}
+SELFHOST = False   # set by --selfhost in main(); thumbnails download only when set
 
 
 def fnv1a32(s: str) -> int:
@@ -28,34 +74,35 @@ def fnv1a32(s: str) -> int:
     return h
 
 
-req = json.load(sys.stdin)            # {"url","etag","last_modified","max_size","asset_dir"}
-# asset_dir is deliberately unused: thumbnails (like the videos themselves) stay
-# hotlinked at their original i.ytimg.com URLs — this strategy downloads nothing
-# but the feed XML, and the store hosts no assets for it.
+def log(*a):
+    print("srr-youtube:", *a, file=sys.stderr)
 
-hdr = {"User-Agent": "SRR-youtube"}
-if req.get("etag"):
-    hdr["If-None-Match"] = req["etag"]
-if req.get("last_modified"):
-    hdr["If-Modified-Since"] = req["last_modified"]
 
-try:
-    r = urllib.request.urlopen(urllib.request.Request(req["url"], headers=hdr))
-except urllib.error.HTTPError as e:
-    if e.code == 304:                 # nothing new since our cursor
-        json.dump({"not_modified": True}, sys.stdout)
-        sys.exit(0)
-    raise
-
-body = r.read(req.get("max_size") or 8_000_000)
+def fetch_feed(req):
+    """GET the Atom feed honoring the etag/last-modified cursor.
+    -> (body, etag, last_modified), or None when nothing changed (304)."""
+    hdr = dict(UA)
+    if req.get("etag"):
+        hdr["If-None-Match"] = req["etag"]
+    if req.get("last_modified"):
+        hdr["If-Modified-Since"] = req["last_modified"]
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(req["url"], headers=hdr))
+    except urllib.error.HTTPError as e:
+        if e.code == 304:                 # nothing new since our cursor
+            return None
+        raise
+    body = r.read(req.get("max_size") or 8_000_000)
+    return body, r.headers.get("ETag", ""), r.headers.get("Last-Modified", "")
 
 
 # Thumbnail quality ladder: the Atom feed always declares hqdefault.jpg (480x360),
 # but most videos have larger variants on the same CDN. Probe with HEAD requests
-# (zero image bytes — thumbnails stay hotlinked, never downloaded) and keep the
-# first that exists; a 404 means the uploader never provided that size. Any other
-# failure (timeout, DNS) latches probing off for the rest of the run so a CDN
-# hiccup degrades quality once instead of stalling on every item.
+# (zero image bytes in hotlink mode) and keep the first that exists; a 404 means
+# the uploader never provided that size. Any other failure (timeout, DNS) latches
+# probing off for the rest of the run so a CDN hiccup degrades quality once
+# instead of stalling on every item. --selfhost rides the same ladder — GETting
+# into the store instead of probing — and shares the latch.
 THUMB_VARIANTS = ("maxresdefault", "sddefault")   # 1280x720, 640x480
 probing = True
 
@@ -68,8 +115,7 @@ def best_thumb(vid: str, feed_url: str) -> str:
         u = f"https://i.ytimg.com/vi/{vid}/{v}.jpg"
         try:
             urllib.request.urlopen(
-                urllib.request.Request(u, method="HEAD", headers={"User-Agent": "SRR-youtube"}),
-                timeout=5)
+                urllib.request.Request(u, method="HEAD", headers=UA), timeout=5)
             return u
         except urllib.error.HTTPError:
             continue          # this size doesn't exist for this video
@@ -78,32 +124,195 @@ def best_thumb(vid: str, feed_url: str) -> str:
     return feed_url
 
 
-items = []
-for e in ET.fromstring(body).findall("a:entry", NS):
-    vid = e.findtext("yt:videoId", "", NS)
-    title = e.findtext("a:title", "", NS)
-    pub = e.findtext("a:published", None, NS)     # already RFC 3339
-    watch = f"https://www.youtube.com/watch?v={vid}"
-    g = e.find("m:group", NS)
-    tnode = g.find("m:thumbnail", NS) if g is not None else None
-    thumb = best_thumb(vid, tnode.get("url") or "") if tnode is not None else ""
-    desc = g.findtext("m:description", "", NS) if g is not None else ""
+def download(url: str, dest: str, cap: int) -> str:
+    """Stream url to dest honoring the byte cap; a partial file never lands at
+    dest (.part + rename, so a run killed mid-download can't leave a truncated
+    file for a later cycle to reuse). -> 'ok' | 'toobig' | 'missing' | 'error'."""
+    tmp = dest + ".part"
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(url, headers=UA), timeout=30) as r:
+            clen = int(r.headers.get("Content-Length") or 0)
+            if cap and clen > cap:
+                return "toobig"
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            n = 0
+            with open(tmp, "wb") as fh:
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    n += len(chunk)
+                    if cap and n > cap:
+                        return "toobig"
+                    fh.write(chunk)
+        if n == 0 or (clen and n != clen):
+            return "error"    # empty or truncated body
+        os.replace(tmp, dest)
+        return "ok"
+    except urllib.error.HTTPError as e:
+        return "missing" if e.code == 404 else "error"
+    except (OSError, ValueError):
+        return "error"
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
-    content = (
-        f'<p><a href="{html.escape(watch)}">'
-        f'<img src="{html.escape(thumb)}" alt="{html.escape(title)}"></a></p>'
-        f'<p>{html.escape(desc).replace(chr(10), "<br>")}</p>'
-    )
-    items.append({
-        "guid": fnv1a32(vid or watch),            # stable per-video dedup key
-        "title": title,
-        "content": content,
-        "link": watch,
-        "published": pub,
-    })
 
-json.dump({
-    "items": items,
-    "etag": r.headers.get("ETag", ""),
-    "last_modified": r.headers.get("Last-Modified", ""),
-}, sys.stdout)
+def selfhost_thumb(vid: str, feed_url: str, asset_dir: str, cap: int):
+    """Download the best thumbnail variant into the store. -> '#/yt/<vid>.jpg'
+    marker, or None to fall back to hotlinking (over-cap file, CDN trouble)."""
+    global probing
+    rel = f"yt/{vid}.jpg"
+    dest = os.path.join(asset_dir, rel)
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        # Refresh the mtime so srrb's post-cycle age-based cache sweep never
+        # deletes a file a live feed still consumes.
+        os.utime(dest, None)
+        return "#/" + rel
+    candidates = [f"https://i.ytimg.com/vi/{vid}/{v}.jpg" for v in THUMB_VARIANTS]
+    if feed_url:
+        candidates.append(feed_url)
+    for u in candidates:
+        if not probing:
+            return None
+        st = download(u, dest, cap)
+        if st == "ok":
+            return "#/" + rel
+        if st == "missing":
+            continue          # this size doesn't exist for this video
+        if st == "toobig":    # a smaller variant may still fit the cap
+            log(f"thumb {vid}: {u.rsplit('/', 1)[-1]} over asset cap {cap}")
+            continue
+        probing = False       # network trouble, not a missing size
+    return None
+
+
+def thumb_src(vid: str, feed_url: str, asset_dir: str, cap: int) -> str:
+    # --selfhost needs a store (srrb preview sends none) and a video id to name
+    # the file; any download fallback hotlinks instead — i.ytimg.com URLs are
+    # public and stable, so the item stays correct either way.
+    if SELFHOST and asset_dir and vid:
+        marker = selfhost_thumb(vid, feed_url, asset_dir, cap)
+        if marker:
+            return marker
+    return best_thumb(vid, feed_url)
+
+
+def build_items(body, asset_dir, cap):
+    items = []
+    for e in ET.fromstring(body).findall("a:entry", NS):
+        vid = e.findtext("yt:videoId", "", NS)
+        title = e.findtext("a:title", "", NS)
+        pub = e.findtext("a:published", None, NS)     # already RFC 3339
+        watch = f"https://www.youtube.com/watch?v={vid}"
+        g = e.find("m:group", NS)
+        tnode = g.find("m:thumbnail", NS) if g is not None else None
+        thumb = (thumb_src(vid, tnode.get("url") or "", asset_dir, cap)
+                 if tnode is not None else "")
+        desc = g.findtext("m:description", "", NS) if g is not None else ""
+
+        content = (
+            f'<p><a href="{html.escape(watch)}">'
+            f'<img src="{html.escape(thumb)}" alt="{html.escape(title)}"></a></p>'
+            f'<p>{html.escape(desc).replace(chr(10), "<br>")}</p>'
+        )
+        items.append({
+            "guid": fnv1a32(vid or watch),            # stable per-video dedup key
+            "title": title,
+            "content": content,
+            "link": watch,
+            "published": pub,
+        })
+    return items
+
+
+def run_ingest(req):
+    got = fetch_feed(req)
+    if got is None:
+        return {"not_modified": True}
+    body, etag, last_modified = got
+    asset_dir = req.get("asset_dir") or ""
+    # srrb's --max-asset-size cap, sent per request as max_asset_size (bytes);
+    # 0 = no cap. Honored at download time, per the external-ingest contract.
+    cap = int(req.get("max_asset_size") or 0)
+    return {
+        "items": build_items(body, asset_dir, cap),
+        "etag": etag,
+        "last_modified": last_modified,
+    }
+
+
+CLI_PARAMS = {"--etag": "etag", "--last-modified": "last_modified",
+              "--asset-dir": "asset_dir", "--max-asset-size": "max_asset_size"}
+
+
+def request_from_argv(argv):
+    """CLI parameters -> the same request dict srrb sends as JSON on stdin."""
+    req, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in CLI_PARAMS:
+            if i + 1 >= len(argv):
+                sys.exit(f"srr-youtube: {a} needs a value")
+            req[CLI_PARAMS[a]] = argv[i + 1]
+            i += 2
+        elif a.startswith("-"):
+            sys.exit(f"srr-youtube: unknown option {a!r} (see --help)")
+        elif "url" in req:
+            sys.exit(f"srr-youtube: more than one feed URL given "
+                     f"({req['url']!r}, {a!r})")
+        else:
+            req["url"] = a
+            i += 1
+    if "url" not in req:
+        sys.exit("srr-youtube: missing feed URL (see --help)")
+    if "max_asset_size" in req:
+        try:
+            req["max_asset_size"] = int(req["max_asset_size"])
+        except ValueError:
+            sys.exit(f"srr-youtube: --max-asset-size must be a byte count, "
+                     f"got {req['max_asset_size']!r}")
+    return req
+
+
+def cmd_ingest(req=None):
+    # req is built from CLI parameters (manual run) or, when None, read as the
+    # JSON request srrb writes to stdin (the SRR external-ingest contract).
+    pretty = req is not None
+    if req is None:
+        try:
+            req = json.load(sys.stdin)
+        except json.JSONDecodeError as e:
+            sys.exit(f"srr-youtube: could not parse request on stdin: {e}")
+    try:
+        result = run_ingest(req)
+    except urllib.error.URLError as e:
+        sys.exit(f"srr-youtube: feed fetch failed: {e}")
+    if pretty:
+        # manual run: readable for a human, not byte-compatible with srrb's
+        json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+    else:
+        json.dump(result, sys.stdout)
+
+
+def main():
+    global SELFHOST
+    argv = sys.argv[1:]
+    SELFHOST = "--selfhost" in argv
+    argv = [a for a in argv if a != "--selfhost"]
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if argv and argv[0] in ("version", "--version", "-V"):
+        print("srr-youtube", VERSION)
+        return
+    cmd_ingest(request_from_argv(argv) if argv else None)
+
+
+if __name__ == "__main__":
+    main()

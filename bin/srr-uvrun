@@ -1,0 +1,18 @@
+#!/bin/sh
+# srr-uvrun — shebang interpreter for the toolbox's Python scripts:
+#
+#     #!/usr/bin/env srr-uvrun
+#
+# Locates the repo from its own resolved path and execs the target script in
+# the repo's uv project venv (pyproject.toml + uv.lock), so the checkout can
+# live anywhere. This indirection exists because a shebang can't be
+# script-relative: a relative --project resolves against the INVOKER's cwd —
+# measured to silently fall back to system python, or silently adopt an
+# unrelated project's venv when the cwd happens to be inside one.
+#
+# Needs bin/ on PATH, which everything here already requires anyway: srrb
+# resolves ingest strategies by bare name (~/.zshrc and srrb-prod-fetch.service
+# both set it). A missing PATH fails loudly ("env: 'srr-uvrun': No such file
+# or directory"), never silently wrong.
+here="$(dirname "$(readlink -f "$0")")"
+exec uv run --project "$(dirname "$here")" --script "$@"

@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# srrb — SRR backend wrapper. Defaults to the DEV config srr.yaml (safe; mutates ~/public/srr.tmp).
-# srr.yaml IS the default config (what the bare binary reads), so dev is the safe fall-through.
-# This is the everyday command. Override by exporting SRR_CONFIG before calling.
-# For PRODUCTION (~/public/srr — what live users see) use `srrb.prod` instead.
-BIN=/home/gllera/ws/srr/dist/srrb
-[ -x "$BIN" ] || { echo "srrb: backend not built at $BIN — run: (cd ~/ws/srr && make build-be)" >&2; exit 127; }
-export SRR_CONFIG="${SRR_CONFIG:-/home/gllera/.config/srr/srr.yaml}"
-exec "$BIN" "$@"

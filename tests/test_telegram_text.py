@@ -1,7 +1,7 @@
 """Unit tests for srr-telegram's text_to_html / linkify.
 
-Run with the script's deps available:
-    uv run --with "telethon>=1.43,<2" --with cryptg python tests/test_telegram_text.py
+Run in the repo's uv project venv (deps come from pyproject.toml):
+    uv run tests/test_telegram_text.py
 """
 import importlib.machinery
 import importlib.util

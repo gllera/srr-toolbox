@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# srr-deploy — manage the two LOCAL SRR deployments on this server.
+# srr — the single SRR ops tool: run the backend against either LOCAL deployment, and
+# manage the deployments themselves. (Merger of srr-deploy + srrb + srrb.prod, 2026-07-04.)
 #
 #   prod  ->  ~/public/srr/       config ~/.config/srr/srr.prod.yaml  served at /srr/
-#   dev   ->  ~/public/srr.tmp/   config ~/.config/srr/srr.yaml       served at /srr.tmp/  (the default)
+#   dev   ->  ~/public/srr.tmp/   config ~/.config/srr/srr.yaml       served at /srr.tmp/
 #
 # nginx-public serves all of ~/public read-only, so both are live with no nginx change.
 # The two environments are FULLY INDEPENDENT — the only thing that links them is the
@@ -11,27 +12,32 @@
 # Backend binary, by env (key design point):
 #   dev  ops use the LIVE build  ~/ws/srr/dist/srrb        (changes every `make build-be`)
 #   prod ops use a STATIC binary ~/.local/lib/srr/srrb     (frozen; only `deploy-be` updates it)
-# So prod never runs whatever half-built backend you last compiled. The `srrb`/`srrb.prod`
-# PATH wrappers mirror this: `srrb` -> dev build, `srrb.prod` -> the static prod binary.
+# So prod never runs whatever half-built backend you last compiled. The env token is
+# always explicit — there is no default env, so no way to hit prod by omission.
 #
 # Usage:
-#   srr-deploy reset-dev          Wipe ~/public/srr.tmp and re-seed it from current prod
+#   srr dev  [srrb args...]       Run the backend: LIVE dev build + dev config. The everyday
+#                                 command (an exported SRR_CONFIG still overrides).
+#   srr prod [srrb args...]       Run the backend: STATIC prod binary + prod config, ignoring
+#                                 any pre-set SRR_CONFIG/_INLINE — always prod, both binary
+#                                 and config. Mutates what live users see; use deliberately.
+#   srr reset-dev                 Wipe ~/public/srr.tmp and re-seed it from current prod
 #                                 (frontend + packs), repointing the copied frontend's
 #                                 baked cdn-url /srr/packs/ -> /srr.tmp/packs/. Fresh start.
 #                                 NOTE: copies prod's packs AS-IS — while they predate the
 #                                 current pack format, prefer rebuild-dev.
-#   srr-deploy rebuild-dev        Re-create the dev STORE from scratch with the dev (live)
+#   srr rebuild-dev               Re-create the dev STORE from scratch with the dev (live)
 #                                 binary: import prod's channels+feeds (config only — no
 #                                 articles, no per-feed state), publish a bumped `gen` so
 #                                 stale clients purge cached packs, fetch, validate. The
 #                                 dev frontend files are left untouched.
-#   srr-deploy build-fe <env>     Build the frontend from source against <env>'s config and
+#   srr build-fe <env>            Build the frontend from source against <env>'s config and
 #                                 deploy it into <env>'s dir (packs/ left untouched).
-#   srr-deploy deploy-be          Build the backend from source and install it as the STATIC
-#                                 prod binary (~/.local/lib/srr/srrb) that `srrb.prod` runs.
-#   srr-deploy fetch <env>        Run `art fetch` for <env> (dev=live build, prod=static binary).
-#   srr-deploy config <env>       Print the resolved config for <env> (via that env's binary).
-#   srr-deploy status             Show both deployments + the deployed prod binary.
+#   srr deploy-be                 Build the backend from source and install it as the STATIC
+#                                 prod binary (~/.local/lib/srr/srrb) that `srr prod` runs.
+#   srr fetch <env>               Run `art fetch` for <env> (labelled form of `srr <env> art fetch`).
+#   srr config <env>              Print the resolved config for <env> (via that env's binary).
+#   srr status                    Show both deployments + the deployed prod binary.
 #
 #   <env> is `prod` or `dev`.
 set -euo pipefail
@@ -44,7 +50,7 @@ DEV_DIR=/home/gllera/public/srr.tmp
 PROD_CFG=/home/gllera/.config/srr/srr.prod.yaml
 DEV_CFG=/home/gllera/.config/srr/srr.yaml
 
-die() { echo "srr-deploy: $*" >&2; exit 1; }
+die() { echo "srr: $*" >&2; exit 1; }
 
 # Resolve an env name to its dir + config + binary; sets ENV_DIR/ENV_CFG/ENV_PATH/ENV_BIN.
 resolve_env() {
@@ -54,6 +60,28 @@ resolve_env() {
       "")   die "missing env (prod|dev)" ;;
       *)    die "unknown env '$1' (use prod|dev)" ;;
    esac
+}
+
+need_bin() {  # ensure the resolved env's binary exists, with an env-appropriate hint
+   [ -x "$ENV_BIN" ] && return 0
+   if [ "$ENV_BIN" = "$PROD_BIN" ]; then
+      die "prod binary not deployed at $ENV_BIN — run: srr deploy-be"
+   else
+      die "dev binary not built at $ENV_BIN — run: cd $REPO && make build-be"
+   fi
+}
+
+cmd_run() {  # srr <env> [srrb args...] — pass-through to that env's binary + config
+   local env="$1"; shift
+   resolve_env "$env"; need_bin
+   if [ "$env" = prod ]; then
+      # Always prod, both binary and config: ignore anything lingering in the shell.
+      unset SRR_CONFIG_INLINE
+      export SRR_CONFIG="$PROD_CFG"
+   else
+      export SRR_CONFIG="${SRR_CONFIG:-$DEV_CFG}"
+   fi
+   exec "$ENV_BIN" "$@"
 }
 
 cmd_reset_dev() {
@@ -142,13 +170,13 @@ for s in json.load(sys.stdin).get("pipe") or []: print(s)')
 
    echo "==> validating"
    SRR_CONFIG="$DEV_CFG" "$DEV_BIN" inspect --validate | tail -1
-   [ -f "$DEV_DIR/index.html" ] || echo "==> NOTE: no dev frontend at $DEV_DIR — run: srr-deploy build-fe dev"
+   [ -f "$DEV_DIR/index.html" ] || echo "==> NOTE: no dev frontend at $DEV_DIR — run: srr build-fe dev"
    echo "==> done. live at https://dev.llera.eu/srr.tmp/"
 }
 
 cmd_build_fe() {
    resolve_env "${1:-}"
-   command -v node >/dev/null || { set +u; . /home/gllera/.nvm/nvm.sh; set -u; }
+   command -v node >/dev/null || eval "$("$HOME"/.local/bin/fnm env)"
    echo "==> building frontend against $ENV_CFG"
    ( cd "$REPO" && SRR_CONFIG="$ENV_CFG" make build-fe )
    echo "==> deploying frontend into $ENV_DIR (preserving packs/)"
@@ -157,15 +185,6 @@ cmd_build_fe() {
    find "$ENV_DIR" -maxdepth 1 -type f -delete
    cp -r "$REPO"/dist/srrf/. "$ENV_DIR"/
    echo "==> done. live at https://dev.llera.eu$ENV_PATH"
-}
-
-need_bin() {  # ensure the resolved env's binary exists, with an env-appropriate hint
-   [ -x "$ENV_BIN" ] && return 0
-   if [ "$ENV_BIN" = "$PROD_BIN" ]; then
-      die "prod binary not deployed at $ENV_BIN — run: srr-deploy deploy-be"
-   else
-      die "dev binary not built at $ENV_BIN — run: cd $REPO && make build-be"
-   fi
 }
 
 cmd_fetch() {
@@ -186,7 +205,7 @@ cmd_deploy_be() {
    [ -x "$DEV_BIN" ] || die "build did not produce $DEV_BIN"
    mkdir -p "$(dirname "$PROD_BIN")"
    echo "==> installing $DEV_BIN -> $PROD_BIN (atomic)"
-   # Copy to a temp then mv: an in-flight `srrb.prod` keeps running the old inode.
+   # Copy to a temp then mv: an in-flight `srr prod` keeps running the old inode.
    cp -f "$DEV_BIN" "$PROD_BIN.new"
    chmod +x "$PROD_BIN.new"
    mv -f "$PROD_BIN.new" "$PROD_BIN"
@@ -206,18 +225,19 @@ cmd_status() {
    done
    echo "binaries:"
    if [ -x "$PROD_BIN" ]; then
-      printf "  prod (srrb.prod) %s  [%s]\n" "$PROD_BIN" "$(date -r "$PROD_BIN" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+      printf "  prod (srr prod) %s  [%s]\n" "$PROD_BIN" "$(date -r "$PROD_BIN" '+%Y-%m-%d %H:%M' 2>/dev/null)"
    else
-      printf "  prod (srrb.prod) %s  (NOT deployed — run: srr-deploy deploy-be)\n" "$PROD_BIN"
+      printf "  prod (srr prod) %s  (NOT deployed — run: srr deploy-be)\n" "$PROD_BIN"
    fi
    if [ -x "$DEV_BIN" ]; then
-      printf "  dev  (srrb)      %s  [%s]\n" "$DEV_BIN" "$(date -r "$DEV_BIN" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+      printf "  dev  (srr dev)  %s  [%s]\n" "$DEV_BIN" "$(date -r "$DEV_BIN" '+%Y-%m-%d %H:%M' 2>/dev/null)"
    else
-      printf "  dev  (srrb)      %s  (not built — run: cd %s && make build-be)\n" "$DEV_BIN" "$REPO"
+      printf "  dev  (srr dev)  %s  (not built — run: cd %s && make build-be)\n" "$DEV_BIN" "$REPO"
    fi
 }
 
 case "${1:-}" in
+   dev|prod)    cmd_run "$@" ;;
    reset-dev)   cmd_reset_dev ;;
    rebuild-dev) cmd_rebuild_dev ;;
    build-fe)  cmd_build_fe "${2:-}" ;;
@@ -227,5 +247,5 @@ case "${1:-}" in
    status)    cmd_status ;;
    ""|-h|--help|help)
       awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0" ;;
-   *) die "unknown command '$1' (try: reset-dev | rebuild-dev | build-fe | deploy-be | fetch | config | status)" ;;
+   *) die "unknown command '$1' (try: dev | prod | reset-dev | rebuild-dev | build-fe | deploy-be | fetch | config | status)" ;;
 esac

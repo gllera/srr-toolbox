@@ -1,12 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.9"
-# dependencies = [
-#     "telethon>=1.43,<2",
-#     "cryptg>=0.4",
-#     "beautifulsoup4>=4.12",
-# ]
-# ///
+#!/usr/bin/env srr-uvrun
 """SRR external ingest strategy: a Telegram channel (incl. PRIVATE) -> SRR items.
 
 Reads a Telegram channel and turns each message — or each album — into an SRR
@@ -19,10 +11,13 @@ article, self-hosting its photos and videos into the SRR store. Two modes:
     public web preview (https://t.me/s/<username>). Needs no credentials at
     all. Media is linked, not downloaded, unless --selfhost is also given.
 
-Dependencies are declared inline (PEP 723) and managed by `uv`: the shebang runs
-the script via `uv run --script`, which resolves Telethon + cryptg into a cached
-environment on first run (see uv.lock for the pinned versions). `uv` must be on
-PATH — including the PATH of whatever runs the SRR fetch loop.
+Dependencies are declared once for the whole toolbox in the repo-root
+pyproject.toml and managed by `uv`: the shebang runs the script via the
+`srr-uvrun` wrapper (bin/srr-uvrun), which locates the repo from its own
+path and execs `uv run --project <repo> --script`, syncing the project's
+.venv on first run (see uv.lock for the pinned versions). Both `uv` and the
+repo's bin/ must be on PATH — including the PATH of whatever runs the SRR
+fetch loop.
 
 Why a user account and not a bot: a bot can only see channels it has been added
 to (as admin), can't read history before it joined, and the Bot API caps media
@@ -50,20 +45,20 @@ channel in Telegram Web/Desktop to read the id off the URL), a public
 `https://t.me/<username>` / `@username`, an invite link `https://t.me/+<hash>`
 (you must already be a member), or a bare numeric id (`-100…`).
 
-     srrb chan add -t "My private channel" \
+     srr dev chan add -t "My private channel" \
        -u "https://t.me/c/1234567890" \
        -i "srr-telegram"
 
 Preview without deploying (media is NOT downloaded in preview — placeholders shown):
      SRR_TG_API_ID=… SRR_TG_API_HASH=… SRR_TG_SESSION=… \
-       srrb preview "https://t.me/c/1234567890" -i "srr-telegram" -a 127.0.0.1:8098
+       srr dev preview "https://t.me/c/1234567890" -i "srr-telegram" -a 127.0.0.1:8098
 
 WEB (NO-ACCOUNT) MODE — `--no-auth`
 -----------------------------------
 Public channels need no account: with --no-auth, srr-telegram scrapes the
 channel's public web preview instead. No credentials, no setup:
 
-     srrb chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth"
+     srr dev chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth"
 
 Any public-username URL form works (https://t.me/s/<name>, https://t.me/<name>,
 @<name>). Private forms (t.me/c/<id>, invite links, numeric ids) have no public
@@ -75,7 +70,7 @@ Telegram" link, keeping the store text-only for that feed. (Hotlinking is not
 an option — the preview CDN's URLs are token-signed and expire.) Add --selfhost
 to download media into the SRR store instead, like the account mode does:
 
-     srrb chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
+     srr dev chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
 
 Trade-offs vs account mode: public channels with previews enabled only; with
 --selfhost, videos above the preview size limit have no downloadable URL — an
@@ -134,8 +129,8 @@ try:
     from telethon.tl import functions, types
 except ModuleNotFoundError:
     sys.exit("srr-telegram: Telethon not available — run this script via `uv run` "
-             "(its shebang does this) so the inline PEP 723 dependencies are "
-             "installed; do not invoke it with a bare `python3`.")
+             "(its shebang does this) so the repo pyproject.toml dependencies "
+             "are installed; do not invoke it with a bare `python3`.")
 
 try:
     import bs4
@@ -737,7 +732,7 @@ def collect_web_widgets(username, cursor):
 def run_web_ingest(req):
     if BeautifulSoup is None:
         sys.exit("srr-telegram: beautifulsoup4 not available — run this script via "
-                 "`uv run` (its shebang does this) so the inline PEP 723 "
+                 "`uv run` (its shebang does this) so the repo pyproject.toml "
                  "dependencies are installed.")
     url = (req.get("url") or "").strip()
     username = web_username(url)
