@@ -55,6 +55,7 @@ for url, want in [
 
 check_true("account (MTProto) is the default mode (--no-auth opts into web)",
            mod.AUTH_MODE is True)
+check_true("media download is opt-in (--selfhost)", mod.SELFHOST is False)
 
 
 # --- rich-text cleaning ------------------------------------------------------
@@ -169,6 +170,32 @@ _, none_widgets, none_exists = mod.parse_channel_page(
     "<html><body><div>nothing here</div></body></html>")
 check_true("error page: no widgets, exists=False",
            none_widgets == [] and not none_exists)
+
+
+# --- --selfhost gating -------------------------------------------------------
+
+LINK = "https://t.me/mychan/12"
+
+# Without --selfhost media is never fetched: the element is a link to the post,
+# even when a store (asset_dir) is available. src is a poisoned URL on purpose —
+# any download attempt would blow up instead of silently passing.
+check("no --selfhost: image -> open-in-Telegram link",
+      mod.web_media_element("image", "http://invalid.invalid/x.jpg", "tg/mychan/12",
+                            0, "/nonexistent-store", 0, LINK),
+      '<p><em>[image — <a href="%s">open in Telegram</a>]</em></p>' % LINK)
+check("no --selfhost: oversized video keeps its dedicated placeholder",
+      mod.web_media_element("video", None, "tg/mychan/12", 0, "/nonexistent-store",
+                            0, LINK),
+      '<p><em>[video too large for the public preview — '
+      '<a href="%s">open in Telegram</a>]</em></p>' % LINK)
+
+# With --selfhost but no store (srrb preview), placeholders only — no download.
+mod.SELFHOST = True
+check("--selfhost without a store: bare placeholder",
+      mod.web_media_element("image", "http://invalid.invalid/x.jpg", "tg/mychan/12",
+                            0, "", 0, LINK),
+      "<p><em>[image]</em></p>")
+mod.SELFHOST = False
 
 
 # --- misc helpers ------------------------------------------------------------

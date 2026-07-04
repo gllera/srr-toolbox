@@ -17,7 +17,7 @@ article, self-hosting its photos and videos into the SRR store. Two modes:
     below.
   * WEB (no-account) mode — `srr-telegram --no-auth`: public channels via the
     public web preview (https://t.me/s/<username>). Needs no credentials at
-    all.
+    all. Media is linked, not downloaded, unless --selfhost is also given.
 
 Dependencies are declared inline (PEP 723) and managed by `uv`: the shebang runs
 the script via `uv run --script`, which resolves Telethon + cryptg into a cached
@@ -70,13 +70,19 @@ Any public-username URL form works (https://t.me/s/<name>, https://t.me/<name>,
 preview — subscribe those through the default account mode. `--auth` is
 accepted as an explicit synonym for the default.
 
-Trade-offs vs account mode: public channels with previews enabled only; photos
-and videos are self-hosted from the preview CDN (its video URLs expire, so they
-are downloaded at fetch time), but videos above the preview size limit have no
-downloadable URL — an "open in Telegram" link is emitted instead; voice notes,
-stickers and documents are skipped; items carry a different dedup guid than
-account mode (the preview page hides the numeric channel id), so switching an
-existing feed between modes re-imports its backlog once.
+Media is NOT downloaded by default: each photo/video is replaced by an "open in
+Telegram" link, keeping the store text-only for that feed. (Hotlinking is not
+an option — the preview CDN's URLs are token-signed and expire.) Add --selfhost
+to download media into the SRR store instead, like the account mode does:
+
+     srrb chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
+
+Trade-offs vs account mode: public channels with previews enabled only; with
+--selfhost, videos above the preview size limit have no downloadable URL — an
+"open in Telegram" link is emitted instead; voice notes, stickers and documents
+are skipped; items carry a different dedup guid than account mode (the preview
+page hides the numeric channel id), so switching an existing feed between modes
+re-imports its backlog once.
 
 ENVIRONMENT
 -----------
@@ -120,7 +126,7 @@ try:
 except ModuleNotFoundError:
     bs4 = BeautifulSoup = None   # only web (no-account) mode needs it
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 
 # --- config -----------------------------------------------------------------
@@ -138,6 +144,7 @@ BACKFILL = env_int("SRR_TG_BACKFILL", 20)
 MAX_BATCH = env_int("SRR_TG_MAX_BATCH", 200)
 INCLUDE_DOCS = env_bool("SRR_TG_INCLUDE_DOCS")
 AUTH_MODE = True   # cleared by --no-auth in main(); default is the account (MTProto) mode
+SELFHOST = False   # set by --selfhost in main(); web mode downloads media only when set
 
 
 def fnv1a32(s: str) -> int:
@@ -655,8 +662,13 @@ def web_media_element(kind, src, rel_base, n, asset_dir, max_media, post_link):
         return ('<p><em>[video too large for the public preview — '
                 '<a href="%s">open in Telegram</a>]</em></p>'
                 % htmllib.escape(post_link, quote=True))
+    if not SELFHOST:
+        # Downloading is opt-in (--selfhost); hotlinking is not a fallback —
+        # the preview CDN's URLs are token-signed and expire.
+        return ('<p><em>[%s — <a href="%s">open in Telegram</a>]</em></p>'
+                % (kind, htmllib.escape(post_link, quote=True)))
     if not asset_dir:
-        # preview / self-hosting off: CDN URLs expire, so don't hotlink them.
+        # preview: no store to download into — placeholders only.
         return "<p><em>[%s]</em></p>" % kind
     rel = rel_base + ("" if n == 0 else "_%d" % n) \
         + _url_ext(src, ".jpg" if kind == "image" else ".mp4")
@@ -816,13 +828,17 @@ def cmd_login(argv):
 
 
 def main():
-    global AUTH_MODE
+    global AUTH_MODE, SELFHOST
     argv = sys.argv[1:]
     if "--auth" in argv and "--no-auth" in argv:
         sys.exit("srr-telegram: --auth and --no-auth are mutually exclusive")
     AUTH_MODE = "--no-auth" not in argv
+    SELFHOST = "--selfhost" in argv
+    if SELFHOST and AUTH_MODE:
+        sys.exit("srr-telegram: --selfhost only applies to the web mode — "
+                 "combine it with --no-auth (the account mode always self-hosts)")
     # --auth is the default; accepted so recipes can spell the mode out.
-    argv = [a for a in argv if a not in ("--auth", "--no-auth")]
+    argv = [a for a in argv if a not in ("--auth", "--no-auth", "--selfhost")]
     if argv and argv[0] == "login":
         return cmd_login(argv[1:])
     if argv and argv[0] in ("-h", "--help", "help"):
