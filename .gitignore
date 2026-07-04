@@ -6,3 +6,6 @@ __pycache__/
 
 # Runtime media cache downloaded by srr-telegram (large, per-run)
 tg/
+
+# Superpowers design specs — local working notes, not shipped
+docs/
