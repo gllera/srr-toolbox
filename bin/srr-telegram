@@ -84,6 +84,23 @@ are skipped; items carry a different dedup guid than account mode (the preview
 page hides the numeric channel id), so switching an existing feed between modes
 re-imports its backlog once.
 
+MANUAL RUNS (parameters instead of stdin)
+-----------------------------------------
+Normally srrb drives this script by writing a JSON request to stdin. To test a
+channel by hand, pass the URL as an argument instead — the request is built
+from parameters and the result is pretty-printed:
+
+     srr-telegram --no-auth https://t.me/s/durov
+     srr-telegram --no-auth --selfhost https://t.me/s/durov --asset-dir /tmp/store
+     srr-telegram https://t.me/c/1234567890 --etag 517
+
+  <url>                     the channel (same forms as the SRR `url` above)
+  --etag <cursor>           resume after this message id (absent = first run,
+                            so SRR_TG_BACKFILL recent messages are ingested)
+  --asset-dir <dir>         store dir to self-host media into (what srrb sends
+                            as asset_dir; absent = placeholders instead)
+  --max-asset-size <bytes>  per-file media cap (absent/0 = no cap)
+
 ENVIRONMENT
 -----------
   SRR_TG_API_ID        (required) numeric API id from my.telegram.org
@@ -126,7 +143,7 @@ try:
 except ModuleNotFoundError:
     bs4 = BeautifulSoup = None   # only web (no-account) mode needs it
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 
 # --- config -----------------------------------------------------------------
@@ -776,11 +793,50 @@ def run_web_ingest(req):
     return {"items": items, "etag": str(max_id)}
 
 
-def cmd_ingest():
-    try:
-        req = json.load(sys.stdin)
-    except json.JSONDecodeError as e:
-        sys.exit("srr-telegram: could not parse request on stdin: %s" % e)
+CLI_PARAMS = {"--etag": "etag", "--asset-dir": "asset_dir",
+              "--max-asset-size": "max_asset_size"}
+
+
+def request_from_argv(argv):
+    """CLI parameters -> the same request dict srrb sends as JSON on stdin."""
+    req, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in CLI_PARAMS:
+            if i + 1 >= len(argv):
+                sys.exit("srr-telegram: %s needs a value" % a)
+            req[CLI_PARAMS[a]] = argv[i + 1]
+            i += 2
+        elif a.startswith("--"):
+            sys.exit("srr-telegram: unknown option %r (see --help)" % a)
+        elif "url" in req:
+            sys.exit("srr-telegram: more than one channel URL given "
+                     "(%r, %r)" % (req["url"], a))
+        else:
+            # Not restricted to things that look like URLs: bare numeric ids
+            # (account mode) start with "-" but are channels, not options.
+            req["url"] = a
+            i += 1
+    if "url" not in req:
+        sys.exit("srr-telegram: missing channel URL (see --help)")
+    if "max_asset_size" in req:
+        try:
+            req["max_asset_size"] = int(req["max_asset_size"])
+        except ValueError:
+            sys.exit("srr-telegram: --max-asset-size must be a byte count, "
+                     "got %r" % req["max_asset_size"])
+    return req
+
+
+def cmd_ingest(req=None):
+    # req is built from CLI parameters (manual run) or, when None, read as the
+    # JSON request srrb writes to stdin (the SRR external-ingest contract).
+    pretty = req is not None
+    if req is None:
+        try:
+            req = json.load(sys.stdin)
+        except json.JSONDecodeError as e:
+            sys.exit("srr-telegram: could not parse request on stdin: %s" % e)
 
     if AUTH_MODE:
         try:
@@ -798,7 +854,12 @@ def cmd_ingest():
             result = run_web_ingest(req)
         except urllib.error.URLError as e:
             sys.exit("srr-telegram: t.me fetch failed: %s" % e)
-    json.dump(result, sys.stdout)
+    if pretty:
+        # manual run: readable for a human, not byte-compatible with srrb's
+        json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+    else:
+        json.dump(result, sys.stdout)
 
 
 # --- login (interactive) ----------------------------------------------------
@@ -847,7 +908,7 @@ def main():
     if argv and argv[0] in ("version", "--version", "-V"):
         print("srr-telegram", VERSION)
         return
-    cmd_ingest()
+    cmd_ingest(request_from_argv(argv) if argv else None)
 
 
 if __name__ == "__main__":
