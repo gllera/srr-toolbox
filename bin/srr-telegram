@@ -4,13 +4,19 @@
 # dependencies = [
 #     "telethon>=1.43,<2",
 #     "cryptg>=0.4",
+#     "beautifulsoup4>=4.12",
 # ]
 # ///
 """SRR external ingest strategy: a Telegram channel (incl. PRIVATE) -> SRR items.
 
-Reads a private/public Telegram channel via MTProto (your own user account, the
-Telethon library) and turns each message — or each album — into an SRR article,
-self-hosting its photos and videos into the SRR store.
+Reads a Telegram channel and turns each message — or each album — into an SRR
+article, self-hosting its photos and videos into the SRR store. Two modes:
+
+  * WEB (no-account) mode — the DEFAULT: public channels via the public web
+    preview (https://t.me/s/<username>). Needs no credentials at all.
+  * ACCOUNT (MTProto) mode — `srr-telegram --auth`: private (and public)
+    channels via your own user account (the Telethon library). Needs the
+    one-time login below.
 
 Dependencies are declared inline (PEP 723) and managed by `uv`: the shebang runs
 the script via `uv run --script`, which resolves Telethon + cryptg into a cached
@@ -22,7 +28,27 @@ to (as admin), can't read history before it joined, and the Bot API caps media
 downloads at ~20 MB. A user session reads any channel/group YOU are a member of
 and downloads media of any size.
 
-ONE-TIME SETUP
+WEB (NO-ACCOUNT) MODE — the default
+-----------------------------------
+Public channels need no account: unless --auth is given, srr-telegram scrapes
+the channel's public web preview. No credentials, no setup:
+
+     srrb chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram"
+
+Any public-username URL form works (https://t.me/s/<name>, https://t.me/<name>,
+@<name>). Private forms (t.me/c/<id>, invite links, numeric ids) have no public
+preview — subscribe those through the account mode: `-i "srr-telegram --auth"`.
+`--web` is accepted as an explicit synonym for the default.
+
+Trade-offs vs account mode: public channels with previews enabled only; photos
+and videos are self-hosted from the preview CDN (its video URLs expire, so they
+are downloaded at fetch time), but videos above the preview size limit have no
+downloadable URL — an "open in Telegram" link is emitted instead; voice notes,
+stickers and documents are skipped; items carry a different dedup guid than
+account mode (the preview page hides the numeric channel id), so switching an
+existing feed between modes re-imports its backlog once.
+
+ONE-TIME SETUP (account mode only)
 --------------
 1. Install uv (https://docs.astral.sh/uv/) if it isn't already.
 2. Get an API id + hash from https://my.telegram.org  ->  "API development tools".
@@ -36,8 +62,8 @@ ONE-TIME SETUP
    srrb-prod-fetch service environment, or an env file it sources). The session
    string is a credential — treat it like a password.
 
-SUBSCRIBE A CHANNEL
--------------------
+SUBSCRIBE A CHANNEL (account mode)
+----------------------------------
 The channel's SRR `url` is any of: a private link `https://t.me/c/<id>` (open the
 channel in Telegram Web/Desktop to read the id off the URL), a public
 `https://t.me/<username>` / `@username`, an invite link `https://t.me/+<hash>`
@@ -45,11 +71,11 @@ channel in Telegram Web/Desktop to read the id off the URL), a public
 
      srrb chan add -t "My private channel" \
        -u "https://t.me/c/1234567890" \
-       -i "srr-telegram"
+       -i "srr-telegram --auth"
 
 Preview without deploying (media is NOT downloaded in preview — placeholders shown):
      SRR_TG_API_ID=… SRR_TG_API_HASH=… SRR_TG_SESSION=… \
-       srrb preview "https://t.me/c/1234567890" -i "srr-telegram" -a 127.0.0.1:8098
+       srrb preview "https://t.me/c/1234567890" -i "srr-telegram --auth" -a 127.0.0.1:8098
 
 ENVIRONMENT
 -----------
@@ -74,6 +100,8 @@ import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 
 try:
     from telethon import TelegramClient
@@ -85,7 +113,13 @@ except ModuleNotFoundError:
              "(its shebang does this) so the inline PEP 723 dependencies are "
              "installed; do not invoke it with a bare `python3`.")
 
-VERSION = "1.0"
+try:
+    import bs4
+    from bs4 import BeautifulSoup
+except ModuleNotFoundError:
+    bs4 = BeautifulSoup = None   # only web (no-account) mode needs it
+
+VERSION = "1.2"
 
 
 # --- config -----------------------------------------------------------------
@@ -102,6 +136,7 @@ def env_bool(name):
 BACKFILL = env_int("SRR_TG_BACKFILL", 20)
 MAX_BATCH = env_int("SRR_TG_MAX_BATCH", 200)
 INCLUDE_DOCS = env_bool("SRR_TG_INCLUDE_DOCS")
+AUTH_MODE = False   # set by --auth in main(); default is the web (no-account) mode
 
 
 def fnv1a32(s: str) -> int:
@@ -421,21 +456,335 @@ async def run_ingest(req):
     return {"items": items, "etag": str(max_id)}
 
 
+# --- web (no-account) mode ----------------------------------------------------
+#
+# Public channels expose their recent messages at https://t.me/s/<username> —
+# plain HTML, no auth. ?after=<id> pages forward (our incremental cursor),
+# ?before=<id> pages backward (backfill). Albums arrive pre-collapsed into one
+# widget (multiple photo wraps under the FIRST member's id). Photo/video CDN
+# URLs are token-signed and expire, so media is downloaded at fetch time, never
+# hotlinked. Nonexistent/private/no-preview channels return HTTP 200 with
+# neither channel info nor message widgets.
+
+WEB_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/126.0 Safari/537.36")
+WEB_PAGE_SIZE = 20   # t.me/s serves at most 20 messages per page
+
+USERNAME_URL_RE = re.compile(
+    r"^(?:https?://)?(?:t|telegram)\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{2,})/?(?:[?#].*)?$",
+    re.I)
+BG_URL_RE = re.compile(r"background-image:\s*url\('([^']+)'\)")
+# In the widget's rich text, <br><br>-runs separate paragraphs (same role as
+# \n\n in the MTProto message text).
+BR_PARA_RE = re.compile(r"(?:\s*<br>\s*){2,}")
+KEEP_TAGS = {"b", "strong", "i", "em", "u", "s", "del", "code", "pre"}
+
+
+def web_username(url):
+    """The public username a URL names, else None (private/invite/numeric forms)."""
+    u = (url or "").strip()
+    if u.startswith("@"):
+        u = "t.me/" + u[1:]
+    m = USERNAME_URL_RE.match(u)
+    return m.group(1) if m else None
+
+
+def web_get(url):
+    r = urllib.request.Request(url, headers={"User-Agent": WEB_UA})
+    with urllib.request.urlopen(r, timeout=30) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def _in_quoted_block(el):
+    """True for nodes inside a reply quote or a link-preview card — that content
+    belongs to another message/page, not to this post's body."""
+    return el.find_parent(
+        class_=re.compile(r"tgme_widget_message_(reply|link_preview)")) is not None
+
+
+def _abs_href(href):
+    if href.startswith("//"):
+        return "https:" + href
+    if href.startswith("/"):
+        return "https://t.me" + href
+    return href
+
+
+def _clean_rich(node, out):
+    """Rebuild t.me rich text keeping only allowlisted markup. Emoji <i> wrappers
+    (and <tg-emoji>) collapse to the plain emoji character; unknown tags unwrap."""
+    for child in node.children:
+        if isinstance(child, bs4.Comment):
+            continue
+        if isinstance(child, bs4.NavigableString):
+            out.append(htmllib.escape(str(child)))
+            continue
+        if not isinstance(child, bs4.Tag):
+            continue
+        name = child.name.lower()
+        if name == "br":
+            out.append("<br>")
+        elif "emoji" in (child.get("class") or []):
+            out.append(htmllib.escape(child.get_text()))
+        elif name == "a":
+            href = _abs_href((child.get("href") or "").strip())
+            inner = []
+            _clean_rich(child, inner)
+            body = "".join(inner) or htmllib.escape(href)
+            if href:
+                out.append('<a href="%s">%s</a>'
+                           % (htmllib.escape(href, quote=True), body))
+            else:
+                out.append(body)
+        elif name in KEEP_TAGS:
+            inner = []
+            _clean_rich(child, inner)
+            out.append("<%s>%s</%s>" % (name, "".join(inner), name))
+        else:
+            _clean_rich(child, out)
+
+
+def widget_text_html(text_el):
+    """Rich-text div -> clean <p> paragraphs; same invariant as text_to_html:
+    paragraph breaks never surface as <br><br>."""
+    if text_el is None:
+        return ""
+    out = []
+    _clean_rich(text_el, out)
+    parts = []
+    for para in BR_PARA_RE.split("".join(out).strip()):
+        para = re.sub(r"^(?:\s*<br>\s*)+|(?:\s*<br>\s*)+$", "", para).strip()
+        if para:
+            parts.append("<p>%s</p>" % para)
+    return "".join(parts)
+
+
+def widget_caption(text_el):
+    """Plain-text caption (for make_title): cleaned HTML minus markup."""
+    if text_el is None:
+        return ""
+    out = []
+    _clean_rich(text_el, out)
+    txt = "".join(out).replace("<br>", "\n")
+    return htmllib.unescape(re.sub(r"<[^>]+>", "", txt))
+
+
+def parse_channel_page(page_html):
+    """-> (channel_title, [widget dict] ascending by id, channel_exists)."""
+    soup = BeautifulSoup(page_html, "html.parser")
+    title = None
+    og = soup.find("meta", attrs={"property": "og:title"})
+    if og and og.get("content"):
+        title = og["content"].strip()
+    widgets = []
+    for w in soup.select("div.tgme_widget_message[data-post]"):
+        user, _, mid = w["data-post"].rpartition("/")
+        if not mid.isdigit():
+            continue
+        t = w.select_one("time[datetime]")
+        text_el = next((el for el in w.select(".tgme_widget_message_text")
+                        if not _in_quoted_block(el)), None)
+        media = []
+        for el in w.select("a.tgme_widget_message_photo_wrap"):
+            if _in_quoted_block(el):
+                continue
+            m = BG_URL_RE.search(el.get("style") or "")
+            if m:
+                media.append(("image", m.group(1)))
+        for el in w.select(".tgme_widget_message_video_player, "
+                           ".tgme_widget_message_roundvideo_player"):
+            if _in_quoted_block(el):
+                continue
+            v = el.find("video")
+            # src missing = video too large for the public preview
+            media.append(("video", v.get("src") if v else None))
+        widgets.append({
+            "user": user, "id": int(mid),
+            "date": t["datetime"] if t and t.get("datetime") else None,
+            "text_el": text_el, "media": media,
+            "poll": w.select_one(".tgme_widget_message_poll") is not None,
+        })
+    widgets.sort(key=lambda x: x["id"])
+    exists = bool(widgets) or soup.select_one(".tgme_channel_info") is not None
+    return title, widgets, exists
+
+
+def _url_ext(u, default):
+    ext = os.path.splitext(u.split("?", 1)[0].split("#", 1)[0])[1].lower()
+    return ext if re.fullmatch(r"\.[a-z0-9]{2,4}", ext) else default
+
+
+def web_download(url, dest, cap):
+    """Stream url to dest honoring the byte cap. -> 'ok' | 'toobig' | 'error'."""
+    tmp = dest + ".part"
+    try:
+        r = urllib.request.Request(url, headers={"User-Agent": WEB_UA})
+        with urllib.request.urlopen(r, timeout=60) as resp:
+            clen = resp.headers.get("Content-Length")
+            if cap and clen and int(clen) > cap:
+                return "toobig"
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            n = 0
+            with open(tmp, "wb") as fh:
+                while True:
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    n += len(chunk)
+                    if cap and n > cap:
+                        return "toobig"
+                    fh.write(chunk)
+        if n == 0:
+            return "error"
+        os.replace(tmp, dest)
+        return "ok"
+    except (OSError, ValueError) as e:
+        log("download failed: %s (%s)" % (url, e))
+        return "error"
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def web_media_element(kind, src, rel_base, n, asset_dir, max_media, post_link):
+    if kind == "video" and not src:
+        return ('<p><em>[video too large for the public preview — '
+                '<a href="%s">open in Telegram</a>]</em></p>'
+                % htmllib.escape(post_link, quote=True))
+    if not asset_dir:
+        # preview / self-hosting off: CDN URLs expire, so don't hotlink them.
+        return "<p><em>[%s]</em></p>" % kind
+    rel = rel_base + ("" if n == 0 else "_%d" % n) \
+        + _url_ext(src, ".jpg" if kind == "image" else ".mp4")
+    dest = os.path.join(asset_dir, rel)
+    if not (os.path.exists(dest) and os.path.getsize(dest) > 0):
+        st = web_download(src, dest, max_media)
+        if st == "toobig":
+            log("skip %s %s: > cap %d" % (kind, rel_base, max_media))
+            return "<p><em>[%s skipped: too large]</em></p>" % kind
+        if st == "error":
+            return None
+    marker = "#/" + rel
+    if kind == "image":
+        return '<p><img src="%s" alt=""></p>' % marker
+    return ('<p><video src="%s" controls preload="metadata" playsinline>'
+            '</video></p>' % marker)
+
+
+def collect_web_widgets(username, cursor):
+    """-> (channel_title, new widgets ascending, channel_exists), bounded by
+    MAX_BATCH (plus slack, like the MTProto collector)."""
+    hard = MAX_BATCH + 32
+    base = "https://t.me/s/%s" % username
+    if cursor > 0:
+        title, widgets, exists, seen, after = None, [], False, set(), cursor
+        while len(widgets) < hard:
+            t, page, ok = parse_channel_page(web_get("%s?after=%d" % (base, after)))
+            title, exists = title or t, exists or ok
+            fresh = [w for w in page if w["id"] > cursor and w["id"] not in seen]
+            if not fresh:
+                break
+            seen.update(w["id"] for w in fresh)
+            widgets.extend(fresh)
+            after = max(w["id"] for w in fresh)
+            if len(page) < WEB_PAGE_SIZE:
+                break
+        return title, widgets, exists
+    title, widgets, exists = parse_channel_page(web_get(base))
+    while widgets and len(widgets) < min(BACKFILL, hard):
+        _, page, _ = parse_channel_page(
+            web_get("%s?before=%d" % (base, widgets[0]["id"])))
+        fresh = [w for w in page if w["id"] < widgets[0]["id"]]
+        if not fresh:
+            break
+        widgets = fresh + widgets
+    return title, widgets[-BACKFILL:], exists
+
+
+def run_web_ingest(req):
+    if BeautifulSoup is None:
+        sys.exit("srr-telegram: beautifulsoup4 not available — run this script via "
+                 "`uv run` (its shebang does this) so the inline PEP 723 "
+                 "dependencies are installed.")
+    url = (req.get("url") or "").strip()
+    username = web_username(url)
+    if not username:
+        sys.exit("srr-telegram: web (no-account) mode only reads PUBLIC channels "
+                 "by username (https://t.me/s/<name>, https://t.me/<name>, "
+                 "@<name>) — %r needs the account mode: srr-telegram --auth" % url)
+    asset_dir = req.get("asset_dir") or ""
+    max_media = int(req.get("max_asset_size") or 0)
+    try:
+        cursor = int(req.get("etag") or 0)
+    except (TypeError, ValueError):
+        cursor = 0
+
+    chan_title, widgets, exists = collect_web_widgets(username, cursor)
+    if not exists:
+        sys.exit("srr-telegram: no public preview for @%s — the channel is "
+                 "private, nonexistent, or has previews disabled; it needs the "
+                 "account mode: srr-telegram --auth" % username)
+
+    items, max_id = [], cursor
+    for w in widgets[:MAX_BATCH]:
+        post_user = w["user"] or username
+        link = "https://t.me/%s/%d" % (post_user, w["id"])
+        parts = []
+        for n, (kind, src) in enumerate(w["media"]):
+            el = web_media_element(kind, src, "tg/%s/%d" % (post_user.lower(),
+                                   w["id"]), n, asset_dir, max_media, link)
+            if el:
+                parts.append(el)
+        if w["poll"]:
+            parts.append('<p><em>[poll — <a href="%s">open in Telegram</a>]'
+                         '</em></p>' % htmllib.escape(link, quote=True))
+        content = "".join(parts) + widget_text_html(w["text_el"])
+        if not content.strip():
+            content = "<p><em>(no content)</em></p>"
+        date_iso = w["date"] or ""
+        items.append({
+            # Different keyspace than account mode (which hashes the numeric
+            # channel id — the preview page doesn't expose it): usernames can't
+            # be all-digits, so the two can never collide.
+            "guid": fnv1a32("%s:%d" % (post_user.lower(), w["id"])),
+            "title": make_title(widget_caption(w["text_el"]), chan_title or username,
+                                date_iso),
+            "content": content,
+            "link": link,
+            "published": w["date"],
+        })
+        max_id = max(max_id, w["id"])
+
+    if not items:
+        return {"not_modified": True} if cursor > 0 else {"items": []}
+    return {"items": items, "etag": str(max_id)}
+
+
 def cmd_ingest():
     try:
         req = json.load(sys.stdin)
     except json.JSONDecodeError as e:
         sys.exit("srr-telegram: could not parse request on stdin: %s" % e)
 
-    try:
-        result = asyncio.run(run_ingest(req))
-    except FloodWaitError as e:
-        sys.exit("srr-telegram: Telegram rate limit, wait %ds before retrying"
-                 % e.seconds)
-    except PartialDownload as e:
-        # Fail the cycle so the cursor stays put and the next fetch retries;
-        # publishing an article that references a truncated file is permanent.
-        sys.exit("srr-telegram: partial download, failing cycle to retry: %s" % e)
+    if AUTH_MODE:
+        try:
+            result = asyncio.run(run_ingest(req))
+        except FloodWaitError as e:
+            sys.exit("srr-telegram: Telegram rate limit, wait %ds before retrying"
+                     % e.seconds)
+        except PartialDownload as e:
+            # Fail the cycle so the cursor stays put and the next fetch retries;
+            # publishing an article that references a truncated file is permanent.
+            sys.exit("srr-telegram: partial download, failing cycle to retry: %s"
+                     % e)
+    else:
+        try:
+            result = run_web_ingest(req)
+        except urllib.error.URLError as e:
+            sys.exit("srr-telegram: t.me fetch failed: %s" % e)
     json.dump(result, sys.stdout)
 
 
@@ -466,7 +815,13 @@ def cmd_login(argv):
 
 
 def main():
+    global AUTH_MODE
     argv = sys.argv[1:]
+    if "--auth" in argv and "--web" in argv:
+        sys.exit("srr-telegram: --auth and --web are mutually exclusive")
+    AUTH_MODE = "--auth" in argv
+    # --web is the default; accepted so recipes can spell the mode out.
+    argv = [a for a in argv if a not in ("--auth", "--web")]
     if argv and argv[0] == "login":
         return cmd_login(argv[1:])
     if argv and argv[0] in ("-h", "--help", "help"):
