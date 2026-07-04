@@ -1,0 +1,58 @@
+# Tests on every push to main; a `v*` tag additionally publishes a GitHub Release
+# gated on those tests. Release notes are built from `git log` (not
+# --generate-notes, which is PR-based and comes out empty on a direct-push repo).
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install deps (fails if uv.lock is stale)
+        run: uv sync --locked
+      - name: Run test suite
+        run: |
+          for t in tests/test_*.py; do
+            echo "==> $t"
+            uv run "$t" || exit 1
+          done
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags, for the changelog range
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists; nothing to do"
+            exit 0
+          fi
+          prev=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || true)
+          {
+            git log --pretty='- %s' ${prev:+$prev..}"$tag"
+            if [ -n "$prev" ]; then
+              echo
+              echo "**Full Changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$prev...$tag"
+            fi
+          } > notes.md
+          gh release create "$tag" --verify-tag --title "$tag" --notes-file notes.md
