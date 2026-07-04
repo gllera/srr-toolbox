@@ -7,9 +7,10 @@ __pycache__/
 # Secrets — Telegram API id/hash + login session
 .env
 
-# Runtime media caches downloaded by srr-telegram / srr-youtube --selfhost
+# Runtime media caches downloaded by srr-telegram / srr-youtube / srr-x --selfhost
 tg/
 yt/
+x/
 
 # Superpowers design specs — local working notes, not shipped
 docs/

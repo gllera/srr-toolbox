@@ -1,0 +1,464 @@
+#!/usr/bin/env srr-uvrun
+"""SRR external ingest strategy: an X/Twitter account -> SRR items, read
+through a Nitter instance (default: https://nitter.net).
+
+Runs in the toolbox's shared uv project venv (repo-root pyproject.toml, via
+the srr-uvrun shebang wrapper) like every bin/ script; needs beautifulsoup4
+(description rewriting) and httpx[http2] (feed fetch — some instances 403
+plain HTTP/1.1) from that venv.
+
+X serves no feeds and its read API is paid, but nitter.net rebuilds a public
+account's timeline as RSS. This strategy fetches that RSS and rewrites every
+nitter artifact back to a canonical URL, so the STORED items never depend on
+the instance staying alive (only the next fetch does):
+
+  * proxied media  <instance>/pic/<encoded>  ->  https://pbs.twimg.com/...
+    (the public Twitter CDN; /pic/orig/ becomes the ?name=orig full-size)
+  * mentions, hashtags, statuses  <instance>/...  ->  https://x.com/...
+    (nitter's #m fragments dropped); external links pass through untouched
+  * item links -> https://x.com/<author>/status/<id>
+  * nitter's inline max-width styles stripped (the reader sizes images)
+
+Nitter's title jargon is translated, never shown raw (prefixes per its
+rss.nimf, mutually exclusive):
+  * "RT by @x: "  retweets/reposts — kept, attributed to the original author
+    with a leading "RT @author" body line; drop them with --no-retweets.
+    Quote-reposts arrive as normal tweets with the quote as a blockquote.
+  * "R to @x: "   replies — only self-thread continuations exist here (the
+    profile RSS mirrors X's Posts tab, and nitter.net serves no
+    with_replies RSS); stripped from the title, attributed with a leading
+    "↩ replying to @x" body line; drop them with --no-replies.
+  * "Pinned: "    the pinned tweet re-surfacing at the top — prefix stripped;
+    guid dedup means it's ingested once, old pubDate and all.
+Videos are never downloaded in any mode: nitter's Video placeholder becomes
+a clickable poster linking to the tweet, like srr-youtube's thumbnails. The
+synthesized body survives #sanitize (img src / a href are allowlisted; no
+scripts). Tweets have no natural titles — the tweet text lands in the
+title, capped like srr-telegram's, so consider srrb's no-title feed option.
+
+Subscribe with any form that names the account — an x.com / twitter.com /
+nitter URL, @handle, or bare handle:
+  srr dev chan add -t "NASA" -u "https://x.com/NASA" -i "srr-x"
+
+THE INSTANCE — --instance
+-------------------------
+Fetches default to https://nitter.net. Nitter instances are mortal (X keeps
+fighting them): when one dies, point the strategy elsewhere — one config
+edit, nothing stored needs rewriting:
+  srr dev chan add -t "..." -u "https://x.com/NASA" \\
+    -i "srr-x --instance https://nitter.poast.org"
+Instance intel (all measured from this LAN, 2026-07-04):
+  * nitter.net           RSS ok, but a harsh per-IP token bucket: absorbs a
+                         burst, then HTTP 429 with ~40s/request refill while
+                         its Retry-After claims 1s. Fine for a few feeds at
+                         fetch-loop cadence; painful beyond that.
+  * nitter.poast.org     RSS ok and burst-tolerant (5 rapid hits -> 200).
+                         Its WAF 403s BROWSER UAs *and* all of HTTP/1.1 (the
+                         reason srr-x fetches over HTTP/2), so don't panic
+                         when it "fails" in Firefox or curl --http1.1.
+  * rss.xcancel.com      xcancel's dedicated RSS host (xcancel.com/…/rss
+                         redirects there; srr-x follows it), burst-tolerant,
+                         but answers a whitelist-request stub until you email
+                         them your reader ID (the stub tells you how).
+  * everyone else tracked by status.d420.de had RSS disabled or broken.
+Note nitter serves no ETag/Last-Modified today; the etag/last-modified
+cursor is honored per the external-ingest contract anyway, so a future
+instance that does send them gets 304s for free.
+
+SELF-HOSTING MEDIA — --selfhost
+-------------------------------
+By default images stay hotlinked at their rewritten pbs.twimg.com URLs — the
+strategy downloads nothing but the feed XML. Add --selfhost to download each
+image into the SRR store instead (straight from the CDN, never through the
+nitter proxy). A download that fails (CDN hiccup, over srrb's
+--max-asset-size cap) falls back to its hotlink: pbs.twimg.com URLs are
+public and stable, so degrading beats failing the cycle. `srr dev preview`
+sends no asset_dir (self-hosting off), so previews hotlink too.
+
+MANUAL RUNS (parameters instead of stdin)
+-----------------------------------------
+Normally srrb drives this script by writing a JSON request to stdin. To test
+an account by hand, pass it as an argument instead — the request is built
+from parameters and the result is pretty-printed:
+
+  srr-x "https://x.com/NASA"
+  srr-x --selfhost @NASA --asset-dir /tmp/store
+
+  <account>                 the account: an x.com/twitter.com/nitter URL,
+                            @handle, or bare handle
+  --etag <value>            HTTP ETag from the previous run (sent as
+                            If-None-Match; unchanged feed -> not_modified)
+  --last-modified <value>   HTTP Last-Modified from the previous run
+                            (sent as If-Modified-Since)
+  --asset-dir <dir>         store dir to download media into (what srrb
+                            sends as asset_dir; only used with --selfhost)
+  --max-asset-size <bytes>  per-file media cap (absent/0 = no cap)
+"""
+import sys, os, re, json, html, urllib.parse, urllib.request, urllib.error
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+
+import httpx
+from bs4 import BeautifulSoup
+
+NS = {"dc": "http://purl.org/dc/elements/1.1/"}
+
+VERSION = "1.0"
+
+UA = {"User-Agent": "SRR-x"}
+SELFHOST = False               # set by --selfhost; media downloads only when set
+NO_RETWEETS = False            # set by --no-retweets; drops "RT by @..." items
+NO_REPLIES = False             # set by --no-replies; drops "R to @..." items
+INSTANCE = "https://nitter.net"  # set by --instance; who serves the RSS
+
+USER_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+# Nitter's reply title jargon (rss.nimf): "R to @<user>: <text>". Mutually
+# exclusive with the "Pinned: " and "RT by @<user>: " prefixes, in that order.
+REPLY_RE = re.compile(r"^R to (@[A-Za-z0-9_]{1,15}): (.*)$", re.S)
+
+
+def fnv1a32(s: str) -> int:
+    h = 0x811C9DC5
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def log(*a):
+    print("srr-x:", *a, file=sys.stderr)
+
+
+def username_from_url(url: str) -> str:
+    """Any accepted account form -> bare username (or a loud exit)."""
+    u = (url or "").strip().lstrip("@")
+    if "/" in u:                       # URL form: the first path segment
+        if "://" not in u:
+            u = "https://" + u
+        path = urllib.parse.urlsplit(u).path.strip("/")
+        u = path.split("/", 1)[0].lstrip("@")
+    if not USER_RE.match(u):
+        sys.exit(f"srr-x: cannot find an X username in {url!r}")
+    return u
+
+
+def feed_url(url: str) -> str:
+    return f"{INSTANCE}/{username_from_url(url)}/rss"
+
+
+# The feed fetch rides httpx over HTTP/2: nitter.poast.org's WAF 403s every
+# HTTP/1.1 request (measured 2026-07-04 — same URL and UA pass on h2), and
+# urllib can't speak h2. CDN media downloads stay on urllib below: pbs.twimg.com
+# has no such gate, and download()'s semantics are shared with srr-youtube.
+HTTP = None
+
+
+def http_client():
+    global HTTP
+    if HTTP is None:
+        HTTP = httpx.Client(http2=True, headers=UA, follow_redirects=True,
+                            timeout=30)
+    return HTTP
+
+
+def fetch_feed(req):
+    """GET the account's RSS off the instance honoring the etag/last-modified
+    cursor. -> (body, etag, last_modified), or None when nothing changed (304)."""
+    hdr = {}
+    if req.get("etag"):
+        hdr["If-None-Match"] = req["etag"]
+    if req.get("last_modified"):
+        hdr["If-Modified-Since"] = req["last_modified"]
+    cap = req.get("max_size") or 8_000_000
+    with http_client().stream("GET", feed_url(req["url"]), headers=hdr) as r:
+        if r.status_code == 304:          # nothing new since our cursor
+            return None
+        if r.status_code == 429:
+            # Retrying in-process is pointless: nitter.net's Retry-After says
+            # 1s but the drained bucket measured ~40s/request (2026-07-04).
+            sys.exit(f"srr-x: {urllib.parse.urlsplit(INSTANCE).netloc} "
+                     f"rate-limited this IP (HTTP 429; its Retry-After header "
+                     f"is untrustworthy) — wait it out, space the polls, or "
+                     f"switch --instance (see --help)")
+        r.raise_for_status()
+        body = b""
+        for chunk in r.iter_bytes(64 * 1024):
+            body += chunk
+            if len(body) >= cap:
+                break
+    return (body[:cap], r.headers.get("ETag", ""),
+            r.headers.get("Last-Modified", ""))
+
+
+def direct_media_url(enc_path: str) -> str:
+    """nitter's /pic/<percent-encoded> proxy path -> direct CDN URL. Host-less
+    paths (media/..., amplify_video_thumb/...) live on pbs.twimg.com; a leading
+    orig/ is nitter's full-size marker, ?name=orig on the CDN."""
+    p = urllib.parse.unquote(enc_path)
+    size = ""
+    if p.startswith("orig/"):
+        p, size = p[len("orig/"):], "?name=orig"
+    if "." not in p.split("/", 1)[0]:     # first segment isn't a hostname
+        p = "pbs.twimg.com/" + p
+    return "https://" + p + size
+
+
+def rewrite_url(u: str, host: str) -> str:
+    """Point a nitter URL back at its canonical home; leave the rest alone."""
+    parts = urllib.parse.urlsplit(u)
+    if parts.netloc != host:
+        return u
+    if parts.path.startswith("/pic/"):
+        return direct_media_url(parts.path[len("/pic/"):])
+    # mention / status / search: same path+query on x.com, #m fragment dropped
+    return urllib.parse.urlunsplit(("https", "x.com", parts.path, parts.query, ""))
+
+
+def download(url: str, dest: str, cap: int) -> str:
+    """Stream url to dest honoring the byte cap; a partial file never lands at
+    dest (.part + rename, so a run killed mid-download can't leave a truncated
+    file for a later cycle to reuse). -> 'ok' | 'toobig' | 'missing' | 'error'."""
+    tmp = dest + ".part"
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(url, headers=UA), timeout=30) as r:
+            clen = int(r.headers.get("Content-Length") or 0)
+            if cap and clen > cap:
+                return "toobig"
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            n = 0
+            with open(tmp, "wb") as fh:
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    n += len(chunk)
+                    if cap and n > cap:
+                        return "toobig"
+                    fh.write(chunk)
+        if n == 0 or (clen and n != clen):
+            return "error"    # empty or truncated body
+        os.replace(tmp, dest)
+        return "ok"
+    except urllib.error.HTTPError as e:
+        return "missing" if e.code == 404 else "error"
+    except (OSError, ValueError):
+        return "error"
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def asset_rel(url: str) -> str:
+    """Store-relative name for a CDN URL: content-addressed by the URL itself
+    (Twitter media keys are opaque; hashing dodges cross-directory collisions)."""
+    ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1] or ".jpg"
+    return "x/%08x%s" % (fnv1a32(url), ext)
+
+
+# A failed download other than a plain 404 latches downloading off for the rest
+# of the run, so a CDN hiccup degrades to hotlinks once instead of stalling on
+# every image.
+probing = True
+
+
+def selfhost_media(url: str, asset_dir: str, cap: int):
+    """Download one image into the store. -> '#/x/<name>' marker, or None to
+    fall back to hotlinking (missing media, over-cap file, CDN trouble)."""
+    global probing
+    rel = asset_rel(url)
+    dest = os.path.join(asset_dir, rel)
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        # Refresh the mtime so srrb's post-cycle age-based cache sweep never
+        # deletes a file a live feed still consumes.
+        os.utime(dest, None)
+        return "#/" + rel
+    if not probing:
+        return None
+    st = download(url, dest, cap)
+    if st == "ok":
+        return "#/" + rel
+    if st == "toobig":
+        log(f"media over asset cap {cap}: {url}")
+    elif st == "error":
+        probing = False       # network trouble, not a missing file
+    return None
+
+
+def build_content(desc_html, host, creator, is_rt, reply_to, asset_dir, cap):
+    """Rewrite one item's description: every URL pointed home, styles dropped,
+    --selfhost markers swapped in, retweets attributed to their author and
+    replies to the account they answer."""
+    soup = BeautifulSoup(desc_html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        old, new = a["href"], rewrite_url(a["href"], host)
+        a["href"] = new
+        # Quote citations show the raw nitter URL as the link text — keep the
+        # visible text canonical too.
+        if a.string and a.string.strip() == old:
+            a.string.replace_with(new)
+    for img in soup.find_all("img", src=True):
+        src = rewrite_url(img["src"], host)
+        if SELFHOST and asset_dir and src.startswith("https://"):
+            marker = selfhost_media(src, asset_dir, cap)
+            if marker:
+                src = marker
+        attrs = {"src": src}              # drops nitter's max-width style
+        if img.get("alt"):
+            attrs["alt"] = img["alt"]
+        img.attrs = attrs
+    out = str(soup)
+    if is_rt and creator:
+        u = html.escape(creator.lstrip("@"))
+        out = f'<p>RT <a href="https://x.com/{u}">@{u}</a></p>' + out
+    elif reply_to:
+        u = html.escape(reply_to.lstrip("@"))
+        out = f'<p>↩ replying to <a href="https://x.com/{u}">@{u}</a></p>' + out
+    return out
+
+
+def build_items(body, asset_dir, cap):
+    host = urllib.parse.urlsplit(INSTANCE).netloc
+    items = []
+    # lstrip: rss.xcancel.com pads its XML with leading whitespace, which the
+    # XML spec (and ET) reject before the declaration.
+    for it in ET.fromstring(body.lstrip()).iter("item"):
+        title = (it.findtext("title") or "").strip()
+        is_rt, reply_to = False, None
+        if title.startswith("Pinned: "):      # old tweet re-surfacing at the
+            title = title[len("Pinned: "):]   # top; guid dedup ingests it once
+        elif title.startswith("RT by @"):
+            is_rt = True
+        else:
+            m = REPLY_RE.match(title)
+            if m:                             # a self-thread continuation (the
+                reply_to, title = m.groups()  # Posts tab carries no other kind)
+        if (NO_RETWEETS and is_rt) or (NO_REPLIES and reply_to):
+            continue
+        tid = (it.findtext("guid") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        creator = (it.findtext("dc:creator", "", NS) or "").strip()
+        try:
+            pub = parsedate_to_datetime(it.findtext("pubDate", "")).isoformat()
+        except (TypeError, ValueError):
+            pub = None
+        items.append({
+            "guid": fnv1a32(tid or link),     # tweet ids are globally unique
+            "title": (title[:117] + "…") if len(title) > 118 else title,
+            "content": build_content(it.findtext("description") or "", host,
+                                     creator, is_rt, reply_to, asset_dir, cap),
+            "link": rewrite_url(link, host),
+            "published": pub,
+        })
+    return items
+
+
+def run_ingest(req):
+    got = fetch_feed(req)
+    if got is None:
+        return {"not_modified": True}
+    body, etag, last_modified = got
+    asset_dir = req.get("asset_dir") or ""
+    # srrb's --max-asset-size cap, sent per request as max_asset_size (bytes);
+    # 0 = no cap. Honored at download time, per the external-ingest contract.
+    cap = int(req.get("max_asset_size") or 0)
+    return {
+        "items": build_items(body, asset_dir, cap),
+        "etag": etag,
+        "last_modified": last_modified,
+    }
+
+
+def strip_mode_flags(argv):
+    """Pull the mode flags (valid in both stdin and manual runs) out of argv;
+    what remains decides stdin vs manual mode."""
+    global SELFHOST, NO_RETWEETS, NO_REPLIES, INSTANCE
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--selfhost":
+            SELFHOST = True
+        elif a == "--no-retweets":
+            NO_RETWEETS = True
+        elif a == "--no-replies":
+            NO_REPLIES = True
+        elif a == "--instance":
+            if i + 1 >= len(argv):
+                sys.exit("srr-x: --instance needs a value")
+            INSTANCE = argv[i + 1].rstrip("/")
+            i += 1
+        else:
+            out.append(a)
+        i += 1
+    return out
+
+
+CLI_PARAMS = {"--etag": "etag", "--last-modified": "last_modified",
+              "--asset-dir": "asset_dir", "--max-asset-size": "max_asset_size"}
+
+
+def request_from_argv(argv):
+    """CLI parameters -> the same request dict srrb sends as JSON on stdin."""
+    req, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in CLI_PARAMS:
+            if i + 1 >= len(argv):
+                sys.exit(f"srr-x: {a} needs a value")
+            req[CLI_PARAMS[a]] = argv[i + 1]
+            i += 2
+        elif a.startswith("-"):
+            sys.exit(f"srr-x: unknown option {a!r} (see --help)")
+        elif "url" in req:
+            sys.exit(f"srr-x: more than one account given "
+                     f"({req['url']!r}, {a!r})")
+        else:
+            req["url"] = a
+            i += 1
+    if "url" not in req:
+        sys.exit("srr-x: missing account (see --help)")
+    if "max_asset_size" in req:
+        try:
+            req["max_asset_size"] = int(req["max_asset_size"])
+        except ValueError:
+            sys.exit(f"srr-x: --max-asset-size must be a byte count, "
+                     f"got {req['max_asset_size']!r}")
+    return req
+
+
+def cmd_ingest(req=None):
+    # req is built from CLI parameters (manual run) or, when None, read as the
+    # JSON request srrb writes to stdin (the SRR external-ingest contract).
+    pretty = req is not None
+    if req is None:
+        try:
+            req = json.load(sys.stdin)
+        except json.JSONDecodeError as e:
+            sys.exit(f"srr-x: could not parse request on stdin: {e}")
+    try:
+        result = run_ingest(req)
+    except (httpx.HTTPError, urllib.error.URLError) as e:
+        sys.exit(f"srr-x: feed fetch failed: {e}")
+    if pretty:
+        # manual run: readable for a human, not byte-compatible with srrb's
+        json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+    else:
+        json.dump(result, sys.stdout)
+
+
+def main():
+    argv = strip_mode_flags(sys.argv[1:])
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if argv and argv[0] in ("version", "--version", "-V"):
+        print("srr-x", VERSION)
+        return
+    cmd_ingest(request_from_argv(argv) if argv else None)
+
+
+if __name__ == "__main__":
+    main()
