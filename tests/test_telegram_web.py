@@ -53,8 +53,8 @@ for url, want in [
 ]:
     check("web_username(%r)" % url, mod.web_username(url), want)
 
-check_true("web is the default mode (--auth opts into MTProto)",
-           mod.AUTH_MODE is False)
+check_true("account (MTProto) is the default mode (--no-auth opts into web)",
+           mod.AUTH_MODE is True)
 
 
 # --- rich-text cleaning ------------------------------------------------------

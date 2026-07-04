@@ -12,11 +12,12 @@
 Reads a Telegram channel and turns each message — or each album — into an SRR
 article, self-hosting its photos and videos into the SRR store. Two modes:
 
-  * WEB (no-account) mode — the DEFAULT: public channels via the public web
-    preview (https://t.me/s/<username>). Needs no credentials at all.
-  * ACCOUNT (MTProto) mode — `srr-telegram --auth`: private (and public)
-    channels via your own user account (the Telethon library). Needs the
-    one-time login below.
+  * ACCOUNT (MTProto) mode — the DEFAULT: private (and public) channels via
+    your own user account (the Telethon library). Needs the one-time login
+    below.
+  * WEB (no-account) mode — `srr-telegram --no-auth`: public channels via the
+    public web preview (https://t.me/s/<username>). Needs no credentials at
+    all.
 
 Dependencies are declared inline (PEP 723) and managed by `uv`: the shebang runs
 the script via `uv run --script`, which resolves Telethon + cryptg into a cached
@@ -28,28 +29,8 @@ to (as admin), can't read history before it joined, and the Bot API caps media
 downloads at ~20 MB. A user session reads any channel/group YOU are a member of
 and downloads media of any size.
 
-WEB (NO-ACCOUNT) MODE — the default
------------------------------------
-Public channels need no account: unless --auth is given, srr-telegram scrapes
-the channel's public web preview. No credentials, no setup:
-
-     srrb chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram"
-
-Any public-username URL form works (https://t.me/s/<name>, https://t.me/<name>,
-@<name>). Private forms (t.me/c/<id>, invite links, numeric ids) have no public
-preview — subscribe those through the account mode: `-i "srr-telegram --auth"`.
-`--web` is accepted as an explicit synonym for the default.
-
-Trade-offs vs account mode: public channels with previews enabled only; photos
-and videos are self-hosted from the preview CDN (its video URLs expire, so they
-are downloaded at fetch time), but videos above the preview size limit have no
-downloadable URL — an "open in Telegram" link is emitted instead; voice notes,
-stickers and documents are skipped; items carry a different dedup guid than
-account mode (the preview page hides the numeric channel id), so switching an
-existing feed between modes re-imports its backlog once.
-
-ONE-TIME SETUP (account mode only)
---------------
+ONE-TIME SETUP (skip if you only use --no-auth)
+-----------------------------------------------
 1. Install uv (https://docs.astral.sh/uv/) if it isn't already.
 2. Get an API id + hash from https://my.telegram.org  ->  "API development tools".
 3. Mint a login session (interactive: phone number, login code, optional 2FA):
@@ -62,8 +43,8 @@ ONE-TIME SETUP (account mode only)
    srrb-prod-fetch service environment, or an env file it sources). The session
    string is a credential — treat it like a password.
 
-SUBSCRIBE A CHANNEL (account mode)
-----------------------------------
+SUBSCRIBE A CHANNEL
+-------------------
 The channel's SRR `url` is any of: a private link `https://t.me/c/<id>` (open the
 channel in Telegram Web/Desktop to read the id off the URL), a public
 `https://t.me/<username>` / `@username`, an invite link `https://t.me/+<hash>`
@@ -71,11 +52,31 @@ channel in Telegram Web/Desktop to read the id off the URL), a public
 
      srrb chan add -t "My private channel" \
        -u "https://t.me/c/1234567890" \
-       -i "srr-telegram --auth"
+       -i "srr-telegram"
 
 Preview without deploying (media is NOT downloaded in preview — placeholders shown):
      SRR_TG_API_ID=… SRR_TG_API_HASH=… SRR_TG_SESSION=… \
-       srrb preview "https://t.me/c/1234567890" -i "srr-telegram --auth" -a 127.0.0.1:8098
+       srrb preview "https://t.me/c/1234567890" -i "srr-telegram" -a 127.0.0.1:8098
+
+WEB (NO-ACCOUNT) MODE — `--no-auth`
+-----------------------------------
+Public channels need no account: with --no-auth, srr-telegram scrapes the
+channel's public web preview instead. No credentials, no setup:
+
+     srrb chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth"
+
+Any public-username URL form works (https://t.me/s/<name>, https://t.me/<name>,
+@<name>). Private forms (t.me/c/<id>, invite links, numeric ids) have no public
+preview — subscribe those through the default account mode. `--auth` is
+accepted as an explicit synonym for the default.
+
+Trade-offs vs account mode: public channels with previews enabled only; photos
+and videos are self-hosted from the preview CDN (its video URLs expire, so they
+are downloaded at fetch time), but videos above the preview size limit have no
+downloadable URL — an "open in Telegram" link is emitted instead; voice notes,
+stickers and documents are skipped; items carry a different dedup guid than
+account mode (the preview page hides the numeric channel id), so switching an
+existing feed between modes re-imports its backlog once.
 
 ENVIRONMENT
 -----------
@@ -119,7 +120,7 @@ try:
 except ModuleNotFoundError:
     bs4 = BeautifulSoup = None   # only web (no-account) mode needs it
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 
 # --- config -----------------------------------------------------------------
@@ -136,7 +137,7 @@ def env_bool(name):
 BACKFILL = env_int("SRR_TG_BACKFILL", 20)
 MAX_BATCH = env_int("SRR_TG_MAX_BATCH", 200)
 INCLUDE_DOCS = env_bool("SRR_TG_INCLUDE_DOCS")
-AUTH_MODE = False   # set by --auth in main(); default is the web (no-account) mode
+AUTH_MODE = True   # cleared by --no-auth in main(); default is the account (MTProto) mode
 
 
 def fnv1a32(s: str) -> int:
@@ -714,7 +715,7 @@ def run_web_ingest(req):
     if not username:
         sys.exit("srr-telegram: web (no-account) mode only reads PUBLIC channels "
                  "by username (https://t.me/s/<name>, https://t.me/<name>, "
-                 "@<name>) — %r needs the account mode: srr-telegram --auth" % url)
+                 "@<name>) — %r needs the account mode: drop --no-auth" % url)
     asset_dir = req.get("asset_dir") or ""
     max_media = int(req.get("max_asset_size") or 0)
     try:
@@ -726,7 +727,7 @@ def run_web_ingest(req):
     if not exists:
         sys.exit("srr-telegram: no public preview for @%s — the channel is "
                  "private, nonexistent, or has previews disabled; it needs the "
-                 "account mode: srr-telegram --auth" % username)
+                 "account mode: drop --no-auth" % username)
 
     items, max_id = [], cursor
     for w in widgets[:MAX_BATCH]:
@@ -817,11 +818,11 @@ def cmd_login(argv):
 def main():
     global AUTH_MODE
     argv = sys.argv[1:]
-    if "--auth" in argv and "--web" in argv:
-        sys.exit("srr-telegram: --auth and --web are mutually exclusive")
-    AUTH_MODE = "--auth" in argv
-    # --web is the default; accepted so recipes can spell the mode out.
-    argv = [a for a in argv if a not in ("--auth", "--web")]
+    if "--auth" in argv and "--no-auth" in argv:
+        sys.exit("srr-telegram: --auth and --no-auth are mutually exclusive")
+    AUTH_MODE = "--no-auth" not in argv
+    # --auth is the default; accepted so recipes can spell the mode out.
+    argv = [a for a in argv if a not in ("--auth", "--no-auth")]
     if argv and argv[0] == "login":
         return cmd_login(argv[1:])
     if argv and argv[0] in ("-h", "--help", "help"):
