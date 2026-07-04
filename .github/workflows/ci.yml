@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v7   # latest floating major (v8.x has no v8 alias yet); node24
         with:
           enable-cache: true
       - name: Install deps (fails if uv.lock is stale)
