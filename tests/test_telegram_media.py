@@ -143,7 +143,7 @@ finally:
     shutil.rmtree(tmp)
 
 # 3. A download that 'succeeds' with fewer bytes than advertised must fail the
-#    cycle (so srrb retries) instead of publishing a truncated file.
+#    cycle (so srr retries) instead of publishing a truncated file.
 tmp = tempfile.mkdtemp()
 try:
     dest = os.path.join(tmp, DEST_REL)
@@ -159,7 +159,7 @@ finally:
     shutil.rmtree(tmp)
 
 # 4. A complete cached file (exact advertised size) is reused without any
-#    network call — and reuse refreshes its mtime, so srrb's age-based cache
+#    network call — and reuse refreshes its mtime, so srr's age-based cache
 #    sweep never deletes a file a live feed still consumes.
 tmp = tempfile.mkdtemp()
 try:

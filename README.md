@@ -1,7 +1,7 @@
 # srr-toolbox
 
-External ingest strategies for **SRR** (Static RSS Reader — the Go `srrb` backend +
-TypeScript frontend living in `~/ws/srr`): the `srr-*` scripts that teach `srrb` to
+External ingest strategies for **SRR** (Static RSS Reader — the Go `srr` backend +
+TypeScript frontend living in `~/ws/srr`): the `srr-*` scripts that teach `srr` to
 ingest sources that don't speak usable RSS.
 
 ## Layout
@@ -15,7 +15,7 @@ tests/            self-checking test scripts + fixtures
 pyproject.toml    shared dependencies for every bin/ script, pinned by uv.lock
 ```
 
-Every `bin/` entry point must be reachable from `PATH` — `srrb` resolves ingest
+Every `bin/` entry point must be reachable from `PATH` — `srr` resolves ingest
 strategies by bare name, and `srr-uvrun` shebangs rely on it too. Symlinks into a
 PATH dir work fine (`srr-uvrun` sees through them via `readlink -f`), as does
 putting `bin/` on `PATH` directly. A missing entry fails loudly, never silently
@@ -23,7 +23,7 @@ wrong.
 
 ## Ingest strategies
 
-Each is an executable that `srrb` drives through the external-ingest contract: a JSON
+Each is an executable that `srr` drives through the external-ingest contract: a JSON
 request on stdin, SRR items as JSON on stdout. Subscribe a channel to one with
 `-i "<strategy> [flags]"`; all three also accept the URL as a CLI argument for manual
 testing (the result is pretty-printed).
@@ -44,8 +44,8 @@ photos and videos into the SRR store. Two modes:
   into the store like account mode does.
 
 ```bash
-srrb chan add -t "My private channel" -u "https://t.me/c/1234567890" -i "srr-telegram"
-srrb chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
+srr chan add -t "My private channel" -u "https://t.me/c/1234567890" -i "srr-telegram"
+srr chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
 ```
 
 ### `srr-youtube`
@@ -58,7 +58,7 @@ store, falling back to the hotlink if a download fails (those URLs are public an
 stable, so degrading beats failing the cycle). The video itself is never downloaded.
 
 ```bash
-srrb chan add -t "Veritasium" \
+srr chan add -t "Veritasium" \
   -u "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA" \
   -i "srr-youtube --selfhost"
 ```
@@ -76,7 +76,7 @@ does). Retweets and self-reply threads are attributed and kept (`--no-retweets` 
 measured per-instance quirks (rate limits, an HTTP/2-only WAF, whitelisting).
 
 ```bash
-srrb chan add -t "NASA" -u "https://x.com/NASA" -i "srr-x"
+srr chan add -t "NASA" -u "https://x.com/NASA" -i "srr-x"
 ```
 
 ## Python setup
@@ -84,7 +84,7 @@ srrb chan add -t "NASA" -u "https://x.com/NASA" -i "srr-x"
 All Python scripts share **one** uv project: dependencies are declared once in the
 repo-root `pyproject.toml` and pinned by the committed `uv.lock`. Their shebangs go
 through `bin/srr-uvrun`, which locates the repo from its own resolved path and execs
-`uv run --project <repo> --script`, so any invocation — the shell, srrb's fetch loop,
+`uv run --project <repo> --script`, so any invocation — the shell, srr's fetch loop,
 the tests — resolves the same `.venv` from any cwd, wherever the checkout lives.
 (The indirection exists because a shebang can't be script-relative: a relative
 `--project` resolves against the *invoker's* cwd, which silently picks the wrong

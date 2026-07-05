@@ -35,7 +35,7 @@ ONE-TIME SETUP (skip if you only use --no-auth)
      srr-telegram login            # prints a StringSession + the env lines to keep
 
    Save the three SRR_TG_* values where the SRR fetch loop can see them (e.g. the
-   srrb-fetch service environment, or an env file it sources). The session
+   srr-fetch service environment, or an env file it sources). The session
    string is a credential — treat it like a password.
 
 SUBSCRIBE A CHANNEL
@@ -81,7 +81,7 @@ re-imports its backlog once.
 
 MANUAL RUNS (parameters instead of stdin)
 -----------------------------------------
-Normally srrb drives this script by writing a JSON request to stdin. To test a
+Normally srr drives this script by writing a JSON request to stdin. To test a
 channel by hand, pass the URL as an argument instead — the request is built
 from parameters and the result is pretty-printed:
 
@@ -92,7 +92,7 @@ from parameters and the result is pretty-printed:
   <url>                     the channel (same forms as the SRR `url` above)
   --etag <cursor>           resume after this message id (absent = first run,
                             so SRR_TG_BACKFILL recent messages are ingested)
-  --asset-dir <dir>         store dir to self-host media into (what srrb sends
+  --asset-dir <dir>         store dir to self-host media into (what srr sends
                             as asset_dir; absent = placeholders instead)
   --max-asset-size <bytes>  per-file media cap (absent/0 = no cap)
 
@@ -106,9 +106,9 @@ ENVIRONMENT
   SRR_TG_MAX_BATCH     max messages (albums count as members) per fetch (default 200)
   SRR_TG_INCLUDE_DOCS  "true" to also self-host non-image/video documents as links
 
-The media size cap is NOT configured here: srrb sends its --max-asset-size as the
+The media size cap is NOT configured here: srr sends its --max-asset-size as the
 per-request max_asset_size, and media over that is skipped with a "[… skipped: too
-large]" note in place of it. Keeping one cap (srrb's) avoids two drifting apart.
+large]" note in place of it. Keeping one cap (srr's) avoids two drifting apart.
 
 This is protocol boilerplate around Telethon; the SRR external-ingest contract is
 documented in ~/ws/srr/backend/README.md (Ingest Strategies).
@@ -334,14 +334,14 @@ async def media_element(client, msg, chan_id, asset_dir, max_media):
     rel = "tg/%d/%d%s" % (chan_id, msg.id, ext)
     dest = os.path.join(asset_dir, rel)
     if cache_complete(dest, size):
-        # Refresh the mtime so srrb's post-cycle age-based cache sweep never
+        # Refresh the mtime so srr's post-cycle age-based cache sweep never
         # deletes a file a live feed still consumes (e.g. while a big backlog
         # warms up across failing cycles).
         os.utime(dest, None)
     else:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         # Download to a .part file and rename into place only once complete, so
-        # a run killed mid-download (srrb cmd-timeout, crash, dropped
+        # a run killed mid-download (srr cmd-timeout, crash, dropped
         # connection) can never leave a truncated file at dest for a later
         # cycle to reuse and publish (the live chron-437 moov-less mp4 bug).
         part = dest + ".part"
@@ -423,7 +423,7 @@ async def run_ingest(req):
     api_id, api_hash = credentials()
     session = load_session()
     asset_dir = req.get("asset_dir") or ""
-    # srrb's --max-asset-size cap, sent per request as max_asset_size (bytes); 0 = no cap.
+    # srr's --max-asset-size cap, sent per request as max_asset_size (bytes); 0 = no cap.
     max_media = int(req.get("max_asset_size") or 0)
     # Our cursor is the highest message id seen, stored as the etag. A
     # non-numeric etag (e.g. a leftover HTTP etag from a prior #rss strategy)
@@ -793,7 +793,7 @@ CLI_PARAMS = {"--etag": "etag", "--asset-dir": "asset_dir",
 
 
 def request_from_argv(argv):
-    """CLI parameters -> the same request dict srrb sends as JSON on stdin."""
+    """CLI parameters -> the same request dict srr sends as JSON on stdin."""
     req, i = {}, 0
     while i < len(argv):
         a = argv[i]
@@ -825,7 +825,7 @@ def request_from_argv(argv):
 
 def cmd_ingest(req=None):
     # req is built from CLI parameters (manual run) or, when None, read as the
-    # JSON request srrb writes to stdin (the SRR external-ingest contract).
+    # JSON request srr writes to stdin (the SRR external-ingest contract).
     pretty = req is not None
     if req is None:
         try:
@@ -850,7 +850,7 @@ def cmd_ingest(req=None):
         except urllib.error.URLError as e:
             sys.exit("srr-telegram: t.me fetch failed: %s" % e)
     if pretty:
-        # manual run: readable for a human, not byte-compatible with srrb's
+        # manual run: readable for a human, not byte-compatible with srr's
         json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
         print()
     else:

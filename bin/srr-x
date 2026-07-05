@@ -34,7 +34,7 @@ Videos are never downloaded in any mode: nitter's Video placeholder becomes
 a clickable poster linking to the tweet, like srr-youtube's thumbnails. The
 synthesized body survives #sanitize (img src / a href are allowlisted; no
 scripts). Tweets have no natural titles — the tweet text lands in the
-title, capped like srr-telegram's, so consider srrb's no-title feed option.
+title, capped like srr-telegram's, so consider srr's no-title feed option.
 
 Subscribe with any form that names the account — an x.com / twitter.com /
 nitter URL, @handle, or bare handle:
@@ -70,14 +70,14 @@ SELF-HOSTING MEDIA — --selfhost
 By default images stay hotlinked at their rewritten pbs.twimg.com URLs — the
 strategy downloads nothing but the feed XML. Add --selfhost to download each
 image into the SRR store instead (straight from the CDN, never through the
-nitter proxy). A download that fails (CDN hiccup, over srrb's
+nitter proxy). A download that fails (CDN hiccup, over srr's
 --max-asset-size cap) falls back to its hotlink: pbs.twimg.com URLs are
 public and stable, so degrading beats failing the cycle. `srr dev preview`
 sends no asset_dir (self-hosting off), so previews hotlink too.
 
 MANUAL RUNS (parameters instead of stdin)
 -----------------------------------------
-Normally srrb drives this script by writing a JSON request to stdin. To test
+Normally srr drives this script by writing a JSON request to stdin. To test
 an account by hand, pass it as an argument instead — the request is built
 from parameters and the result is pretty-printed:
 
@@ -90,7 +90,7 @@ from parameters and the result is pretty-printed:
                             If-None-Match; unchanged feed -> not_modified)
   --last-modified <value>   HTTP Last-Modified from the previous run
                             (sent as If-Modified-Since)
-  --asset-dir <dir>         store dir to download media into (what srrb
+  --asset-dir <dir>         store dir to download media into (what srr
                             sends as asset_dir; only used with --selfhost)
   --max-asset-size <bytes>  per-file media cap (absent/0 = no cap)
 """
@@ -271,7 +271,7 @@ def selfhost_media(url: str, asset_dir: str, cap: int):
     rel = asset_rel(url)
     dest = os.path.join(asset_dir, rel)
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
-        # Refresh the mtime so srrb's post-cycle age-based cache sweep never
+        # Refresh the mtime so srr's post-cycle age-based cache sweep never
         # deletes a file a live feed still consumes.
         os.utime(dest, None)
         return "#/" + rel
@@ -361,7 +361,7 @@ def run_ingest(req):
         return {"not_modified": True}
     body, etag, last_modified = got
     asset_dir = req.get("asset_dir") or ""
-    # srrb's --max-asset-size cap, sent per request as max_asset_size (bytes);
+    # srr's --max-asset-size cap, sent per request as max_asset_size (bytes);
     # 0 = no cap. Honored at download time, per the external-ingest contract.
     cap = int(req.get("max_asset_size") or 0)
     return {
@@ -400,7 +400,7 @@ CLI_PARAMS = {"--etag": "etag", "--last-modified": "last_modified",
 
 
 def request_from_argv(argv):
-    """CLI parameters -> the same request dict srrb sends as JSON on stdin."""
+    """CLI parameters -> the same request dict srr sends as JSON on stdin."""
     req, i = {}, 0
     while i < len(argv):
         a = argv[i]
@@ -430,7 +430,7 @@ def request_from_argv(argv):
 
 def cmd_ingest(req=None):
     # req is built from CLI parameters (manual run) or, when None, read as the
-    # JSON request srrb writes to stdin (the SRR external-ingest contract).
+    # JSON request srr writes to stdin (the SRR external-ingest contract).
     pretty = req is not None
     if req is None:
         try:
@@ -442,7 +442,7 @@ def cmd_ingest(req=None):
     except (httpx.HTTPError, urllib.error.URLError) as e:
         sys.exit(f"srr-x: feed fetch failed: {e}")
     if pretty:
-        # manual run: readable for a human, not byte-compatible with srrb's
+        # manual run: readable for a human, not byte-compatible with srr's
         json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
         print()
     else:

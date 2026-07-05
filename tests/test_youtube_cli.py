@@ -1,5 +1,5 @@
 """Unit tests for srr-youtube's CLI request building (parameters instead of
-the stdin JSON that srrb normally sends).
+the stdin JSON that srr normally sends).
 
 Run in the repo's uv project venv (plain python3 works too — the script
 under test has no third-party deps):
@@ -51,7 +51,7 @@ FEED = "https://www.youtube.com/feeds/videos.xml?channel_id=UCabc"
 
 check_true("thumbnail download is opt-in (--selfhost)", mod.SELFHOST is False)
 
-# The request built from parameters must match what srrb sends on stdin.
+# The request built from parameters must match what srr sends on stdin.
 check("url only", mod.request_from_argv([FEED]), {"url": FEED})
 check("all params",
       mod.request_from_argv([FEED, "--etag", 'W/"abc"',

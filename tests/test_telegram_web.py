@@ -188,7 +188,7 @@ check("no --selfhost: oversized video keeps its dedicated placeholder",
       '<p><em>[video too large for the public preview — '
       '<a href="%s">open in Telegram</a>]</em></p>' % LINK)
 
-# With --selfhost but no store (srrb preview), placeholders only — no download.
+# With --selfhost but no store (srr preview), placeholders only — no download.
 mod.SELFHOST = True
 check("--selfhost without a store: bare placeholder",
       mod.web_media_element("image", "http://invalid.invalid/x.jpg", "tg/mychan/12",

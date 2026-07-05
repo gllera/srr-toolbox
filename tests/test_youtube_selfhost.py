@@ -148,7 +148,7 @@ with open(dest(), "rb") as fh:
 check_true("selfhost: no .part left behind", not os.path.exists(dest() + ".part"))
 
 # Cache: a stored file is reused without any request, and its mtime refreshed
-# (srrb's age-based cache sweep must never delete a file a live feed consumes).
+# (srr's age-based cache sweep must never delete a file a live feed consumes).
 os.utime(dest(), (1, 1))
 CALLS.clear()
 check("selfhost: cache hit -> marker, no request",
@@ -200,7 +200,7 @@ CALLS.clear()
 check("selfhost: latched off after network error",
       (mod.thumb_src("otherVid0002", HQ, STORE, 0), CALLS), (HQ, []))
 
-# No store (srrb preview sends no asset_dir) and no video id: hotlink path.
+# No store (srr preview sends no asset_dir) and no video id: hotlink path.
 reset({MAXRES: ("body", b"x")}, selfhost=True)
 check("selfhost without a store: hotlinks (preview)",
       mod.thumb_src(VID, HQ, "", 0), MAXRES)

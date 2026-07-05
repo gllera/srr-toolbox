@@ -1,7 +1,7 @@
 # Shared uv project for every Python script in bin/ (and the tests): one place
 # declaring the third-party deps, pinned by the committed uv.lock. The scripts'
 # shebangs go through bin/srr-uvrun, which self-locates the repo and execs
-# `uv run --project <repo> --script`, so any invocation — the shell, srrb's
+# `uv run --project <repo> --script`, so any invocation — the shell, srr's
 # fetch loop, the tests — resolves the same .venv from any cwd, wherever the
 # checkout lives.
 # No [build-system] on purpose: uv must install only the dependencies, never

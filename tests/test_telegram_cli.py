@@ -1,5 +1,5 @@
 """Unit tests for srr-telegram's CLI request building (parameters instead of
-the stdin JSON that srrb normally sends).
+the stdin JSON that srr normally sends).
 
 Run in the repo's uv project venv (deps come from pyproject.toml):
     uv run tests/test_telegram_cli.py
@@ -39,7 +39,7 @@ def check_exit(name, argv):
     failures.append(name)
 
 
-# The request built from parameters must match what srrb sends on stdin.
+# The request built from parameters must match what srr sends on stdin.
 check("url only", mod.request_from_argv(["https://t.me/s/durov"]),
       {"url": "https://t.me/s/durov"})
 check("all params",

@@ -285,7 +285,7 @@ with open(dest(), "rb") as fh:
     check("selfhost: CDN bytes stored", fh.read(), b"IMG-BYTES")
 
 # Cache: a stored file is reused without any request, and its mtime refreshed
-# (srrb's age-based cache sweep must never delete a file a live feed consumes).
+# (srr's age-based cache sweep must never delete a file a live feed consumes).
 os.utime(dest(), (1, 1))
 CALLS.clear()
 check("selfhost: cache hit -> marker, no request",

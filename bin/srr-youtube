@@ -28,14 +28,14 @@ poster links out to youtube.com):
     -u "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA" \
     -i "srr-youtube --selfhost"
 
-A thumbnail that can't be downloaded (CDN hiccup, over srrb's --max-asset-size
+A thumbnail that can't be downloaded (CDN hiccup, over srr's --max-asset-size
 cap) falls back to its hotlink: unlike Telegram's token-signed preview CDN,
 i.ytimg.com URLs are public and stable, so degrading beats failing the cycle.
 `srr dev preview` sends no asset_dir (self-hosting off), so previews hotlink too.
 
 MANUAL RUNS (parameters instead of stdin)
 -----------------------------------------
-Normally srrb drives this script by writing a JSON request to stdin. To test a
+Normally srr drives this script by writing a JSON request to stdin. To test a
 feed by hand, pass the URL as an argument instead — the request is built from
 parameters and the result is pretty-printed:
 
@@ -48,7 +48,7 @@ parameters and the result is pretty-printed:
                             If-None-Match; unchanged feed -> not_modified)
   --last-modified <value>   HTTP Last-Modified from the previous run
                             (sent as If-Modified-Since)
-  --asset-dir <dir>         store dir to download thumbnails into (what srrb
+  --asset-dir <dir>         store dir to download thumbnails into (what srr
                             sends as asset_dir; only used with --selfhost)
   --max-asset-size <bytes>  per-file thumbnail cap (absent/0 = no cap)
 """
@@ -169,7 +169,7 @@ def selfhost_thumb(vid: str, feed_url: str, asset_dir: str, cap: int):
     rel = f"yt/{vid}.jpg"
     dest = os.path.join(asset_dir, rel)
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
-        # Refresh the mtime so srrb's post-cycle age-based cache sweep never
+        # Refresh the mtime so srr's post-cycle age-based cache sweep never
         # deletes a file a live feed still consumes.
         os.utime(dest, None)
         return "#/" + rel
@@ -192,7 +192,7 @@ def selfhost_thumb(vid: str, feed_url: str, asset_dir: str, cap: int):
 
 
 def thumb_src(vid: str, feed_url: str, asset_dir: str, cap: int) -> str:
-    # --selfhost needs a store (srrb preview sends none) and a video id to name
+    # --selfhost needs a store (srr preview sends none) and a video id to name
     # the file; any download fallback hotlinks instead — i.ytimg.com URLs are
     # public and stable, so the item stays correct either way.
     if SELFHOST and asset_dir and vid:
@@ -236,7 +236,7 @@ def run_ingest(req):
         return {"not_modified": True}
     body, etag, last_modified = got
     asset_dir = req.get("asset_dir") or ""
-    # srrb's --max-asset-size cap, sent per request as max_asset_size (bytes);
+    # srr's --max-asset-size cap, sent per request as max_asset_size (bytes);
     # 0 = no cap. Honored at download time, per the external-ingest contract.
     cap = int(req.get("max_asset_size") or 0)
     return {
@@ -251,7 +251,7 @@ CLI_PARAMS = {"--etag": "etag", "--last-modified": "last_modified",
 
 
 def request_from_argv(argv):
-    """CLI parameters -> the same request dict srrb sends as JSON on stdin."""
+    """CLI parameters -> the same request dict srr sends as JSON on stdin."""
     req, i = {}, 0
     while i < len(argv):
         a = argv[i]
@@ -281,7 +281,7 @@ def request_from_argv(argv):
 
 def cmd_ingest(req=None):
     # req is built from CLI parameters (manual run) or, when None, read as the
-    # JSON request srrb writes to stdin (the SRR external-ingest contract).
+    # JSON request srr writes to stdin (the SRR external-ingest contract).
     pretty = req is not None
     if req is None:
         try:
@@ -293,7 +293,7 @@ def cmd_ingest(req=None):
     except urllib.error.URLError as e:
         sys.exit(f"srr-youtube: feed fetch failed: {e}")
     if pretty:
-        # manual run: readable for a human, not byte-compatible with srrb's
+        # manual run: readable for a human, not byte-compatible with srr's
         json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
         print()
     else:

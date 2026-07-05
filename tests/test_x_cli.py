@@ -115,7 +115,7 @@ check("feed URL follows --instance",
       mod.feed_url("@NASA"), "https://nitter.example/NASA/rss")
 reset_modes()
 
-# --- manual-run request building (must match srrb's stdin JSON) ----------------
+# --- manual-run request building (must match srr's stdin JSON) ----------------
 
 check("account only", mod.request_from_argv([ACCOUNT]), {"url": ACCOUNT})
 check("all params",
