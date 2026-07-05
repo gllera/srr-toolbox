@@ -82,7 +82,9 @@ Twitter-CDN URLs, so stored items stay instance-independent. GIF tweets skip
 the lookup entirely: nitter ships them as a native <video> whose mp4 rides
 its /pic/ proxy (captured 2026-07-05) — both URLs are rewritten canonical and
 the element is rebuilt flat, because srr's #sanitize would otherwise drop the
-<source> child (an unplayable poster-only box) and its autoplay/muted/loop.
+<source> child (an unplayable poster-only box). GIFs keep GIF-style playback
+(autoplay muted loop, allowed by srr's sanitizer since v3.3.2; older
+backends strip the trio, degrading to click-to-play).
 With --no-videos a GIF degrades to its canonical poster image. (A
 placeholder-style GIF thumb would also resolve request-free: its mp4 key is
 the thumb filename, tweet_video_thumb/K.jpg -> tweet_video/K.mp4.)
@@ -132,7 +134,7 @@ from bs4 import BeautifulSoup
 
 NS = {"dc": "http://purl.org/dc/elements/1.1/"}
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 UA = {"User-Agent": "SRR-x"}
 SELFHOST = False               # set by --selfhost; media downloads only when set
@@ -416,6 +418,23 @@ def selfhost_media(url: str, asset_dir: str, cap: int):
     return None
 
 
+def flat_video(soup, src, poster, gif):
+    """The one <video> shape emitted everywhere: the attr set srr's #sanitize
+    allowlists, same as srr-telegram's. GIFs additionally autoplay muted in a
+    loop — how every platform renders them; autoplay is only honored by
+    browsers when muted, so the trio travels together (needs the deployed srr
+    sanitizer >= v3.3.2 — older ones strip it, degrading to click-to-play)."""
+    v = soup.new_tag("video", src=src)
+    if poster:
+        v["poster"] = poster
+    v["controls"] = ""
+    v["preload"] = "metadata"
+    v["playsinline"] = ""
+    if gif:
+        v["autoplay"] = v["muted"] = v["loop"] = ""
+    return v
+
+
 def build_content(desc_html, host, creator, is_rt, reply_to, asset_dir, cap):
     """Rewrite one item's description: every URL pointed home, styles dropped,
     --selfhost markers swapped in, retweets attributed to their author and
@@ -449,17 +468,12 @@ def build_content(desc_html, host, creator, is_rt, reply_to, asset_dir, cap):
         src = rewrite_url(raw, host) if raw else ""
         poster = rewrite_url(v["poster"], host) if v.get("poster") else ""
         if VIDEOS and src.startswith("https://"):
+            gif = "/tweet_video/" in src      # decide before markers hide it
             if SELFHOST and asset_dir:
                 if poster:
                     poster = selfhost_media(poster, asset_dir, cap) or poster
                 src = selfhost_media(src, asset_dir, cap) or src
-            new = soup.new_tag("video", src=src)
-            if poster:
-                new["poster"] = poster
-            new["controls"] = ""
-            new["preload"] = "metadata"
-            new["playsinline"] = ""
-            v.replace_with(new)
+            v.replace_with(flat_video(soup, src, poster, gif))
         elif poster:
             v.replace_with(soup.new_tag("img", src=poster))
         else:
@@ -480,15 +494,12 @@ def build_content(desc_html, host, creator, is_rt, reply_to, asset_dir, cap):
             src = video_url(tid.group(1), thumb)
             if not src:
                 continue
+            gif = "/tweet_video/" in src      # decide before markers hide it
             poster = thumb
             if SELFHOST and asset_dir:
                 poster = selfhost_media(thumb, asset_dir, cap) or thumb
                 src = selfhost_media(src, asset_dir, cap) or src
-            video = soup.new_tag("video", src=src, poster=poster)
-            video["controls"] = ""
-            video["preload"] = "metadata"
-            video["playsinline"] = ""
-            a.replace_with(video)
+            a.replace_with(flat_video(soup, src, poster, gif))
     for img in soup.find_all("img", src=True):
         src = rewrite_url(img["src"], host)
         if SELFHOST and asset_dir and src.startswith("https://"):

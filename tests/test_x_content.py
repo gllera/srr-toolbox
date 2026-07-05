@@ -91,6 +91,10 @@ V_MP4 = ("https://video.twimg.com/amplify_video/2073121879032758272/"
 # bs4 serializes attributes alphabetically; %s slots are (poster, src).
 V_TAG = ('<video controls="" playsinline="" poster="%s" preload="metadata" '
          'src="%s"></video>')
+# GIFs additionally autoplay muted in a loop — how every platform renders
+# them (survives srr's #sanitize since v3.3.2).
+G_TAG = ('<video autoplay="" controls="" loop="" muted="" playsinline="" '
+         'poster="%s" preload="metadata" src="%s"></video>')
 SYND_JSON = {
     "__typename": "Tweet",
     "mediaDetails": [{
@@ -166,6 +170,9 @@ check("video: one syndication lookup, id + token as X's widget sends them",
 check("video: the token derives from the tweet id (value isn't validated — "
       "measured 2026-07-05 — but absence is)",
       getattr(mod, "syndication_token", lambda _: None)(V_TID), "5wwkigvtv9ap")
+check_true("video: real videos stay click-to-play (no GIF autoplay/loop)",
+           "autoplay" not in it["content"] and "loop" not in it["content"],
+           it["content"])
 
 it = by_guid(items, "2073373486597239210")     # RT with a mention + quote (@NASAEarth)
 check_true("item: mention links point at x.com",
@@ -370,13 +377,13 @@ check_true("pinned: no attribution line added",
 # drops <source> children and autoplay/muted/loop, so passing it through
 # yields an unplayable poster-only box; it must be rebuilt flat + canonical.
 it = items[3]                                   # GIF tweet
-check_true("gif: native video rebuilt flat with canonical CDN URLs",
-           (V_TAG % ("https://pbs.twimg.com/tweet_video_thumb/GGkey123.jpg",
+check_true("gif: native video rebuilt flat, canonical CDN URLs, GIF-style "
+           "autoplay/muted/loop",
+           (G_TAG % ("https://pbs.twimg.com/tweet_video_thumb/GGkey123.jpg",
                      "https://video.twimg.com/tweet_video/GGkey123.mp4"))
            in it["content"], it["content"])
-check_true("gif: sanitizer-doomed attrs (autoplay/loop/style) not re-emitted",
-           "autoplay" not in it["content"] and "loop" not in it["content"]
-           and "style=" not in it["content"], it["content"])
+check_true("gif: nitter's max-width style not re-emitted",
+           "style=" not in it["content"], it["content"])
 check_true("gif: no nitter URL survives in the item",
            "nitter.net" not in json.dumps(it))
 check("gif: rewrite is request-free (no syndication lookup)",
@@ -543,8 +550,9 @@ G_THUMB = "https://pbs.twimg.com/tweet_video_thumb/GGkey123.jpg"
 reset({G_MP4: ("body", b"GIF-MP4"), G_THUMB: ("body", b"GIF-THUMB")},
       selfhost=True)
 it = mod.build_items(SYNTH.encode(), store(), 0)[3]
-check_true("selfhost: native gif mp4 and poster use store markers",
-           (V_TAG % ("#/" + mod.asset_rel(G_THUMB),
+check_true("selfhost: native gif mp4 and poster use store markers, still "
+           "GIF-style",
+           (G_TAG % ("#/" + mod.asset_rel(G_THUMB),
                      "#/" + mod.asset_rel(G_MP4))) in it["content"],
            it["content"])
 
