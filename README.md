@@ -1,14 +1,12 @@
 # srr-toolbox
 
-Ops tooling and external ingest strategies for **SRR** (Static RSS Reader — the Go
-`srrb` backend + TypeScript frontend living in `~/ws/srr`). This repo is what runs
-*around* SRR: the single command that operates the two local deployments, and the
-`srr-*` scripts that teach `srrb` to ingest sources that don't speak usable RSS.
+External ingest strategies for **SRR** (Static RSS Reader — the Go `srrb` backend +
+TypeScript frontend living in `~/ws/srr`): the `srr-*` scripts that teach `srrb` to
+ingest sources that don't speak usable RSS.
 
 ## Layout
 
 ```
-bin/srr           the SRR ops command (bash) — run/deploy/reset the prod & dev envs
 bin/srr-telegram  ingest strategy: Telegram channel (incl. private) -> SRR items
 bin/srr-youtube   ingest strategy: YouTube channel Atom feed -> SRR items
 bin/srr-x         ingest strategy: X/Twitter account (via a Nitter instance) -> SRR items
@@ -17,39 +15,11 @@ tests/            self-checking test scripts + fixtures
 pyproject.toml    shared dependencies for every bin/ script, pinned by uv.lock
 ```
 
-`bin/` must be on `PATH` — `srrb` resolves ingest strategies by bare name, and
-`srr-uvrun` shebangs rely on it too. A missing PATH fails loudly, never silently wrong.
-
-## `srr` — the ops command
-
-One tool drives both **fully independent** local deployments (they share nothing;
-the only link is the explicit `reset-dev`):
-
-| Env | Dir | Config | Binary it runs |
-|---|---|---|---|
-| **prod** | `~/public/srr/` | `~/.config/srr/srr.prod.yaml` | static `~/.local/lib/srr/srrb` (frozen; only `deploy-be` updates it) |
-| **dev** | `~/public/srr.tmp/` | `~/.config/srr/srr.yaml` | live build `~/ws/srr/dist/srrb` (changes every `make build-be`) |
-
-The env token is always explicit — there is no default env, so no way to hit prod by
-omission. `srr prod` also scrubs any lingering `SRR_CONFIG`/`SRR_CONFIG_INLINE` from
-the shell: always prod, both binary and config.
-
-```bash
-srr dev  [srrb args...]   # run the backend: live dev build + dev config (everyday command)
-srr prod [srrb args...]   # run the backend: static prod binary + prod config — live users!
-srr status                # both envs + both binaries at a glance
-srr config <prod|dev>     # print the resolved config for an env
-srr reset-dev             # wipe dev, re-seed it from current prod, repoint the baked cdn-url
-srr rebuild-dev           # re-create the dev store from scratch: prod's channels (config
-                          # only), fresh fetch with the dev binary, gen bump
-srr build-fe <prod|dev>   # build the frontend against that env's config and deploy it
-srr deploy-be             # build the backend and install it as the static prod binary
-srr fetch <prod|dev>      # `art fetch` into that env's packs (labelled form of `srr <env> art fetch`)
-```
-
-Typical flow: develop and test everything with `srr dev …`; when a backend build is
-vetted, `srr deploy-be` promotes it — until then prod keeps running the
-previously-deployed binary, never a half-finished dev build.
+Every `bin/` entry point must be reachable from `PATH` — `srrb` resolves ingest
+strategies by bare name, and `srr-uvrun` shebangs rely on it too. Symlinks into a
+PATH dir work fine (`srr-uvrun` sees through them via `readlink -f`), as does
+putting `bin/` on `PATH` directly. A missing entry fails loudly, never silently
+wrong.
 
 ## Ingest strategies
 
@@ -74,8 +44,8 @@ photos and videos into the SRR store. Two modes:
   into the store like account mode does.
 
 ```bash
-srr dev chan add -t "My private channel" -u "https://t.me/c/1234567890" -i "srr-telegram"
-srr dev chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
+srrb chan add -t "My private channel" -u "https://t.me/c/1234567890" -i "srr-telegram"
+srrb chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
 ```
 
 ### `srr-youtube`
@@ -88,7 +58,7 @@ store, falling back to the hotlink if a download fails (those URLs are public an
 stable, so degrading beats failing the cycle). The video itself is never downloaded.
 
 ```bash
-srr dev chan add -t "Veritasium" \
+srrb chan add -t "Veritasium" \
   -u "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA" \
   -i "srr-youtube --selfhost"
 ```
@@ -106,7 +76,7 @@ does). Retweets and self-reply threads are attributed and kept (`--no-retweets` 
 measured per-instance quirks (rate limits, an HTTP/2-only WAF, whitelisting).
 
 ```bash
-srr dev chan add -t "NASA" -u "https://x.com/NASA" -i "srr-x"
+srrb chan add -t "NASA" -u "https://x.com/NASA" -i "srr-x"
 ```
 
 ## Python setup
@@ -121,7 +91,8 @@ the tests — resolves the same `.venv` from any cwd, wherever the checkout live
 python.) There is deliberately no `[build-system]`: uv installs only the
 dependencies, never this repo as a package.
 
-Requirements: [`uv`](https://docs.astral.sh/uv/) installed, `bin/` on `PATH`.
+Requirements: [`uv`](https://docs.astral.sh/uv/) installed, `bin/` entry points
+reachable from `PATH` (symlinked into a PATH dir, or `bin/` on `PATH` directly).
 
 ## Tests
 

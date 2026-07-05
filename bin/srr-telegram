@@ -35,7 +35,7 @@ ONE-TIME SETUP (skip if you only use --no-auth)
      srr-telegram login            # prints a StringSession + the env lines to keep
 
    Save the three SRR_TG_* values where the SRR fetch loop can see them (e.g. the
-   srrb-prod-fetch service environment, or an env file it sources). The session
+   srrb-fetch service environment, or an env file it sources). The session
    string is a credential — treat it like a password.
 
 SUBSCRIBE A CHANNEL
@@ -343,7 +343,7 @@ async def media_element(client, msg, chan_id, asset_dir, max_media):
         # Download to a .part file and rename into place only once complete, so
         # a run killed mid-download (srrb cmd-timeout, crash, dropped
         # connection) can never leave a truncated file at dest for a later
-        # cycle to reuse and publish (the prod chron-437 moov-less mp4 bug).
+        # cycle to reuse and publish (the live chron-437 moov-less mp4 bug).
         part = dest + ".part"
         try:
             got = await client.download_media(msg, file=part)

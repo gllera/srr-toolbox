@@ -10,9 +10,10 @@
 # measured to silently fall back to system python, or silently adopt an
 # unrelated project's venv when the cwd happens to be inside one.
 #
-# Needs bin/ on PATH, which everything here already requires anyway: srrb
-# resolves ingest strategies by bare name (~/.zshrc and srrb-prod-fetch.service
-# both set it). A missing PATH fails loudly ("env: 'srr-uvrun': No such file
-# or directory"), never silently wrong.
+# Needs to be reachable from PATH — e.g. via a symlink in a PATH dir — which
+# everything here already requires anyway: srrb resolves ingest strategies by
+# bare name the same way. readlink -f below sees through any symlink, so the
+# repo is located from the REAL bin/. A missing entry fails loudly ("env:
+# 'srr-uvrun': No such file or directory"), never silently wrong.
 here="$(dirname "$(readlink -f "$0")")"
 exec uv run --project "$(dirname "$here")" --script "$@"
