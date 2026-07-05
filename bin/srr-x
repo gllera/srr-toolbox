@@ -4,8 +4,8 @@ through a Nitter instance (default: https://nitter.net).
 
 Runs in the toolbox's shared uv project venv (repo-root pyproject.toml, via
 the srr-uvrun shebang wrapper) like every bin/ script; needs beautifulsoup4
-(description rewriting) and httpx[http2] (feed fetch — some instances 403
-plain HTTP/1.1) from that venv.
+(description rewriting) and httpx[http2] (feed fetch + video resolution —
+some instances 403 plain HTTP/1.1) from that venv.
 
 X serves no feeds and its read API is paid, but nitter.net rebuilds a public
 account's timeline as RSS. This strategy fetches that RSS and rewrites every
@@ -15,7 +15,9 @@ the instance staying alive (only the next fetch does):
   * proxied media  <instance>/pic/<encoded>  ->  https://pbs.twimg.com/...
     (the public Twitter CDN; /pic/orig/ becomes the ?name=orig full-size)
   * mentions, hashtags, statuses  <instance>/...  ->  https://x.com/...
-    (nitter's #m fragments dropped); external links pass through untouched
+    (nitter's #m fragments dropped); external links pass through untouched —
+    except piped.video (nitter's replaceYouTube rewrite on some instances),
+    which goes back to www.youtube.com / youtu.be
   * item links -> https://x.com/<author>/status/<id>
   * nitter's inline max-width styles stripped (the reader sizes images)
 
@@ -30,10 +32,11 @@ rss.nimf, mutually exclusive):
     "↩ replying to @x" body line; drop them with --no-replies.
   * "Pinned: "    the pinned tweet re-surfacing at the top — prefix stripped;
     guid dedup means it's ingested once, old pubDate and all.
-Videos are never downloaded in any mode: nitter's Video placeholder becomes
-a clickable poster linking to the tweet, like srr-youtube's thumbnails. The
-synthesized body survives #sanitize (img src / a href are allowlisted; no
-scripts). Tweets have no natural titles — the tweet text lands in the
+Video tweets play in place by default: nitter's Video/GIF placeholder
+becomes a real <video> element (see VIDEOS below; --no-videos keeps the old
+clickable poster linking to the tweet, like srr-youtube's thumbnails). The
+synthesized body survives #sanitize (img / a / video attrs are allowlisted;
+no scripts). Tweets have no natural titles — the tweet text lands in the
 title, capped like srr-telegram's, so consider srr's no-title feed option.
 
 Subscribe with any form that names the account — an x.com / twitter.com /
@@ -65,15 +68,41 @@ Note nitter serves no ETag/Last-Modified today; the etag/last-modified
 cursor is honored per the external-ingest contract anyway, so a future
 instance that does send them gets 304s for free.
 
+VIDEOS — default on, --no-videos to opt out
+-------------------------------------------
+Nitter's RSS carries only a poster thumbnail for a video tweet, and every
+usable instance challenge-gates its HTML pages (measured 2026-07-05:
+nitter.net answers empty 200s, poast/xcancel a browser-verification stub),
+so the mp4 is resolved through X's own syndication CDN instead — the
+unauthenticated cdn.syndication.twimg.com endpoint behind publish.twitter.com
+embeds: one request per video tweet per changed cycle, none of it touching
+the nitter instance. The highest-bitrate mp4 variant lands in a <video>
+element with the pbs.twimg.com thumb as its poster — both canonical
+Twitter-CDN URLs, so stored items stay instance-independent. GIF tweets skip
+the lookup entirely: nitter ships them as a native <video> whose mp4 rides
+its /pic/ proxy (captured 2026-07-05) — both URLs are rewritten canonical and
+the element is rebuilt flat, because srr's #sanitize would otherwise drop the
+<source> child (an unplayable poster-only box) and its autoplay/muted/loop.
+With --no-videos a GIF degrades to its canonical poster image. (A
+placeholder-style GIF thumb would also resolve request-free: its mp4 key is
+the thumb filename, tweet_video_thumb/K.jpg -> tweet_video/K.mp4.)
+The endpoint is unofficial,
+so any per-tweet failure (endpoint changed, deleted tweet, HLS-only
+variants) degrades that item to the old clickable-poster placeholder and the
+cycle continues; a transport error stops further lookups for the rest of the
+run. Note srr's #sanitize strips loop/autoplay, so GIFs render
+click-to-play.
+
 SELF-HOSTING MEDIA — --selfhost
 -------------------------------
-By default images stay hotlinked at their rewritten pbs.twimg.com URLs — the
-strategy downloads nothing but the feed XML. Add --selfhost to download each
-image into the SRR store instead (straight from the CDN, never through the
-nitter proxy). A download that fails (CDN hiccup, over srr's
---max-asset-size cap) falls back to its hotlink: pbs.twimg.com URLs are
-public and stable, so degrading beats failing the cycle. `srr dev preview`
-sends no asset_dir (self-hosting off), so previews hotlink too.
+By default media stays hotlinked at its rewritten Twitter-CDN URLs
+(pbs.twimg.com images, video.twimg.com mp4s) — nothing lands in the store.
+Add --selfhost to download each image, video and poster into the SRR store
+instead (straight from the CDN, never through the nitter proxy). A download
+that fails (CDN hiccup, over srr's --max-asset-size cap — which actually
+bites on video) falls back to its hotlink: the CDN URLs are public and
+stable, so degrading beats failing the cycle. `srr dev preview` sends no
+asset_dir (self-hosting off), so previews hotlink too.
 
 MANUAL RUNS (parameters instead of stdin)
 -----------------------------------------
@@ -94,7 +123,7 @@ from parameters and the result is pretty-printed:
                             sends as asset_dir; only used with --selfhost)
   --max-asset-size <bytes>  per-file media cap (absent/0 = no cap)
 """
-import sys, os, re, json, html, urllib.parse, urllib.request, urllib.error
+import sys, os, re, json, html, math, urllib.parse, urllib.request, urllib.error
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 
@@ -103,18 +132,30 @@ from bs4 import BeautifulSoup
 
 NS = {"dc": "http://purl.org/dc/elements/1.1/"}
 
-VERSION = "1.0"
+VERSION = "1.3"
 
 UA = {"User-Agent": "SRR-x"}
 SELFHOST = False               # set by --selfhost; media downloads only when set
 NO_RETWEETS = False            # set by --no-retweets; drops "RT by @..." items
 NO_REPLIES = False             # set by --no-replies; drops "R to @..." items
+VIDEOS = True                  # cleared by --no-videos; resolve video placeholders
 INSTANCE = "https://nitter.net"  # set by --instance; who serves the RSS
 
 USER_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 # Nitter's reply title jargon (rss.nimf): "R to @<user>: <text>". Mutually
 # exclusive with the "Pinned: " and "RT by @<user>: " prefixes, in that order.
 REPLY_RE = re.compile(r"^R to (@[A-Za-z0-9_]{1,15}): (.*)$", re.S)
+# A video placeholder in nitter's RSS is a status link wrapping a video-family
+# thumbnail; the thumb path is the robust signal (rss.nimf's "Video"/"GIF"
+# label text is not). GIF thumbs carry their mp4's key in the filename.
+VIDEO_THUMB_RE = re.compile(r"^https://pbs\.twimg\.com/(?:amplify_video_thumb|"
+                            r"ext_tw_video_thumb|tweet_video_thumb)/")
+GIF_THUMB_RE = re.compile(
+    r"^https://pbs\.twimg\.com/tweet_video_thumb/([A-Za-z0-9_-]+)\.")
+STATUS_RE = re.compile(r"^https://x\.com/[^/]+/status/(\d+)$")
+# A bare 11-char YouTube video id as the whole path — what a youtu.be short
+# link's path looks like after nitter's replaceYouTube host swap.
+YT_ID_RE = re.compile(r"^/[A-Za-z0-9_-]{11}$")
 
 
 def fnv1a32(s: str) -> int:
@@ -205,12 +246,100 @@ def direct_media_url(enc_path: str) -> str:
 def rewrite_url(u: str, host: str) -> str:
     """Point a nitter URL back at its canonical home; leave the rest alone."""
     parts = urllib.parse.urlsplit(u)
+    if parts.netloc == "piped.video":
+        # Some instances set nitter's replaceYouTube=piped.video, which
+        # host-swaps every youtube.com/youtu.be link in the tweet text for
+        # that third-party frontend (as mortal as nitter itself). Exact
+        # inverse: a bare video-id path is a youtu.be short link, anything
+        # else (watch/shorts/channel/@handle) lives on www.youtube.com.
+        yt = "youtu.be" if YT_ID_RE.match(parts.path) else "www.youtube.com"
+        return urllib.parse.urlunsplit(("https", yt, parts.path, parts.query, ""))
     if parts.netloc != host:
         return u
     if parts.path.startswith("/pic/"):
         return direct_media_url(parts.path[len("/pic/"):])
     # mention / status / search: same path+query on x.com, #m fragment dropped
     return urllib.parse.urlunsplit(("https", "x.com", parts.path, parts.query, ""))
+
+
+# WHERE VIDEO URLS COME FROM: nitter's RSS carries only a poster thumbnail for
+# a video tweet, and every usable instance challenge-gates its HTML pages
+# (measured 2026-07-05: nitter.net answers empty 200s, poast/xcancel a
+# browser-verification stub), so tweet pages can't be scraped for the mp4.
+# X's own syndication CDN — the unauthenticated endpoint behind
+# publish.twitter.com embeds — still resolves a tweet id to its
+# video.twimg.com mp4 variants. It's unofficial, so every failure degrades to
+# the clickable-poster placeholder instead of failing the cycle.
+SYNDICATION = "https://cdn.syndication.twimg.com/tweet-result"
+
+SYND_CACHE = {}                # tweet id -> syndication JSON (or None), per run
+
+# Like `probing` for media downloads: the first syndication transport error
+# latches resolution off for the rest of the run.
+resolving = True
+
+
+def syndication_token(tid: str) -> str:
+    """The token X's embed widget derives from the tweet id, ported from its
+    JS: ((id/1e15)*PI).toString(36).replace(/(0+|.)/g, ''). Measured
+    2026-07-05: the value isn't actually validated (any non-empty token
+    works), only its absence is — sending the real derivation anyway keeps
+    the request indistinguishable from the widget's."""
+    x = (int(tid) / 1e15) * math.pi
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    n, ipart = int(x), ""
+    while n:
+        n, r = divmod(n, 36)
+        ipart = digits[r] + ipart
+    frac, fpart = x - int(x), ""
+    for _ in range(10):        # past 10 base-36 digits a float64 is noise
+        frac *= 36
+        fpart += digits[int(frac)]
+        frac -= int(frac)
+    return (ipart + "." + fpart).replace("0", "").replace(".", "")
+
+
+def syndication_lookup(tid: str):
+    """One tweet's syndication record, memoized per run; None = unresolvable."""
+    global resolving
+    if tid in SYND_CACHE:
+        return SYND_CACHE[tid]
+    data = None
+    if resolving:
+        try:
+            r = http_client().get(SYNDICATION, params={
+                "id": tid, "token": syndication_token(tid)})
+            if r.status_code == 200:
+                data = r.json()
+            else:
+                log(f"syndication HTTP {r.status_code} for tweet {tid}")
+        except httpx.HTTPError as e:
+            resolving = False  # network trouble; stop asking this run
+            log(f"syndication unreachable, keeping placeholders: {e}")
+        except ValueError as e:
+            log(f"syndication sent no JSON for tweet {tid}: {e}")
+    SYND_CACHE[tid] = data
+    return data
+
+
+def video_url(tid: str, thumb: str):
+    """The canonical mp4 behind a video placeholder, or None to keep the
+    placeholder. GIF thumbs carry their mp4 key (request-free); real videos
+    ask the syndication CDN and take the highest-bitrate mp4 variant (m3u8
+    variants are useless here: browsers don't play bare HLS in <video>)."""
+    m = GIF_THUMB_RE.match(thumb)
+    if m:
+        return f"https://video.twimg.com/tweet_video/{m.group(1)}.mp4"
+    medias = [md for md in (syndication_lookup(tid) or {}).get("mediaDetails")
+              or [] if md.get("video_info")]
+    match = [md for md in medias if md.get("media_url_https") == thumb]
+    if not match:
+        if len(medias) != 1:   # thumb drifted and it's ambiguous: give up
+            return None
+        match = medias
+    mp4s = [v for v in match[0]["video_info"].get("variants") or []
+            if v.get("content_type") == "video/mp4" and v.get("url")]
+    return max(mp4s, key=lambda v: v.get("bitrate") or 0)["url"] if mp4s else None
 
 
 def download(url: str, dest: str, cap: int) -> str:
@@ -296,9 +425,70 @@ def build_content(desc_html, host, creator, is_rt, reply_to, asset_dir, cap):
         old, new = a["href"], rewrite_url(a["href"], host)
         a["href"] = new
         # Quote citations show the raw nitter URL as the link text — keep the
-        # visible text canonical too.
-        if a.string and a.string.strip() == old:
-            a.string.replace_with(new)
+        # visible text canonical too. Nitter's replaceYouTube swap also mangles
+        # the (possibly truncated) display text; the rewritten href knows
+        # which YouTube host it reversed to.
+        if a.string:
+            text = a.string.strip()
+            if text == old:
+                a.string.replace_with(new)
+            elif text.startswith(("piped.video/", "https://piped.video/")):
+                a.string.replace_with(text.replace(
+                    "piped.video", urllib.parse.urlsplit(new).netloc, 1))
+    # GIF tweets arrive as a native <video> — poster + /pic/-proxied mp4
+    # <source> (captured 2026-07-05) — not a placeholder. Runs in BOTH modes:
+    # stored URLs must never depend on the instance, and srr's #sanitize drops
+    # <source> children (leaving an unplayable poster-only box) and strips
+    # autoplay/muted/loop anyway, so the element is rebuilt flat with the
+    # allowlisted attr set. Without --videos (or with no playable src) it
+    # degrades to its canonical poster <img>, which the img pass below then
+    # treats like any other image (incl. --selfhost).
+    for v in soup.find_all("video"):
+        el = v.find("source", src=True)
+        raw = (el["src"] if el else v.get("src")) or ""
+        src = rewrite_url(raw, host) if raw else ""
+        poster = rewrite_url(v["poster"], host) if v.get("poster") else ""
+        if VIDEOS and src.startswith("https://"):
+            if SELFHOST and asset_dir:
+                if poster:
+                    poster = selfhost_media(poster, asset_dir, cap) or poster
+                src = selfhost_media(src, asset_dir, cap) or src
+            new = soup.new_tag("video", src=src)
+            if poster:
+                new["poster"] = poster
+            new["controls"] = ""
+            new["preload"] = "metadata"
+            new["playsinline"] = ""
+            v.replace_with(new)
+        elif poster:
+            v.replace_with(soup.new_tag("img", src=poster))
+        else:
+            v.decompose()     # nothing renderable would survive #sanitize
+    if VIDEOS:
+        # Video placeholders (status link wrapping a video thumb) become real
+        # <video> elements — the attr set srr's #sanitize allowlists, same as
+        # srr-telegram's. Runs before the <img> pass: an unresolved
+        # placeholder falls through to it and stays a clickable poster.
+        for a in soup.find_all("a", href=True):
+            tid = STATUS_RE.match(a["href"])
+            img = a.find("img", src=True)
+            if not (tid and img):
+                continue
+            thumb = rewrite_url(img["src"], host)
+            if not VIDEO_THUMB_RE.match(thumb):
+                continue
+            src = video_url(tid.group(1), thumb)
+            if not src:
+                continue
+            poster = thumb
+            if SELFHOST and asset_dir:
+                poster = selfhost_media(thumb, asset_dir, cap) or thumb
+                src = selfhost_media(src, asset_dir, cap) or src
+            video = soup.new_tag("video", src=src, poster=poster)
+            video["controls"] = ""
+            video["preload"] = "metadata"
+            video["playsinline"] = ""
+            a.replace_with(video)
     for img in soup.find_all("img", src=True):
         src = rewrite_url(img["src"], host)
         if SELFHOST and asset_dir and src.startswith("https://"):
@@ -321,6 +511,7 @@ def build_content(desc_html, host, creator, is_rt, reply_to, asset_dir, cap):
 
 def build_items(body, asset_dir, cap):
     host = urllib.parse.urlsplit(INSTANCE).netloc
+    SYND_CACHE.clear()         # the memo is per run, not per process
     items = []
     # lstrip: rss.xcancel.com pads its XML with leading whitespace, which the
     # XML spec (and ET) reject before the declaration.
@@ -374,7 +565,7 @@ def run_ingest(req):
 def strip_mode_flags(argv):
     """Pull the mode flags (valid in both stdin and manual runs) out of argv;
     what remains decides stdin vs manual mode."""
-    global SELFHOST, NO_RETWEETS, NO_REPLIES, INSTANCE
+    global SELFHOST, NO_RETWEETS, NO_REPLIES, VIDEOS, INSTANCE
     out, i = [], 0
     while i < len(argv):
         a = argv[i]
@@ -384,6 +575,8 @@ def strip_mode_flags(argv):
             NO_RETWEETS = True
         elif a == "--no-replies":
             NO_REPLIES = True
+        elif a == "--no-videos":
+            VIDEOS = False
         elif a == "--instance":
             if i + 1 >= len(argv):
                 sys.exit("srr-x: --instance needs a value")
