@@ -284,6 +284,14 @@ def classify_media(msg):
     """Return (kind, ext, size) for a downloadable photo/video/doc, else None."""
     if msg.sticker or msg.voice or msg.audio:
         return None
+    if isinstance(msg.media, types.MessageMediaWebPage):
+        # A link-preview card is never self-hosted. Telethon's msg.file resolves
+        # to the preview PHOTO (image/jpeg, small) while download_media(msg)
+        # fetches the preview's VIDEO document (far larger), so the advertised
+        # size and the downloaded bytes never match and the size guard fails the
+        # cycle forever (t.me/hispanmedia/10481: 94 KB photo vs 7.97 MB video).
+        # The message's own text + link already carry the content.
+        return None
     f = msg.file
     if f is None:
         return None

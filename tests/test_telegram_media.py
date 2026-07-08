@@ -99,6 +99,32 @@ class MustNotDownload:
         raise AssertionError("download_media called — valid cache must be reused")
 
 
+class FakeImageFile:
+    """A link preview's photo, exactly as Telethon's msg.file resolves it:
+    image mime + the small advertised photo size."""
+
+    def __init__(self, size):
+        self.ext = ".jpg"
+        self.mime_type = "image/jpeg"
+        self.size = size
+        self.name = "preview.jpg"
+
+
+class FakeWebPageMsg:
+    """A link-preview message: msg.media is MessageMediaWebPage while msg.file
+    resolves to the preview photo (image/jpeg). This is the exact shape that
+    wedged t.me/hispanmedia/10481 — 94 KB photo advertised, but download_media
+    fetches the preview's 7.97 MB video."""
+
+    def __init__(self):
+        self.id = 10481
+        self.sticker = None
+        self.voice = None
+        self.audio = None
+        self.media = mod.types.MessageMediaWebPage(webpage=None)
+        self.file = FakeImageFile(94007)
+
+
 def run(client, msg, asset_dir):
     return asyncio.run(mod.media_element(client, msg, 111, asset_dir, 0))
 
@@ -192,6 +218,15 @@ try:
                not os.path.exists(dest + ".part"))
 finally:
     shutil.rmtree(tmp)
+
+# 6. A link-preview (WebPage) message is never self-hosted. Its msg.file looks
+#    like an image, so the old image-mime branch classified it as a 94 KB photo
+#    — but download_media(msg) fetches the preview's 7.97 MB video, so the size
+#    check failed every cycle and wedged the whole feed. classify_media must
+#    short-circuit WebPage media to None so no download is ever attempted.
+info = mod.classify_media(FakeWebPageMsg())
+check_true("WebPage link-preview is not classified as self-hosted media",
+           info is None, "classify_media returned %r" % (info,))
 
 print()
 if failures:
