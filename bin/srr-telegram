@@ -45,20 +45,20 @@ channel in Telegram Web/Desktop to read the id off the URL), a public
 `https://t.me/<username>` / `@username`, an invite link `https://t.me/+<hash>`
 (you must already be a member), or a bare numeric id (`-100…`).
 
-     srr dev chan add -t "My private channel" \
+     srr feed add -t "My private channel" \
        -u "https://t.me/c/1234567890" \
        -i "srr-telegram"
 
 Preview without deploying (media is NOT downloaded in preview — placeholders shown):
      SRR_TG_API_ID=… SRR_TG_API_HASH=… SRR_TG_SESSION=… \
-       srr dev preview "https://t.me/c/1234567890" -i "srr-telegram" -a 127.0.0.1:8098
+       srr preview "https://t.me/c/1234567890" -i "srr-telegram" -a 127.0.0.1:8098
 
 WEB (NO-ACCOUNT) MODE — `--no-auth`
 -----------------------------------
 Public channels need no account: with --no-auth, srr-telegram scrapes the
 channel's public web preview instead. No credentials, no setup:
 
-     srr dev chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth"
+     srr feed add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth"
 
 Any public-username URL form works (https://t.me/s/<name>, https://t.me/<name>,
 @<name>). Private forms (t.me/c/<id>, invite links, numeric ids) have no public
@@ -70,7 +70,7 @@ Telegram" link, keeping the store text-only for that feed. (Hotlinking is not
 an option — the preview CDN's URLs are token-signed and expire.) Add --selfhost
 to download media into the SRR store instead, like the account mode does:
 
-     srr dev chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
+     srr feed add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
 
 Trade-offs vs account mode: public channels with previews enabled only; with
 --selfhost, videos above the preview size limit have no downloadable URL — an
@@ -111,10 +111,11 @@ per-request max_asset_size, and media over that is skipped with a "[… skipped:
 large]" note in place of it. Keeping one cap (srr's) avoids two drifting apart.
 
 This is protocol boilerplate around Telethon; the SRR external-ingest contract is
-documented in ~/ws/srr/backend/README.md (Ingest Strategies).
+documented in the srr backend's README (Ingest Strategies).
 """
 import asyncio
 import html as htmllib
+import http.client
 import json
 import os
 import re
@@ -138,7 +139,7 @@ try:
 except ModuleNotFoundError:
     bs4 = BeautifulSoup = None   # only web (no-account) mode needs it
 
-VERSION = "1.5"
+VERSION = "1.6"
 
 
 # --- config -----------------------------------------------------------------
@@ -643,13 +644,15 @@ def _url_ext(u, default):
 
 
 def web_download(url, dest, cap):
-    """Stream url to dest honoring the byte cap. -> 'ok' | 'toobig' | 'error'."""
+    """Stream url to dest honoring the byte cap; a partial file never lands at
+    dest (.part + rename, same discipline as the account mode's size guard).
+    -> 'ok' | 'toobig' | 'error'."""
     tmp = dest + ".part"
     try:
         r = urllib.request.Request(url, headers={"User-Agent": WEB_UA})
         with urllib.request.urlopen(r, timeout=60) as resp:
-            clen = resp.headers.get("Content-Length")
-            if cap and clen and int(clen) > cap:
+            clen = int(resp.headers.get("Content-Length") or 0)
+            if cap and clen > cap:
                 return "toobig"
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             n = 0
@@ -662,11 +665,13 @@ def web_download(url, dest, cap):
                     if cap and n > cap:
                         return "toobig"
                     fh.write(chunk)
-        if n == 0:
-            return "error"
+        if n == 0 or (clen and n != clen):
+            return "error"    # empty or truncated body
         os.replace(tmp, dest)
         return "ok"
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, http.client.HTTPException) as e:
+        # HTTPException covers IncompleteRead: a server closing early with a
+        # Content-Length set raises it mid-read, and it is NOT an OSError.
         log("download failed: %s (%s)" % (url, e))
         return "error"
     finally:
@@ -693,13 +698,23 @@ def web_media_element(kind, src, rel_base, n, asset_dir, max_media, post_link):
     rel = rel_base + ("" if n == 0 else "_%d" % n) \
         + _url_ext(src, ".jpg" if kind == "image" else ".mp4")
     dest = os.path.join(asset_dir, rel)
-    if not (os.path.exists(dest) and os.path.getsize(dest) > 0):
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        # Refresh the mtime so srr's post-cycle age-based cache sweep never
+        # deletes a file a live feed still consumes — doubly important here:
+        # the preview CDN's signed URLs expire, so a swept file may be gone
+        # for good.
+        os.utime(dest, None)
+    else:
         st = web_download(src, dest, max_media)
         if st == "toobig":
             log("skip %s %s: > cap %d" % (kind, rel_base, max_media))
             return "<p><em>[%s skipped: too large]</em></p>" % kind
         if st == "error":
-            return None
+            # The item publishes and the cursor advances either way, so a
+            # dropped element would be lost for good — degrade to the same
+            # open-in-Telegram link the no-download mode emits.
+            return ('<p><em>[%s — <a href="%s">open in Telegram</a>]</em></p>'
+                    % (kind, htmllib.escape(post_link, quote=True)))
     marker = "#/" + rel
     if kind == "image":
         return '<p><img src="%s" alt=""></p>' % marker

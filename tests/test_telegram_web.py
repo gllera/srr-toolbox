@@ -4,9 +4,13 @@ rich-text cleaning, and t.me/s widget parsing.
 Run in the repo's uv project venv (deps come from pyproject.toml):
     uv run tests/test_telegram_web.py
 """
+import http.client
 import importlib.machinery
 import importlib.util
 import os
+import shutil
+import tempfile
+import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "bin", "srr-telegram")
@@ -195,6 +199,106 @@ check("--selfhost without a store: bare placeholder",
                             0, "", 0, LINK),
       "<p><em>[image]</em></p>")
 mod.SELFHOST = False
+
+
+# --- --selfhost downloads: cache reuse + degrade paths -------------------------
+
+STORE = tempfile.mkdtemp(prefix="srr-tg-web-test-")
+mod.SELFHOST = True
+
+# Cache hit: the stored file is reused without any request, and its mtime is
+# refreshed — srr's age-based cache sweep must never delete a file a live feed
+# still consumes (doubly so here: the preview CDN's signed URLs expire, so a
+# swept file may be unrecoverable).
+dest = os.path.join(STORE, "tg", "mychan", "12.jpg")
+os.makedirs(os.path.dirname(dest))
+with open(dest, "wb") as fh:
+    fh.write(b"CACHED")
+os.utime(dest, (1, 1))
+
+
+def must_not_download(req_obj, timeout=None):
+    raise AssertionError("download attempted — valid cache must be reused")
+
+
+mod.urllib.request.urlopen = must_not_download
+check("selfhost cache hit -> marker, no download",
+      mod.web_media_element("image", "https://cdn.example/x.jpg", "tg/mychan/12",
+                            0, STORE, 0, LINK),
+      '<p><img src="#/tg/mychan/12.jpg" alt=""></p>')
+check_true("selfhost cache hit refreshes mtime", os.path.getmtime(dest) > 1,
+           "mtime=%r" % os.path.getmtime(dest))
+
+
+# Download error: the item publishes and the cursor advances either way, so a
+# silently dropped element is gone for good — degrade to the same
+# open-in-Telegram link the no-download mode emits.
+def raise_urlerror(req_obj, timeout=None):
+    raise urllib.error.URLError("connection reset")
+
+
+mod.urllib.request.urlopen = raise_urlerror
+check("selfhost download error -> open-in-Telegram placeholder, not silence",
+      mod.web_media_element("image", "https://cdn.example/gone.jpg", "tg/mychan/13",
+                            0, STORE, 0, LINK),
+      '<p><em>[image — <a href="%s">open in Telegram</a>]</em></p>' % LINK)
+
+
+# A body shorter than its Content-Length is a truncated download — 'error',
+# nothing lands at dest (same discipline as the account mode's .part guard).
+class LyingResp:
+    headers = {"Content-Length": "100"}
+
+    def __init__(self):
+        self._done = False
+
+    def read(self, n=-1):
+        if self._done:
+            return b""
+        self._done = True
+        return b"HALF"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+mod.urllib.request.urlopen = lambda req_obj, timeout=None: LyingResp()
+t_dest = os.path.join(STORE, "trunc.jpg")
+check("web_download: body short of Content-Length -> error",
+      mod.web_download("https://cdn.example/t.jpg", t_dest, 0), "error")
+check_true("web_download: truncation leaves no file, no .part",
+           not os.path.exists(t_dest) and not os.path.exists(t_dest + ".part"))
+
+
+# A server closing early raises http.client.IncompleteRead (an HTTPException,
+# NOT an OSError) mid-read — it must degrade, not blow up the cycle.
+class IncompleteResp:
+    headers = {"Content-Length": "100"}
+
+    def read(self, n=-1):
+        raise http.client.IncompleteRead(b"x")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+mod.urllib.request.urlopen = lambda req_obj, timeout=None: IncompleteResp()
+try:
+    got = mod.web_download("https://cdn.example/i.jpg",
+                           os.path.join(STORE, "inc.jpg"), 0)
+except Exception as e:
+    got = "raised: %r" % (e,)
+check("web_download: truncated stream (IncompleteRead) -> error, not a traceback",
+      got, "error")
+
+mod.SELFHOST = False
+shutil.rmtree(STORE, ignore_errors=True)
 
 
 # --- misc helpers ------------------------------------------------------------
