@@ -11,7 +11,7 @@ fetches that feed and synthesizes a clickable-thumbnail + description body that
 survives #sanitize (no <iframe>; img src / a href are allowlisted).
 
 Subscribe with the channel's Atom URL, e.g.:
-  srr dev chan add -t "Veritasium" \
+  srr feed add -t "Veritasium" \
     -u "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA" \
     -i "srr-youtube"
 
@@ -24,14 +24,14 @@ poster thumbnail into the SRR store instead, still picking the best quality
 the ladder finds (the video itself is never downloaded in either mode — the
 poster links out to youtube.com):
 
-  srr dev chan add -t "Veritasium" \
+  srr feed add -t "Veritasium" \
     -u "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA" \
     -i "srr-youtube --selfhost"
 
 A thumbnail that can't be downloaded (CDN hiccup, over srr's --max-asset-size
 cap) falls back to its hotlink: unlike Telegram's token-signed preview CDN,
 i.ytimg.com URLs are public and stable, so degrading beats failing the cycle.
-`srr dev preview` sends no asset_dir (self-hosting off), so previews hotlink too.
+`srr preview` sends no asset_dir (self-hosting off), so previews hotlink too.
 
 MANUAL RUNS (parameters instead of stdin)
 -----------------------------------------
@@ -52,7 +52,7 @@ parameters and the result is pretty-printed:
                             sends as asset_dir; only used with --selfhost)
   --max-asset-size <bytes>  per-file thumbnail cap (absent/0 = no cap)
 """
-import sys, os, json, html, urllib.request, urllib.error
+import sys, os, re, json, html, http.client, urllib.request, urllib.error
 import xml.etree.ElementTree as ET
 
 NS = {
@@ -61,9 +61,10 @@ NS = {
     "yt": "http://www.youtube.com/xml/schemas/2015",
 }
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 UA = {"User-Agent": "SRR-youtube"}
+MAX_FEED_BYTES = 8_000_000   # feed-XML read cap (the request carries no knob for it)
 SELFHOST = False   # set by --selfhost in main(); thumbnails download only when set
 
 
@@ -87,12 +88,13 @@ def fetch_feed(req):
     if req.get("last_modified"):
         hdr["If-Modified-Since"] = req["last_modified"]
     try:
-        r = urllib.request.urlopen(urllib.request.Request(req["url"], headers=hdr))
+        r = urllib.request.urlopen(
+            urllib.request.Request(req["url"], headers=hdr), timeout=30)
     except urllib.error.HTTPError as e:
         if e.code == 304:                 # nothing new since our cursor
             return None
         raise
-    body = r.read(req.get("max_size") or 8_000_000)
+    body = r.read(MAX_FEED_BYTES)
     return body, r.headers.get("ETag", ""), r.headers.get("Last-Modified", "")
 
 
@@ -152,7 +154,9 @@ def download(url: str, dest: str, cap: int) -> str:
         return "ok"
     except urllib.error.HTTPError as e:
         return "missing" if e.code == 404 else "error"
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
+        # HTTPException covers IncompleteRead: a server closing early with a
+        # Content-Length set raises it mid-read, and it is NOT an OSError.
         return "error"
     finally:
         if os.path.exists(tmp):
@@ -202,10 +206,26 @@ def thumb_src(vid: str, feed_url: str, asset_dir: str, cap: int) -> str:
     return best_thumb(vid, feed_url)
 
 
+PARA_SPLIT_RE = re.compile(r"\n[ \t]*\n+")
+
+
+def desc_html(text):
+    """Description -> <p> paragraphs: a blank line separates paragraphs, a lone
+    newline is a soft <br> — blank lines never become <br><br> (the same
+    invariant srr-telegram's text_to_html keeps)."""
+    parts = []
+    for para in PARA_SPLIT_RE.split((text or "").strip()):
+        para = para.strip()
+        if para:
+            parts.append("<p>%s</p>" % html.escape(para).replace("\n", "<br>"))
+    return "".join(parts)
+
+
 def build_items(body, asset_dir, cap):
     items = []
     for e in ET.fromstring(body).findall("a:entry", NS):
         vid = e.findtext("yt:videoId", "", NS)
+        eid = e.findtext("a:id", "", NS)
         title = e.findtext("a:title", "", NS)
         pub = e.findtext("a:published", None, NS)     # already RFC 3339
         watch = f"https://www.youtube.com/watch?v={vid}"
@@ -218,10 +238,12 @@ def build_items(body, asset_dir, cap):
         content = (
             f'<p><a href="{html.escape(watch)}">'
             f'<img src="{html.escape(thumb)}" alt="{html.escape(title)}"></a></p>'
-            f'<p>{html.escape(desc).replace(chr(10), "<br>")}</p>'
+            + desc_html(desc)
         )
         items.append({
-            "guid": fnv1a32(vid or watch),            # stable per-video dedup key
+            # Stable per-video dedup key; the Atom <id> fallback keeps entries
+            # without a yt:videoId from all hashing the same bare watch URL.
+            "guid": fnv1a32(vid or eid or watch),
             "title": title,
             "content": content,
             "link": watch,
@@ -292,6 +314,8 @@ def cmd_ingest(req=None):
         result = run_ingest(req)
     except urllib.error.URLError as e:
         sys.exit(f"srr-youtube: feed fetch failed: {e}")
+    except ET.ParseError as e:
+        sys.exit(f"srr-youtube: feed is not valid XML: {e}")
     if pretty:
         # manual run: readable for a human, not byte-compatible with srr's
         json.dump(result, sys.stdout, indent=2, ensure_ascii=False)

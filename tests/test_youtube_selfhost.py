@@ -6,6 +6,7 @@ Run in the repo's uv project venv (plain python3 works too — the script
 under test has no third-party deps):
     uv run tests/test_youtube_selfhost.py
 """
+import http.client
 import importlib.machinery
 import importlib.util
 import os
@@ -210,6 +211,36 @@ check("selfhost without a video id: feed URL, no requests",
       (mod.thumb_src("", HQ, STORE, 0), CALLS), (HQ, []))
 
 
+# --- download robustness ---------------------------------------------------------
+
+# A server that closes early with a Content-Length set makes http.client raise
+# IncompleteRead — an HTTPException, NOT an OSError — mid-read. It must degrade
+# like any other failed download, never blow up the cycle with a traceback.
+
+
+class IncompleteResp:
+    headers = {"Content-Length": "100"}
+
+    def read(self, n=-1):
+        raise http.client.IncompleteRead(b"x")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+mod.urllib.request.urlopen = lambda req_obj, timeout=None: IncompleteResp()
+try:
+    got = mod.download(MAXRES, os.path.join(store(), "yt", "f.jpg"), 0)
+except Exception as e:
+    got = "raised: %r" % (e,)
+check("download: truncated stream (IncompleteRead) -> error, not a traceback",
+      got, "error")
+mod.urllib.request.urlopen = fake_urlopen
+
+
 # --- build_items end-to-end ----------------------------------------------------
 
 ATOM = f"""<feed xmlns="http://www.w3.org/2005/Atom"
@@ -245,6 +276,32 @@ it = mod.build_items(ATOM.encode(), "", 0)[0]
 check_true("items: default mode hotlinks", f'<img src="{MAXRES}"' in it["content"],
            it["content"])
 
+# Blank lines separate paragraphs -> distinct <p>, never <br><br> (the same
+# invariant srr-telegram's text_to_html keeps).
+ATOM2 = ATOM.replace("line one\nline two",
+                     "para one\n\npara two\n\n\npara three\nsoft")
+reset({}, selfhost=False)
+it = mod.build_items(ATOM2.encode(), "", 0)[0]
+check_true("description: blank lines -> paragraphs, never <br><br>",
+           "<p>para one</p><p>para two</p><p>para three<br>soft</p>"
+           in it["content"] and "<br><br>" not in it["content"],
+           it["content"])
+
+# An entry without a yt:videoId must not collide with its siblings on the
+# constant watch URL: fall back to the Atom <id>.
+ATOM3 = """<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:media="http://search.yahoo.com/mrss/"
+      xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+  <entry>
+    <id>yt:video:fallbackid</id>
+    <title>No videoId</title>
+  </entry>
+</feed>"""
+reset({}, selfhost=False)
+check("guid: entry without yt:videoId falls back to the Atom <id>",
+      mod.build_items(ATOM3.encode(), "", 0)[0]["guid"],
+      mod.fnv1a32("yt:video:fallbackid"))
+
 
 # --- fetch_feed cursor ----------------------------------------------------------
 
@@ -257,6 +314,36 @@ check("fetch_feed: 304 -> None (not_modified)",
       mod.fetch_feed({"url": "https://x", "etag": "e"}), None)
 check("run_ingest: 304 -> not_modified response",
       mod.run_ingest({"url": "https://x", "etag": "e"}), {"not_modified": True})
+
+
+# --- fetch hygiene ----------------------------------------------------------------
+
+# The feed GET must carry a timeout: without one a hung connection stalls the
+# whole fetch cycle until srr's cmd-timeout kills it (and manual runs forever).
+TIMEOUTS = []
+
+
+def capture_timeout(req_obj, timeout=None):
+    TIMEOUTS.append(timeout)
+    return FakeResp(b'<feed xmlns="http://www.w3.org/2005/Atom"/>', {})
+
+
+mod.urllib.request.urlopen = capture_timeout
+mod.fetch_feed({"url": "https://feed.example/x"})
+check_true("fetch_feed sets a timeout", bool(TIMEOUTS and TIMEOUTS[0]),
+           "timeout=%r" % (TIMEOUTS,))
+
+# A feed that isn't XML must exit with a one-line diagnosis, not a traceback.
+mod.urllib.request.urlopen = (
+    lambda req_obj, timeout=None: FakeResp(b"not xml at all", {}))
+try:
+    mod.cmd_ingest({"url": "https://feed.example/x"})
+    got = "no exit"
+except SystemExit as e:
+    got = str(e)
+except Exception as e:
+    got = "raised: %r" % (e,)
+check_true("malformed feed -> clean exit", "not valid XML" in str(got), got)
 
 shutil.rmtree(STORE, ignore_errors=True)
 
