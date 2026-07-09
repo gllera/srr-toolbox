@@ -7,6 +7,7 @@ on:
   push:
     branches: [main]
     tags: ['v[0-9]*']
+  pull_request:   # tests need no secrets, so fork PRs are safe to run
 
 permissions:
   contents: read

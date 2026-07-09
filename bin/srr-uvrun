@@ -15,5 +15,9 @@
 # bare name the same way. readlink -f below sees through any symlink, so the
 # repo is located from the REAL bin/. A missing entry fails loudly ("env:
 # 'srr-uvrun': No such file or directory"), never silently wrong.
+#
+# --locked: refuse to run when uv.lock no longer matches pyproject.toml.
+# Without it, uv would silently re-resolve past the committed pins — the fetch
+# loop must fail loudly (like CI's `uv sync --locked`), never drift.
 here="$(dirname "$(readlink -f "$0")")"
-exec uv run --project "$(dirname "$here")" --script "$@"
+exec uv run --locked --project "$(dirname "$here")" --script "$@"
