@@ -44,8 +44,8 @@ photos and videos into the SRR store. Two modes:
   into the store like account mode does.
 
 ```bash
-srr chan add -t "My private channel" -u "https://t.me/c/1234567890" -i "srr-telegram"
-srr chan add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
+srr feed add -t "My private channel" -u "https://t.me/c/1234567890" -i "srr-telegram"
+srr feed add -t "Durov" -u "https://t.me/s/durov" -i "srr-telegram --no-auth --selfhost"
 ```
 
 ### `srr-youtube`
@@ -58,7 +58,7 @@ store, falling back to the hotlink if a download fails (those URLs are public an
 stable, so degrading beats failing the cycle). The video itself is never downloaded.
 
 ```bash
-srr chan add -t "Veritasium" \
+srr feed add -t "Veritasium" \
   -u "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA" \
   -i "srr-youtube --selfhost"
 ```
@@ -71,12 +71,14 @@ timeline as RSS through a Nitter instance (default `https://nitter.net`,
 canonical URL — proxied media to `pbs.twimg.com`, mentions/statuses to `x.com` — so
 the **stored** items never depend on the instance staying alive (only the next fetch
 does). Retweets and self-reply threads are attributed and kept (`--no-retweets` /
-`--no-replies` to drop them); videos become a clickable poster linking to the tweet;
-`--selfhost` downloads images straight from the CDN. See the script's docstring for
-measured per-instance quirks (rate limits, an HTTP/2-only WAF, whitelisting).
+`--no-replies` to drop them); videos play in place by default — the poster placeholder
+becomes a real `<video>` resolved through X's syndication CDN, and GIF tweets keep
+GIF-style autoplay (`--no-videos` keeps the old clickable poster instead); `--selfhost`
+downloads images, videos and posters straight from the CDN. See the script's docstring
+for measured per-instance quirks (rate limits, an HTTP/2-only WAF, whitelisting).
 
 ```bash
-srr chan add -t "NASA" -u "https://x.com/NASA" -i "srr-x"
+srr feed add -t "NASA" -u "https://x.com/NASA" -i "srr-x"
 ```
 
 ## Python setup
