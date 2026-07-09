@@ -10,6 +10,7 @@ fallback, latch) and the etag/last-modified cursor.
 Run in the repo's uv project venv (deps come from pyproject.toml):
     uv run tests/test_x_content.py
 """
+import http.client
 import importlib.machinery
 import importlib.util
 import json
@@ -416,6 +417,36 @@ except ET.ParseError:
     n = "ParseError"
 check("whitespace-padded XML (rss.xcancel.com style) parses", n, 4)
 
+# A media-only tweet has no text to become the title: fall back to
+# "@user · date" (the same idea as srr-telegram's make_title).
+SYNTH2 = """<?xml version="1.0" encoding="UTF-8"?>
+<rss xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0"><channel>
+<title>User / @user</title><link>https://nitter.net/user</link>
+<item>
+  <title></title>
+  <dc:creator>@user</dc:creator>
+  <description>&lt;img src="https://nitter.net/pic/media%2FBBB.jpg" /&gt;</description>
+  <pubDate>Wed, 01 Jul 2026 10:00:00 GMT</pubDate>
+  <guid isPermaLink="false">555</guid>
+  <link>https://nitter.net/user/status/555#m</link>
+</item>
+</channel></rss>"""
+
+reset_modes()
+check("media-only tweet: title falls back to creator · date",
+      mod.build_items(SYNTH2.encode(), "", 0)[0]["title"], "@user · 2026-07-01")
+
+# A body that isn't XML must exit with a one-line diagnosis, not a traceback.
+use_transport(lambda req: mod.httpx.Response(200, content=b"not xml at all"))
+try:
+    mod.cmd_ingest({"url": "@NASA"})
+    got = "no exit"
+except SystemExit as e:
+    got = str(e)
+except Exception as e:
+    got = "raised: %r" % (e,)
+check_true("malformed feed -> clean exit", "not valid XML" in str(got), got)
+
 # --- --selfhost: download media into the store ----------------------------------
 #
 # fake pbs.twimg.com: url -> ("body", bytes) | "404" | "neterr"; unrouted 404.
@@ -442,6 +473,22 @@ class FakeResp:
         return False
 
 
+class IncompleteResp:
+    """Server closed early with a Content-Length set: http.client raises
+    IncompleteRead (an HTTPException, NOT an OSError) mid-read."""
+
+    headers = {"Content-Length": "100"}
+
+    def read(self, n=-1):
+        raise http.client.IncompleteRead(b"x")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 def fake_urlopen(req_obj, timeout=None):
     url = req_obj.full_url
     CALLS.append((req_obj.get_method(), url, dict(req_obj.headers)))
@@ -450,6 +497,8 @@ def fake_urlopen(req_obj, timeout=None):
         raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
     if r == "neterr":
         raise urllib.error.URLError("connection reset")
+    if r == "incomplete":
+        return IncompleteResp()
     return FakeResp(r[1], {"Content-Length": str(len(r[1]))})
 
 
@@ -515,6 +564,14 @@ check_true("selfhost: network error latches downloads off", mod.probing is False
 CALLS.clear()
 check("selfhost: latched off -> hotlink, no request",
       (mod.selfhost_media(PIC, STORE, 0), CALLS), (None, []))
+
+reset({PIC: "incomplete"}, selfhost=True)       # truncated stream mid-download
+try:
+    got = mod.selfhost_media(PIC, store(), 0)
+except Exception as e:
+    got = "raised: %r" % (e,)
+check("selfhost: truncated stream (IncompleteRead) -> hotlink fallback + latch",
+      (got, mod.probing), (None, False))
 
 reset({PIC: ("body", b"IMG")}, selfhost=True)   # preview sends no asset_dir
 it = by_guid(mod.build_items(FIXTURE, "", 0), "2073358761142432031")

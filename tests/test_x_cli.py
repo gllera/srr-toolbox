@@ -82,6 +82,11 @@ check("no mode flags: argv untouched, stdin mode possible",
 check_exit("--instance without a value rejected",
            mod.strip_mode_flags, ["--instance"])
 
+reset_modes()
+mod.strip_mode_flags(["--instance", "nitter.example", "@x"])
+check("--instance without a scheme is normalized to https",
+      mod.INSTANCE, "https://nitter.example")
+
 # --- username extraction ------------------------------------------------------
 
 reset_modes()
