@@ -63,7 +63,7 @@ class FullWriter:
         self.size = size
         self.calls = 0
 
-    async def download_media(self, msg, file=None):
+    async def download_media(self, msg, file=None, thumb=None):
         self.calls += 1
         with open(file, "wb") as fh:
             fh.write(b"x" * self.size)
@@ -76,7 +76,7 @@ class Interrupter:
     def __init__(self, partial):
         self.partial = partial
 
-    async def download_media(self, msg, file=None):
+    async def download_media(self, msg, file=None, thumb=None):
         with open(file, "wb") as fh:
             fh.write(b"x" * self.partial)
         raise ConnectionError("simulated mid-download death")
@@ -88,14 +88,14 @@ class ShortWriter:
     def __init__(self, partial):
         self.partial = partial
 
-    async def download_media(self, msg, file=None):
+    async def download_media(self, msg, file=None, thumb=None):
         with open(file, "wb") as fh:
             fh.write(b"x" * self.partial)
         return file
 
 
 class MustNotDownload:
-    async def download_media(self, msg, file=None):
+    async def download_media(self, msg, file=None, thumb=None):
         raise AssertionError("download_media called — valid cache must be reused")
 
 
@@ -126,7 +126,8 @@ class FakeWebPageMsg:
 
 
 def run(client, msg, asset_dir):
-    return asyncio.run(mod.media_element(client, msg, 111, asset_dir, 0))
+    return asyncio.run(mod.media_element(client, msg, 111, asset_dir, 0,
+                                         "https://t.me/c/111/%d" % msg.id))
 
 
 SIZE = 1024
@@ -227,6 +228,277 @@ finally:
 info = mod.classify_media(FakeWebPageMsg())
 check_true("WebPage link-preview is not classified as self-hosted media",
            info is None, "classify_media returned %r" % (info,))
+
+
+class FakeDocFile:
+    """A non-image/video document attachment (classify_media's file branch)."""
+
+    def __init__(self, size, name="report.pdf"):
+        self.ext = ".pdf"
+        self.mime_type = "application/pdf"
+        self.size = size
+        self.name = name
+
+
+class FakeDocMsg:
+    def __init__(self, msg_id, size):
+        self.id = msg_id
+        self.file = FakeDocFile(size)
+        self.media = None
+        self.sticker = None
+        self.voice = None
+        self.audio = None
+        self.video = None
+        self.video_note = None
+        self.gif = None
+
+
+class FakeVoiceFile:
+    """A voice note's file: opus-in-ogg, no filename."""
+
+    def __init__(self, size):
+        self.ext = ".oga"
+        self.mime_type = "audio/ogg"
+        self.size = size
+        self.name = None
+
+
+class FakeVoiceMsg(FakeDocMsg):
+    def __init__(self, msg_id, size):
+        super().__init__(msg_id, size)
+        self.file = FakeVoiceFile(size)
+        self.voice = True
+
+
+class FakeStickerFile:
+    def __init__(self, size):
+        self.ext = ".webp"
+        self.mime_type = "image/webp"
+        self.size = size
+        self.name = "sticker.webp"
+
+
+class FakeStickerMsg(FakeDocMsg):
+    def __init__(self, msg_id, size):
+        super().__init__(msg_id, size)
+        self.file = FakeStickerFile(size)
+        self.sticker = True
+
+
+class FakeMusicFile:
+    def __init__(self, size):
+        self.ext = ".mp3"
+        self.mime_type = "audio/mpeg"
+        self.size = size
+        self.name = "song.mp3"
+
+
+class FakeMusicMsg(FakeDocMsg):
+    """A music track (msg.audio), distinct from a voice note."""
+
+    def __init__(self, msg_id, size):
+        super().__init__(msg_id, size)
+        self.file = FakeMusicFile(size)
+        self.audio = True
+
+
+# 7. Document attachments are self-hosted like photos/videos: downloaded into
+#    the store and linked in the article by filename.
+tmp = tempfile.mkdtemp()
+try:
+    client = FullWriter(SIZE)
+    el = run(client, FakeDocMsg(7, SIZE), tmp)
+    dest = os.path.join(tmp, "tg", "111", "7.pdf")
+    check_true("doc is self-hosted",
+               client.calls == 1 and os.path.exists(dest)
+               and os.path.getsize(dest) == SIZE)
+    check_true("doc links the stored file by name",
+               el is not None and "#/tg/111/7.pdf" in el and "report.pdf" in el,
+               repr(el))
+finally:
+    shutil.rmtree(tmp)
+
+# 8. Preview (no asset_dir): docs show the bare kind placeholder, like
+#    photos/videos do — never a download.
+el = asyncio.run(mod.media_element(MustNotDownload(), FakeDocMsg(7, SIZE), 111,
+                                   "", 0, "https://t.me/c/111/7"))
+check_true("doc in preview mode yields the file placeholder",
+           el == "<p><em>[file]</em></p>", repr(el))
+
+# 9. Over srr's size cap nothing is downloaded — but the skip note must keep
+#    a link to the original post, so the attachment stays reachable.
+tmp = tempfile.mkdtemp()
+try:
+    el = asyncio.run(mod.media_element(MustNotDownload(), FakeDocMsg(7, SIZE),
+                                       111, tmp, SIZE - 1,
+                                       "https://t.me/c/111/7"))
+    check_true("over-cap skip note links the original post",
+               el is not None and "too large" in el
+               and 'href="https://t.me/c/111/7"' in el
+               and "open in Telegram" in el, repr(el))
+    check_true("over-cap doc writes nothing to the store",
+               not os.listdir(tmp), os.listdir(tmp))
+finally:
+    shutil.rmtree(tmp)
+
+# 10. Voice notes are self-hosted like videos and emitted as an <audio>
+#     player (the srr sanitizer allowlists <audio src/controls/preload>).
+tmp = tempfile.mkdtemp()
+try:
+    client = FullWriter(SIZE)
+    el = run(client, FakeVoiceMsg(8, SIZE), tmp)
+    dest = os.path.join(tmp, "tg", "111", "8.oga")
+    check_true("voice note is self-hosted",
+               client.calls == 1 and os.path.exists(dest)
+               and os.path.getsize(dest) == SIZE)
+    check_true("voice note emits an <audio> player",
+               el is not None and "<audio" in el and "#/tg/111/8.oga" in el
+               and "controls" in el, repr(el))
+finally:
+    shutil.rmtree(tmp)
+
+# 11. Preview (no asset_dir): voice shows the bare kind placeholder, like
+#     images/videos do.
+el = asyncio.run(mod.media_element(MustNotDownload(), FakeVoiceMsg(8, SIZE), 111,
+                                   "", 0, "https://t.me/c/111/8"))
+check_true("voice in preview mode yields the audio placeholder",
+           el == "<p><em>[audio]</em></p>", repr(el))
+
+# 12. No attachment class is silently dropped — everything follows the same
+#     download-or-placeholder logic: music tracks ride the <audio> player like
+#     voice notes, and a (webp) sticker classifies as a plain image.
+tmp = tempfile.mkdtemp()
+try:
+    client = FullWriter(SIZE)
+    el = run(client, FakeMusicMsg(9, SIZE), tmp)
+    check_true("music track is self-hosted into an <audio> player",
+               client.calls == 1 and el is not None and "<audio" in el
+               and "#/tg/111/9.mp3" in el, repr(el))
+finally:
+    shutil.rmtree(tmp)
+
+tmp = tempfile.mkdtemp()
+try:
+    client = FullWriter(SIZE)
+    el = run(client, FakeStickerMsg(10, SIZE), tmp)
+    check_true("webp sticker is self-hosted as an image",
+               client.calls == 1 and el is not None and "<img" in el
+               and "#/tg/111/10.webp" in el, repr(el))
+finally:
+    shutil.rmtree(tmp)
+
+# 13. …and they degrade like every other kind: preview placeholder without a
+#     store, linked skip note over the cap.
+el = asyncio.run(mod.media_element(MustNotDownload(), FakeMusicMsg(9, SIZE), 111,
+                                   "", 0, "https://t.me/c/111/9"))
+check_true("music in preview mode yields the audio placeholder",
+           el == "<p><em>[audio]</em></p>", repr(el))
+tmp = tempfile.mkdtemp()
+try:
+    el = asyncio.run(mod.media_element(MustNotDownload(), FakeStickerMsg(10, SIZE),
+                                       111, tmp, SIZE - 1,
+                                       "https://t.me/c/111/10"))
+    check_true("over-cap sticker links the original post",
+               el is not None and "too large" in el and "open in Telegram" in el,
+               repr(el))
+finally:
+    shutil.rmtree(tmp)
+
+
+# --- animated .tgs stickers ---------------------------------------------------
+
+class FakeDoc:
+    def __init__(self, thumbs):
+        self.thumbs = thumbs
+
+
+class FakeTgsFile:
+    def __init__(self, size):
+        self.ext = ".tgs"
+        self.mime_type = "application/x-tgsticker"
+        self.size = size
+        self.name = "AnimatedSticker.tgs"
+
+
+class FakeTgsMsg(FakeDocMsg):
+    """Animated Lottie sticker; the downloadable content is the static thumb."""
+
+    def __init__(self, msg_id, thumbs):
+        super().__init__(msg_id, 30 * 1024)
+        self.file = FakeTgsFile(30 * 1024)
+        self.sticker = True
+        self.document = FakeDoc(thumbs)
+
+
+class ThumbWriter:
+    """Serves the sticker's static thumbnail bytes; refuses a full download."""
+
+    def __init__(self, size, head=b"RIFF\x00\x00\x00\x00WEBP"):
+        self.size = size
+        self.head = head
+        self.thumbs_asked = []
+
+    async def download_media(self, msg, file=None, thumb=None):
+        assert thumb is not None, "sticker must download the thumb, not the .tgs"
+        self.thumbs_asked.append(thumb)
+        with open(file, "wb") as fh:
+            fh.write((self.head + b"\x00" * self.size)[:self.size])
+        return file
+
+
+THUMB = mod.types.PhotoSize(type="m", w=128, h=128, size=512)
+
+# 14. A .tgs sticker self-hosts its largest static thumbnail as an image —
+#     never the Lottie file itself, which no browser renders.
+tmp = tempfile.mkdtemp()
+try:
+    client = ThumbWriter(512)
+    msg = FakeTgsMsg(11, [mod.types.PhotoSize(type="s", w=32, h=32, size=64),
+                          THUMB])
+    el = run(client, msg, tmp)
+    dest = os.path.join(tmp, "tg", "111", "11.webp")
+    check_true("tgs sticker downloads its largest static thumb",
+               client.thumbs_asked == [THUMB], repr(client.thumbs_asked))
+    check_true("tgs thumb lands complete in the store",
+               os.path.exists(dest) and os.path.getsize(dest) == 512)
+    check_true("tgs sticker emits an <img> of the thumb",
+               el == '<p><img src="#/tg/111/11.webp" alt=""></p>', repr(el))
+finally:
+    shutil.rmtree(tmp)
+
+# 15. The thumb's real format wins over the assumed one (Telegram serves webp,
+#     jpeg or png depending on sticker age) — and the sniffed file is found
+#     again as cache on the next cycle.
+tmp = tempfile.mkdtemp()
+try:
+    msg = FakeTgsMsg(12, [THUMB])
+    el = run(ThumbWriter(512, head=b"\xff\xd8"), msg, tmp)
+    check_true("jpeg thumb is stored under the sniffed .jpg ext",
+               os.path.exists(os.path.join(tmp, "tg", "111", "12.jpg"))
+               and el is not None and "#/tg/111/12.jpg" in el, repr(el))
+    el = run(MustNotDownload(), msg, tmp)
+    check_true("sniffed thumb is reused as cache",
+               el is not None and "#/tg/111/12.jpg" in el, repr(el))
+finally:
+    shutil.rmtree(tmp)
+
+# 16. No downloadable static thumb (inline vector-path preview only): the
+#     placeholder link, nothing downloaded. Preview shows the bare kind.
+tmp = tempfile.mkdtemp()
+try:
+    msg = FakeTgsMsg(13, [mod.types.PhotoPathSize(type="j", bytes=b"x")])
+    el = run(MustNotDownload(), msg, tmp)
+    check_true("thumbless tgs degrades to the open-in-Telegram link",
+               el is not None and "sticker" in el and "open in Telegram" in el
+               and 'href="https://t.me/c/111/13"' in el, repr(el))
+    check_true("thumbless tgs writes nothing to the store",
+               not os.listdir(tmp), os.listdir(tmp))
+finally:
+    shutil.rmtree(tmp)
+el = asyncio.run(mod.media_element(MustNotDownload(), FakeTgsMsg(13, [THUMB]),
+                                   111, "", 0, "https://t.me/c/111/13"))
+check_true("tgs in preview mode yields the sticker placeholder",
+           el == "<p><em>[sticker]</em></p>", repr(el))
 
 print()
 if failures:

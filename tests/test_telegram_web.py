@@ -297,6 +297,29 @@ except Exception as e:
 check("web_download: truncated stream (IncompleteRead) -> error, not a traceback",
       got, "error")
 
+
+# Over the size cap: the skip note keeps the open-in-Telegram link, so the
+# attachment stays reachable from the article.
+class HugeResp:
+    headers = {"Content-Length": "999999"}
+
+    def read(self, n=-1):
+        return b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+mod.urllib.request.urlopen = lambda req_obj, timeout=None: HugeResp()
+check("selfhost over-cap -> too-large note links the original post",
+      mod.web_media_element("image", "https://cdn.example/big.jpg", "tg/mychan/14",
+                            0, STORE, 100, LINK),
+      '<p><em>[image skipped: too large — <a href="%s">open in Telegram</a>]'
+      '</em></p>' % LINK)
+
 mod.SELFHOST = False
 shutil.rmtree(STORE, ignore_errors=True)
 

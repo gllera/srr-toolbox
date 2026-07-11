@@ -2,7 +2,9 @@
 """SRR external ingest strategy: a Telegram channel (incl. PRIVATE) -> SRR items.
 
 Reads a Telegram channel and turns each message — or each album — into an SRR
-article, self-hosting its photos and videos into the SRR store. Two modes:
+article, self-hosting every attachment into the SRR store: photos, videos,
+voice notes and music as inline players, stickers as images (animated .tgs
+via their static thumbnail), anything else as a download link. Two modes:
 
   * ACCOUNT (MTProto) mode — the DEFAULT: private (and public) channels via
     your own user account (the Telethon library). Needs the one-time login
@@ -104,11 +106,11 @@ ENVIRONMENT
   SRR_TG_SESSION_FILE  alternative: path to a file holding that string
   SRR_TG_BACKFILL      first-run: how many recent messages to ingest (default 20)
   SRR_TG_MAX_BATCH     max messages (albums count as members) per fetch (default 200)
-  SRR_TG_INCLUDE_DOCS  "true" to also self-host non-image/video documents as links
 
 The media size cap is NOT configured here: srr sends its --max-asset-size as the
 per-request max_asset_size, and media over that is skipped with a "[… skipped: too
-large]" note in place of it. Keeping one cap (srr's) avoids two drifting apart.
+large — open in Telegram]" link in place of it. Keeping one cap (srr's) avoids two
+drifting apart.
 
 This is protocol boilerplate around Telethon; the SRR external-ingest contract is
 documented in the srr backend's README (Ingest Strategies).
@@ -139,7 +141,7 @@ try:
 except ModuleNotFoundError:
     bs4 = BeautifulSoup = None   # only web (no-account) mode needs it
 
-VERSION = "1.6"
+VERSION = "1.7"
 
 
 # --- config -----------------------------------------------------------------
@@ -149,13 +151,8 @@ def env_int(name, default):
     return int(v) if v else default
 
 
-def env_bool(name):
-    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
-
-
 BACKFILL = env_int("SRR_TG_BACKFILL", 20)
 MAX_BATCH = env_int("SRR_TG_MAX_BATCH", 200)
-INCLUDE_DOCS = env_bool("SRR_TG_INCLUDE_DOCS")
 AUTH_MODE = True   # cleared by --no-auth in main(); default is the account (MTProto) mode
 SELFHOST = False   # set by --selfhost in main(); web mode downloads media only when set
 
@@ -281,10 +278,41 @@ def text_to_html(text):
     return "".join(parts)
 
 
+def sticker_thumb(msg):
+    """Largest downloadable static thumbnail of an animated-sticker document,
+    or None — some .tgs carry only an inline vector-path preview
+    (PhotoPathSize), which has no downloadable bytes."""
+    doc = getattr(msg, "document", None)
+    best = None
+    for t in (getattr(doc, "thumbs", None) or []):
+        if isinstance(t, types.PhotoSize) and (best is None or t.size > best.size):
+            best = t
+    return best
+
+
+def image_ext(path):
+    """Sniff a downloaded thumbnail's actual format — Telegram serves sticker
+    thumbs as webp, jpeg or png depending on the sticker's age."""
+    with open(path, "rb") as fh:
+        head = fh.read(12)
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    if head[:4] == b"\x89PNG":
+        return ".png"
+    if head[:2] == b"\xff\xd8":
+        return ".jpg"
+    return ".webp"
+
+
+STICKER_EXTS = (".webp", ".png", ".jpg")
+
+
 def classify_media(msg):
-    """Return (kind, ext, size) for a downloadable photo/video/doc, else None."""
-    if msg.sticker or msg.voice or msg.audio:
-        return None
+    """Return (kind, ext, size) for any downloadable attachment, else None.
+
+    Every attachment class goes through the same download-or-placeholder
+    logic in media_element — nothing is silently dropped. The kind only
+    picks the HTML element: image/video/audio players, or a file link."""
     if isinstance(msg.media, types.MessageMediaWebPage):
         # A link-preview card is never self-hosted. Telethon's msg.file resolves
         # to the preview PHOTO (image/jpeg, small) while download_media(msg)
@@ -298,13 +326,20 @@ def classify_media(msg):
         return None
     ext = f.ext or ""
     mime = (f.mime_type or "")
+    if mime == "application/x-tgsticker":
+        # An animated Lottie sticker: the .tgs itself is a gzipped vector
+        # animation no browser renders — self-host its static thumbnail
+        # instead. size/ext are the thumb's, resolved once in media_element
+        # (which reads the thumb object anyway): 0 here, and .webp until
+        # image_ext finalizes it from the downloaded bytes.
+        return ("sticker", ".webp", 0)
     if isinstance(msg.media, types.MessageMediaPhoto) or mime.startswith("image/"):
         return ("image", ext or ".jpg", f.size)
     if mime.startswith("video/") or msg.video or msg.video_note or msg.gif:
         return ("video", ext or ".mp4", f.size)
-    if INCLUDE_DOCS:
-        return ("file", ext or ".bin", f.size)
-    return None
+    if mime.startswith("audio/") or msg.voice or msg.audio:
+        return ("audio", ext or ".ogg", f.size)
+    return ("file", ext or ".bin", f.size)
 
 
 class PartialDownload(Exception):
@@ -328,7 +363,7 @@ def cache_complete(dest, size):
     return have == size if size else have > 0
 
 
-async def media_element(client, msg, chan_id, asset_dir, max_media):
+async def media_element(client, msg, chan_id, asset_dir, max_media, post_link):
     info = classify_media(msg)
     if info is None:
         return None
@@ -336,11 +371,31 @@ async def media_element(client, msg, chan_id, asset_dir, max_media):
     if not asset_dir:
         # preview / self-hosting off: there is no public URL for private media.
         return "<p><em>[%s]</em></p>" % kind
+    thumb = None
+    if kind == "sticker":
+        thumb = sticker_thumb(msg)
+        if thumb is None:
+            # Nothing downloadable — degrade like web mode's undownloadable
+            # media, never ship the raw .tgs (a dead end for readers).
+            return ('<p><em>[sticker — <a href="%s">open in Telegram</a>]'
+                    '</em></p>' % htmllib.escape(post_link, quote=True))
+        size = thumb.size   # the thumb is the download target, so it sets the size
     if max_media and size and size > max_media:
+        # The attachment must not vanish from the article — the skip note
+        # links the original post, like web mode's degrade paths.
         log("skip %s msg %d: %d bytes > cap %d" % (kind, msg.id, size, max_media))
-        return "<p><em>[%s skipped: too large]</em></p>" % kind
+        return ('<p><em>[%s skipped: too large — <a href="%s">open in Telegram'
+                '</a>]</em></p>' % (kind, htmllib.escape(post_link, quote=True)))
 
     rel = "tg/%d/%d%s" % (chan_id, msg.id, ext)
+    if kind == "sticker":
+        # The thumb's real format is only known once downloaded — reuse
+        # whichever sniffed extension a prior cycle stored it under.
+        for e in STICKER_EXTS:
+            cand = "tg/%d/%d%s" % (chan_id, msg.id, e)
+            if cache_complete(os.path.join(asset_dir, cand), size):
+                rel = cand
+                break
     dest = os.path.join(asset_dir, rel)
     if cache_complete(dest, size):
         # Refresh the mtime so srr's post-cycle age-based cache sweep never
@@ -355,7 +410,7 @@ async def media_element(client, msg, chan_id, asset_dir, max_media):
         # cycle to reuse and publish (the live chron-437 moov-less mp4 bug).
         part = dest + ".part"
         try:
-            got = await client.download_media(msg, file=part)
+            got = await client.download_media(msg, file=part, thumb=thumb)
         except BaseException:
             unlink_quiet(part)
             raise
@@ -368,14 +423,20 @@ async def media_element(client, msg, chan_id, asset_dir, max_media):
             raise PartialDownload(
                 "%s msg %d: downloaded %d bytes, Telegram advertises %d"
                 % (kind, msg.id, have, size))
+        if kind == "sticker":
+            rel = "tg/%d/%d%s" % (chan_id, msg.id, image_ext(part))
+            dest = os.path.join(asset_dir, rel)
         os.replace(part, dest)
 
     marker = "#/" + rel
-    if kind == "image":
+    if kind in ("image", "sticker"):
         return '<p><img src="%s" alt=""></p>' % marker
     if kind == "video":
         return ('<p><video src="%s" controls preload="metadata" playsinline>'
                 '</video></p>' % marker)
+    if kind == "audio":
+        return ('<p><audio src="%s" controls preload="metadata"></audio></p>'
+                % marker)
     name = (msg.file.name or os.path.basename(rel))
     return '<p><a href="%s">%s</a></p>' % (marker, htmllib.escape(name))
 
@@ -460,7 +521,8 @@ async def run_ingest(req):
             caption = next((m.message for m in gm if m.message), "")
             parts = []
             for m in gm:
-                el = await media_element(client, m, entity.id, asset_dir, max_media)
+                el = await media_element(client, m, entity.id, asset_dir,
+                                         max_media, make_link(entity, m.id))
                 if el:
                     parts.append(el)
                 max_id = max(max_id, m.id)
@@ -708,7 +770,9 @@ def web_media_element(kind, src, rel_base, n, asset_dir, max_media, post_link):
         st = web_download(src, dest, max_media)
         if st == "toobig":
             log("skip %s %s: > cap %d" % (kind, rel_base, max_media))
-            return "<p><em>[%s skipped: too large]</em></p>" % kind
+            return ('<p><em>[%s skipped: too large — <a href="%s">open in '
+                    'Telegram</a>]</em></p>'
+                    % (kind, htmllib.escape(post_link, quote=True)))
         if st == "error":
             # The item publishes and the cursor advances either way, so a
             # dropped element would be lost for good — degrade to the same

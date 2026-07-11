@@ -30,8 +30,12 @@ testing (the result is pretty-printed).
 
 ### `srr-telegram`
 
-Turns each message (or album) of a Telegram channel into an article, self-hosting its
-photos and videos into the SRR store. Two modes:
+Turns each message (or album) of a Telegram channel into an article, self-hosting
+every attachment into the SRR store: photos, videos, voice notes and music as inline
+players, stickers as images (animated `.tgs` via their static thumbnail), anything
+else as a download link; whatever can't be downloaded (over srr's size cap, or a
+sticker with no static thumb) degrades to an "open in Telegram" link, never silence.
+Two modes:
 
 - **Account (MTProto) mode — the default**: private *and* public channels through your
   own user account (Telethon). Needs a one-time login: get an API id/hash from
