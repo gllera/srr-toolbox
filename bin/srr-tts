@@ -160,11 +160,11 @@ BLOCK_TAGS = ("p", "div", "li", "ul", "ol", "blockquote", "pre", "table",
               "dl", "dt", "dd", "td", "th", "caption")
 
 
-def extract_text(title: str, content_html: str) -> str:
-    """Item title + content HTML -> the plain text to narrate. Attribute text
-    (alt, URLs) is never included; block boundaries become paragraph breaks
-    so piper phrases them as pauses. '' when there is nothing to say."""
-    soup = BeautifulSoup(content_html or "", "html.parser")
+def html_to_text(fragment: str) -> str:
+    """HTML fragment -> plain text. Attribute text (alt, URLs) is never
+    included; block boundaries become paragraph breaks so piper phrases them
+    as pauses."""
+    soup = BeautifulSoup(fragment or "", "html.parser")
     for t in soup(list(DROP_TAGS)):
         t.decompose()
     for br in soup.find_all("br"):
@@ -172,11 +172,24 @@ def extract_text(title: str, content_html: str) -> str:
     for t in soup.find_all(list(BLOCK_TAGS)):
         t.insert_before("\n\n")
         t.insert_after("\n\n")
-    body = soup.get_text()
-    body = re.sub(r"[ \t\r\f\v]+", " ", body)
-    body = re.sub(r" ?\n ?", "\n", body)
-    body = re.sub(r"\n{3,}", "\n\n", body).strip()
-    title = (title or "").strip()
+    text = soup.get_text()
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" ?\n ?", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def extract_text(title: str, content_html: str) -> str:
+    """Item title + content HTML -> the plain text to narrate. '' when there
+    is nothing to say.
+
+    The title goes through the same conversion as the body: a feed title is
+    NOT plain text — it routinely carries entities ("Tom &amp; Jerry",
+    "It&#8217;s") and sometimes markup, and srr only unescapes and sanitizes
+    it AFTER the pipeline, so this step always sees the raw form. Narrating
+    that verbatim makes piper read the entity out loud. Collapsed to one line
+    because a title is one utterance."""
+    body = html_to_text(content_html)
+    title = " ".join(html_to_text(title).split())
     if title and body:
         return title + "\n\n" + body
     return title or body
