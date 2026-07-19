@@ -143,6 +143,13 @@ check_true("unreadable file is fetch-safe, not a hard exit",
 check_true("manual run still exits when the file comes after a typo'd flag",
            manual_exits(["--voce", "es_ES-davefx-medium"], file_first=False))
 
+# When several tokens look like files and none opens, the reported error must
+# pair the file it names (paths[0]) with that file's OWN errno, not a later
+# candidate's.
+msg = protocol_error(["/nonexistent/a.html", "/nonexistent/b.html"])
+check_true("multi-candidate open failure pairs message with its own file",
+           "a.html" in msg and "b.html" not in msg, msg)
+
 # The invariant behind all of the above, brute-forced rather than sampled:
 # NOTHING on the command line may cause a non-zero exit (or an uncaught
 # crash) unless a readable file was genuinely supplied, because on the fetch
@@ -150,7 +157,7 @@ check_true("manual run still exits when the file comes after a typo'd flag",
 import itertools
 
 FUZZ_TOKENS = ["--voice", "--voce", "--lang-voice", "--max-chars", "--asset-dir",
-               "--title", "--lang", "--bogus", "-", "",
+               "--title", "--lang", "--bogus", "-", "", "--help", "help",
                "en_US-lessac-medium", " en_US-lessac-medium", "lessac",
                "es=es_ES-davefx-medium", "noequals", "abc", "-1", "3000",
                "stray", "/nonexistent/a.html"]
@@ -390,6 +397,20 @@ try:
         check_true("stale staging dir swept", not os.path.exists(stale_stage))
         check_true("a concurrent worker's live staging dir is left alone",
                    os.path.exists(fresh_stage))
+
+        # The kill-then-succeed sequence: debris from a killed download is
+        # still younger than STAGE_TTL when the retry succeeds minutes later,
+        # and once the voice is complete a download-path-only sweep never runs
+        # again — the ~60 MB leak would be permanent. So the sweep must run on
+        # EVERY load, not just ahead of a download.
+        settled_stage = os.path.join(vd, ".dl-settled")
+        os.makedirs(settled_stage, exist_ok=True)
+        os.utime(settled_stage, (old, old))
+        del downloads[:]
+        tts.ensure_voice("en_US-lessac-medium", vd)
+        check("complete voice still not re-downloaded", downloads, [])
+        check_true("stale staging debris swept even without a download",
+                   not os.path.exists(settled_stage))
 finally:
     for k, v in saved_mods.items():
         if v is None:
@@ -497,6 +518,35 @@ proc = subprocess.run([sys.executable, SCRIPT], input=ITEM,
 check("no asset dir: exit 0", proc.returncode, 0)
 check("no asset dir: item echoed unchanged", json.loads(proc.stdout),
       json.loads(ITEM))
+
+# Help/version are argv[0] conveniences, but stdout is the protocol channel:
+# their text is not JSON, so on the fetch path it would fail srr's parse and
+# drop the article as surely as a non-zero exit would. Both must report on
+# stderr and leave stdout empty (= item unchanged).
+proc = subprocess.run([sys.executable, SCRIPT, "--help"], input=ITEM,
+                      capture_output=True, text=True, env=BAD_ENV)
+check("--help: exit 0", proc.returncode, 0)
+check("--help: empty stdout (srr keeps the item unchanged)",
+      proc.stdout.strip(), "")
+check_true("--help: documentation on stderr", "VOICE RESOLUTION" in proc.stderr,
+           proc.stderr[:200])
+
+proc = subprocess.run([sys.executable, SCRIPT, "--version"], input=ITEM,
+                      capture_output=True, text=True, env=BAD_ENV)
+check("--version: exit 0", proc.returncode, 0)
+check("--version: empty stdout", proc.stdout.strip(), "")
+check_true("--version: version on stderr",
+           ("srr-tts %s" % tts.VERSION) in proc.stderr, proc.stderr)
+
+# srr's Go encoder only ever emits valid UTF-8, but the decode must not be at
+# the mercy of the service unit's locale: invalid bytes raise
+# UnicodeDecodeError — a ValueError, NOT a JSONDecodeError — and an uncaught
+# one exits non-zero, which costs the article.
+proc = subprocess.run([sys.executable, SCRIPT],
+                      input=b'{"guid": 1, "title": "\xff\xfe"}',
+                      capture_output=True, env=BAD_ENV)
+check("invalid UTF-8 on stdin: exit 0", proc.returncode, 0)
+check("invalid UTF-8 on stdin: empty stdout", proc.stdout.strip(), b"")
 
 print()
 if failures:

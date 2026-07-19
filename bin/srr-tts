@@ -42,7 +42,9 @@ pipe step fails and keeps its guid, so the article is gone for good — worse
 than losing the narration. Every failure, INCLUDING a typo'd flag in the
 feed's `pipe`, therefore reports on stderr and leaves the item alone. Run the
 step manually (an HTML file argument) to have mistakes reported loudly with a
-non-zero exit.
+non-zero exit. --help/--version print on STDERR for the same reason: stdout
+is the protocol channel, and non-JSON there fails srr's parse — dropping the
+article as surely as a non-zero exit would.
 
 KNOBS
 -----
@@ -101,7 +103,7 @@ import wave
 
 from bs4 import BeautifulSoup
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 DEFAULT_MAX_CHARS = 3_000
 
@@ -271,7 +273,6 @@ def fetch_voice(voice: str, voices_dir: str, onnx: str, conf: str):
     from pathlib import Path
     from piper.download_voices import download_voice
     os.makedirs(voices_dir, exist_ok=True)
-    sweep_stale_stages(voices_dir)
     log("downloading voice %s -> %s" % (voice, voices_dir))
     stage = tempfile.mkdtemp(dir=voices_dir, prefix=".dl-")
     try:
@@ -283,11 +284,15 @@ def fetch_voice(voice: str, voices_dir: str, onnx: str, conf: str):
 
 
 def sweep_stale_stages(voices_dir: str):
-    """Reclaim .dl-* staging dirs an interrupted run left behind. The finally
-    above cannot run on SIGKILL, and voices_dir sits outside srr's age-swept
-    cache, so without this a killed download leaks ~60 MB permanently and
-    every retry can leak another. Only dirs older than STAGE_TTL go, so a
-    concurrent worker's live download is never pulled out from under it."""
+    """Reclaim .dl-* staging dirs an interrupted run left behind. fetch_voice's
+    finally cannot run on SIGKILL, and voices_dir sits outside srr's age-swept
+    cache, so nothing else reclaims them. Called from ensure_voice on EVERY
+    load, not just ahead of a download: in the common kill-then-retry sequence
+    the retry succeeds minutes later — debris still younger than STAGE_TTL —
+    and once the voice is complete a download-path-only sweep would never run
+    again, making that ~60 MB leak permanent. Only dirs older than STAGE_TTL
+    go, so a concurrent worker's live download is never pulled out from under
+    it."""
     cutoff = time.time() - STAGE_TTL
     try:
         names = os.listdir(voices_dir)
@@ -323,6 +328,7 @@ def ensure_voice(voice: str, voices_dir: str):
     fails the same way, and re-downloading 60 MB for every item of the feed
     would turn a memory problem into a bandwidth one."""
     from piper import PiperVoice
+    sweep_stale_stages(voices_dir)
     onnx = os.path.join(voices_dir, voice + ".onnx")
     conf = onnx + ".json"
     if not (os.path.exists(onnx) and os.path.exists(conf)):
@@ -490,16 +496,17 @@ def parse_argv(argv):
     # that OPENS wins, because that orphaned value sits ahead of the real
     # filename in the natural ordering ("--voce X article.html").
     content = None
-    last_err = None
+    open_err = None
     for candidate in paths:
         try:
             with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
                 content = fh.read()
             break
         except OSError as e:
-            last_err = e
+            if open_err is None:
+                open_err = e   # the FIRST failure: the message names paths[0]
     if paths and content is None:
-        errors.append("cannot read %s: %s" % (paths[0], last_err))
+        errors.append("cannot read %s: %s" % (paths[0], open_err))
     elif len(paths) > 1 and not errors:
         errors.append("more than one input file (%s)"
                       % ", ".join(repr(p) for p in paths))
@@ -524,11 +531,16 @@ def parse_argv(argv):
 
 def main():
     argv = sys.argv[1:]
+    # Help/version report on STDERR: stdout is srr's protocol channel, and
+    # their text is not JSON — on the fetch path it would fail srr's parse and
+    # drop the article as surely as a non-zero exit would. A stray help token
+    # in a feed's `pipe` must degrade like every other mistake: loud on
+    # stderr, empty stdout (= item unchanged).
     if argv and argv[0] in ("-h", "--help", "help"):
-        print(__doc__)
+        print(__doc__, file=sys.stderr)
         return
     if argv and argv[0] in ("version", "--version", "-V"):
-        print("srr-tts", VERSION)
+        print("srr-tts", VERSION, file=sys.stderr)
         return
     cfg, item = parse_argv(argv)
     pretty = item is not None
@@ -539,10 +551,17 @@ def main():
         log("%s: passing items through unchanged" % cfg["error"])
         return
     if item is None:
+        # The wire item is UTF-8 (Go's json encoder emits nothing else): pin
+        # the decode so the service unit's locale gets no vote — a strict
+        # UTF-8 locale would crash on invalid bytes (UnicodeDecodeError → a
+        # dropped article), a coerced C locale would smuggle them through as
+        # lone surrogates srr's decoder then mangles. ValueError covers both
+        # that crash and plain bad JSON; either way emit nothing, which srr
+        # reads as "leave the item unchanged".
         try:
+            sys.stdin.reconfigure(encoding="utf-8", errors="strict")
             item = json.load(sys.stdin)
-        except json.JSONDecodeError as e:
-            # Same reasoning: a non-zero exit here would cost the article.
+        except ValueError as e:
             log("could not parse item on stdin (%s): emitting nothing" % e)
             return
     try:
