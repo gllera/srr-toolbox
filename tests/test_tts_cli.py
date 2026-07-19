@@ -191,6 +191,46 @@ try:
                    [n for n in os.listdir(vd) if n.startswith(".dl-")] == [],
                    os.listdir(vd))
         fake_dl.download_voice = fake_download_voice
+
+        # Present-but-corrupt files can't be spotted by stat: a load failure
+        # on a cached voice must heal via one forced re-download, or the
+        # voice is wedged for every future cycle.
+        tts.ensure_voice("xx_XX-test", vd)          # populate the cache
+        loads = []
+
+        def picky_load(path, *a, **k):
+            loads.append(path)
+            with open(path, "rb") as fh:
+                if fh.read() != b"model-bytes":
+                    raise ValueError("corrupt model")
+            return ("loaded", path)
+
+        fake_piper.PiperVoice.load = staticmethod(picky_load)
+        with open(onnx, "wb") as fh:
+            fh.write(b"corrupt")
+        del downloads[:]
+        got = tts.ensure_voice("xx_XX-test", vd)
+        check("corrupt cached voice is re-downloaded", downloads, ["xx_XX-test"])
+        check("...and then loads", got, ("loaded", onnx))
+        check_true("load retried exactly once", len(loads) == 2, loads)
+
+        # A voice that is broken at the source must NOT loop re-downloading.
+        def bad_download(voice, download_dir, force_redownload=False):
+            downloads.append(voice)
+            for suffix in (".onnx", ".onnx.json"):
+                with open(os.path.join(str(download_dir), voice + suffix), "wb") as fh:
+                    fh.write(b"still-corrupt")
+
+        fake_dl.download_voice = bad_download
+        os.remove(onnx)
+        os.remove(onnx + ".json")
+        del downloads[:]
+        try:
+            tts.ensure_voice("xx_XX-test", vd)
+            check_true("freshly downloaded but broken still raises", False)
+        except ValueError:
+            check_true("freshly downloaded but broken still raises", True)
+        check("no re-download loop on a fresh download", downloads, ["xx_XX-test"])
 finally:
     for k, v in saved_mods.items():
         if v is None:

@@ -47,13 +47,14 @@ KNOBS
                             step exits non-zero or times out, and keeps its
                             guid in BoundaryGUIDs, so a --cmd-timeout kill
                             loses the article permanently (never retried).
-                            Measured (piper medium voice): ~59 chars/s of
-                            speech, ~2.6 MB of WAV per 1000 chars — 3000
-                            chars is ~2.9 min of audio / ~7.8 MB, seconds of
-                            synthesis on a fast box and well inside the 5m
-                            default --cmd-timeout on a small ARM one. 0
-                            disables the cap: only do that on a feed whose
-                            article length you know.
+                            Measured (piper medium voice): ~1000 chars per
+                            MINUTE of speech (~17 chars/s) and ~2.6 MB of WAV
+                            per 1000 chars, so 3000 chars is ~2.9 min of
+                            audio / ~7.8 MB. Synthesis measured on a 4-core
+                            ARM64 box (the class that runs the fetch loop):
+                            41s for 3000 chars — a 7x margin under the 5m
+                            default --cmd-timeout. 0 disables the cap: only
+                            do that on a feed whose article length you know.
   --voices-dir <dir>        piper models dir (default $XDG_DATA_HOME else
                             ~/.local/share, + /srr-tts); models auto-download
                             there on first use. Deliberately OUTSIDE srr's
@@ -185,37 +186,59 @@ def resolve_voice(cfg: dict, language: str):
     return cfg["lang_voices"].get(language or "")
 
 
+def fetch_voice(voice: str, voices_dir: str, onnx: str, conf: str):
+    """Download a voice's two files into voices_dir, atomically.
+
+    piper's own downloader skips any file that merely exists and is non-empty
+    and writes straight to the destination, so a run killed mid-download —
+    srr's --cmd-timeout can land there, the model is ~60 MB — would leave a
+    truncated .onnx that is NEVER re-downloaded and fails load every cycle
+    after. So stage into a sibling temp dir and os.replace each file into
+    place (same filesystem, so the rename is atomic). Two feeds racing on a
+    voice's first use both stage their own copy; last replace wins, same
+    bytes. Imports stay inside — see ensure_voice."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+    from piper.download_voices import download_voice
+    os.makedirs(voices_dir, exist_ok=True)
+    log("downloading voice %s -> %s" % (voice, voices_dir))
+    stage = tempfile.mkdtemp(dir=voices_dir, prefix=".dl-")
+    try:
+        download_voice(voice, Path(stage))
+        for dest in (onnx, conf):
+            os.replace(os.path.join(stage, os.path.basename(dest)), dest)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
 def ensure_voice(voice: str, voices_dir: str):
     """Load the piper voice, downloading its model on first use. Imports stay
     inside: onnxruntime is heavy and pass-through runs must not pay for it.
 
     A voice is two files (PiperVoice.load derives the .onnx.json config from
-    the model path), and both must be complete. piper's own downloader skips
-    any file that merely exists and is non-empty, so a run killed mid-download
-    — srr's --cmd-timeout can land there, the model is ~60 MB — would leave a
-    truncated .onnx that is NEVER re-downloaded and fails load every cycle
-    after. So: stage the download in a sibling temp dir and os.replace each
-    file into place (same filesystem, so the rename is atomic). Two feeds
-    racing on a voice's first use both stage their own copy; last replace
-    wins, same bytes."""
-    import shutil
-    import tempfile
-    from pathlib import Path
+    the model path) and both must be complete. Missing files are the cheap
+    case; a file that is present but CORRUPT is not detectable by stat, so a
+    load failure on files we did not just fetch is treated as a poisoned
+    cache and healed by one forced re-download. Without that, anything that
+    predates the staged download above (or damages a model later) wedges the
+    voice permanently: every cycle would fail load and pass the item
+    through."""
     from piper import PiperVoice
     onnx = os.path.join(voices_dir, voice + ".onnx")
     conf = onnx + ".json"
+    fresh = False
     if not (os.path.exists(onnx) and os.path.exists(conf)):
-        from piper.download_voices import download_voice
-        os.makedirs(voices_dir, exist_ok=True)
-        log("downloading voice %s -> %s" % (voice, voices_dir))
-        stage = tempfile.mkdtemp(dir=voices_dir, prefix=".dl-")
-        try:
-            download_voice(voice, Path(stage))
-            for dest in (onnx, conf):
-                os.replace(os.path.join(stage, os.path.basename(dest)), dest)
-        finally:
-            shutil.rmtree(stage, ignore_errors=True)
-    return PiperVoice.load(onnx)
+        fetch_voice(voice, voices_dir, onnx, conf)
+        fresh = True
+    try:
+        return PiperVoice.load(onnx)
+    except Exception as e:
+        if fresh:
+            raise  # just downloaded and still broken — not a stale-cache problem
+        log("voice %s failed to load (%s): re-downloading" % (voice, e))
+        fetch_voice(voice, voices_dir, onnx, conf)
+        return PiperVoice.load(onnx)
 
 
 def synthesize(voice_obj, text: str, dest: str):

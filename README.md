@@ -131,8 +131,9 @@ it just does nothing.
 times out, and keeps its guid in `BoundaryGUIDs` — so blowing the per-step
 `--cmd-timeout` (default 5m) loses the article permanently, not just its narration.
 The cap is the safety bound against that. Measured with a piper medium voice: about
-**59 characters per second of speech and 2.6 MB of WAV per 1000 characters**, so the
-3000-char default is ~2.9 min of audio / ~7.8 MB per narrated article. Raise it only
+**1000 characters per minute of speech and 2.6 MB of WAV per 1000 characters**, so the
+3000-char default is ~2.9 min of audio / ~7.8 MB per narrated article, and synthesis
+takes ~41 s on a 4-core ARM64 box — a 7× margin under the 5 m timeout. Raise it only
 if you've checked the synthesis still finishes comfortably on the box running the
 fetch loop; `0` disables the cap entirely.
 
