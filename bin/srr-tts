@@ -220,7 +220,7 @@ def norm_lang(s: str) -> str:
     strategy DECLARE lang (an RSS <language> copied verbatim) and srr never
     folds that onto the item — so fold here, or a declared 'pt-BR' silently
     misses the table."""
-    return re.split(r"[-_]", s.strip().lower(), 1)[0]
+    return re.split(r"[-_]", s.strip().lower(), maxsplit=1)[0]
 
 
 def resolve_voice(cfg: dict, language: str):
@@ -407,14 +407,18 @@ def parse_argv(argv):
     retries it, and it does not validate external steps up front, so one
     typo'd flag in a feed's `pipe` would silently destroy every article that
     feed ever publishes. In protocol mode a config error therefore degrades
-    exactly like a per-item failure: complain on stderr, change nothing."""
+    exactly like a per-item failure: complain on stderr, change nothing.
+
+    Which mode we are in is decided by whether the file argument OPENS (see
+    below), not by whether one was supplied — a mis-parsed flag value looks
+    exactly like a filename, and guessing wrong costs articles."""
     cfg = {"voice": "", "max_chars": DEFAULT_MAX_CHARS,
            "voices_dir": default_voices_dir(),
            "asset_dir": os.environ.get("SRR_ASSET_DIR", ""),
            "lang_voices": dict(LANG_VOICES), "error": ""}
     errors = []
     manual = {}
-    path = None
+    paths = []
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -439,11 +443,8 @@ def parse_argv(argv):
         elif a.startswith("-"):
             errors.append("unknown option %r (see --help)" % a)
             i += 1
-        elif path is None:
-            path = a
-            i += 1
         else:
-            errors.append("more than one input file (%r, %r)" % (path, a))
+            paths.append(a)
             i += 1
     try:
         cfg["max_chars"] = int(cfg["max_chars"])
@@ -455,21 +456,37 @@ def parse_argv(argv):
         # certainly means a typo, and silently uncapping is the one outcome
         # that can lose articles to --cmd-timeout. Say so.
         errors.append("--max-chars cannot be negative (0 disables the cap)")
-    if path is None and manual:
+    if not paths and manual:
         errors.append("--title/--lang need an HTML file argument "
                       "(protocol mode reads the item from stdin)")
+    # Manual mode is confirmed by OPENING the file, never by merely seeing a
+    # positional — an unknown flag's orphaned value ("--voce es_ES-x-medium")
+    # is indistinguishable from a filename, and a stray token in a feed's
+    # `pipe` looks like one too. Reading a file is the only evidence a human
+    # is driving this, so it is the only thing that may authorize a non-zero
+    # exit; anything else degrades to the fetch-safe path.
+    # The FIRST positional that opens is the file: an unknown flag's orphaned
+    # value sits in the positional list too, ahead of the real filename.
+    content = None
+    for candidate in paths:
+        try:
+            with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+            break
+        except OSError as e:
+            last_err = e
+    if paths and content is None:
+        errors.append("cannot read %s: %s" % (paths[0], last_err))
+    elif len(paths) > 1 and not errors:
+        errors.append("more than one input file (%s)"
+                      % ", ".join(repr(p) for p in paths))
     if errors:
-        if path is not None:
-            sys.exit("srr-tts: " + errors[0])   # manual run: a human is reading
+        if content is not None:
+            sys.exit("srr-tts: " + errors[0])   # confirmed manual run
         cfg["error"] = errors[0]
         return cfg, None
-    if path is None:
+    if content is None:
         return cfg, None
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            content = fh.read()
-    except OSError as e:
-        sys.exit("srr-tts: cannot read %s: %s" % (path, e))
     item = {
         "guid": fnv1a32(content),
         "title": manual.get("title", ""),

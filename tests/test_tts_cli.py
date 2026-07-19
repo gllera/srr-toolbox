@@ -92,15 +92,16 @@ def protocol_error(argv):
     return cfg["error"]
 
 
-def manual_exits(argv):
+def manual_exits(argv, file_first=True):
     with tempfile.TemporaryDirectory() as d:
         page = os.path.join(d, "a.html")
         with open(page, "w") as fh:
             fh.write("<p>x</p>")
+        # file FIRST by default: a trailing flag missing its value would
+        # otherwise swallow it as the value.
+        full = [page] + argv if file_first else argv + [page]
         try:
-            # file FIRST: a trailing flag missing its value would otherwise
-            # swallow it as the value.
-            tts.parse_argv([page] + argv)
+            tts.parse_argv(full)
             return False
         except SystemExit:
             return True
@@ -126,6 +127,51 @@ for name, argv in [("--lang-voice without =", ["--lang-voice", "noequals"]),
 cfg, _ = tts.parse_argv(["--voice", "en_US-lessac-medium"])
 check("well-formed voice accepted", cfg["voice"], "en_US-lessac-medium")
 check("clean argv sets no error", cfg["error"], "")
+
+# Mode is decided by the file OPENING, not by a positional existing. An
+# unknown flag's orphaned value, and a stray token in a feed's `pipe`, both
+# look exactly like filenames — mistaking either for a manual run means a
+# non-zero exit on the fetch path, which permanently drops the article.
+check_true("unknown flag's orphaned value is not mistaken for a file",
+           bool(protocol_error(["--voce", "es_ES-davefx-medium"])))
+check_true("stray token after a good flag is not mistaken for a file",
+           bool(protocol_error(["--voice", "es_ES-davefx-medium", "stray"])))
+check_true("unreadable file is fetch-safe, not a hard exit",
+           "cannot read" in protocol_error(["/nonexistent/a.html"]))
+# The natural CLI ordering: the typo'd flag's orphaned value precedes the real
+# filename in the positional list, so "first positional" is not good enough.
+check_true("manual run still exits when the file comes after a typo'd flag",
+           manual_exits(["--voce", "es_ES-davefx-medium"], file_first=False))
+
+# The invariant behind all of the above, brute-forced rather than sampled:
+# NOTHING on the command line may cause a non-zero exit (or an uncaught
+# crash) unless a readable file was genuinely supplied, because on the fetch
+# path a non-zero exit costs the article permanently.
+import itertools
+
+FUZZ_TOKENS = ["--voice", "--voce", "--lang-voice", "--max-chars", "--asset-dir",
+               "--title", "--lang", "--bogus", "-", "",
+               "en_US-lessac-medium", " en_US-lessac-medium", "lessac",
+               "es=es_ES-davefx-medium", "noequals", "abc", "-1", "3000",
+               "stray", "/nonexistent/a.html"]
+with tempfile.TemporaryDirectory() as d:
+    real = os.path.join(d, "a.html")
+    with open(real, "w") as fh:
+        fh.write("<p>x</p>")
+    violations, tested = [], 0
+    for r in (1, 2, 3):
+        for combo in itertools.product(FUZZ_TOKENS + [real], repeat=r):
+            argv = list(combo)
+            tested += 1
+            try:
+                tts.parse_argv(argv)
+            except SystemExit:
+                if real not in argv:
+                    violations.append(argv)
+            except Exception as e:                      # noqa: BLE001
+                violations.append((argv, repr(e)))
+    check("no argv exits non-zero or crashes without a readable file "
+          "(%d combinations)" % tested, violations[:5], [])
 
 # The built-in table must satisfy the same grammar --voice does, and stay on
 # one quality tier: the size/timing figures documented for --max-chars assume
@@ -433,6 +479,15 @@ proc = subprocess.run([sys.executable, SCRIPT], input="{not json",
                       capture_output=True, text=True, env=BAD_ENV)
 check("malformed stdin: exit 0", proc.returncode, 0)
 check("malformed stdin: empty stdout", proc.stdout.strip(), "")
+
+# The shape a real misconfigured `pipe` takes: a typo'd flag that still has a
+# value. The orphaned value must not be read as a filename.
+proc = subprocess.run([sys.executable, SCRIPT, "--voce", "es_ES-davefx-medium"],
+                      input=ITEM, capture_output=True, text=True, env=BAD_ENV)
+check("typo'd flag with a value: exit 0", proc.returncode, 0)
+check("typo'd flag with a value: empty stdout", proc.stdout.strip(), "")
+check_true("typo'd flag with a value: names the bad flag",
+           "--voce" in proc.stderr, proc.stderr)
 
 # No asset dir (preview / older backend): item echoed verbatim, exit 0.
 env = dict(os.environ)

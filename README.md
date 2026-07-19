@@ -111,7 +111,10 @@ Voice resolution (first hit wins):
    works on plain feeds too; `--voice` forces a voice when detection is empty/wrong
 
 None resolvable, or any other per-item failure, passes the item through unchanged
-(logged to stderr) — srr-tts never fails the feed cycle.
+(logged to stderr) — srr-tts never fails the feed cycle. That holds for *configuration*
+errors too: a typo'd flag in a feed's `pipe` complains on stderr and leaves items
+alone rather than exiting non-zero, because srr reads a non-zero exit as "drop this
+item" and never retries it. Run the step manually to have mistakes reported loudly.
 
 The asset dir arrives as `$SRR_ASSET_DIR` (set by srr on the fetch path); it's absent
 in `srr preview` and older backends, where the step passes through rather than
