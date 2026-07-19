@@ -548,6 +548,44 @@ proc = subprocess.run([sys.executable, SCRIPT],
 check("invalid UTF-8 on stdin: exit 0", proc.returncode, 0)
 check("invalid UTF-8 on stdin: empty stdout", proc.stdout.strip(), b"")
 
+# `raw` is srr's own payload: it saves and restores its typed copy around the
+# reply, so echoing the key back is discarded work — the whole feed entry
+# re-encoded per item. It must not be in the reply at all.
+proc = subprocess.run([sys.executable, SCRIPT],
+                      input=json.dumps(dict(json.loads(ITEM),
+                                            raw={"+": [{"@": "x"}]})),
+                      capture_output=True, text=True, env=env)
+check("raw: exit 0", proc.returncode, 0)
+check("raw is not echoed back (srr discards it either way)",
+      json.loads(proc.stdout), json.loads(ITEM))
+
+# srr ships the feed entry's XML tree as `raw` with NO depth cap (Go's parser
+# handles arbitrary nesting and models the tree as a recursively nested map),
+# but Python's JSON scanner gives up near depth 500 — with RecursionError,
+# which is NOT a ValueError, and an uncaught one costs the article. Dropping
+# `raw` from the reply keeps that depth off the encode side entirely; the
+# decode side still has to survive it. Whatever the depth, the reply must be
+# all-or-nothing: exit 0 and either a full echo or empty stdout (= item
+# unchanged). A non-zero exit or partial JSON on stdout both drop the article
+# permanently.
+for depth in (5, 496, 497, 5000):
+    raw = '{"+":[' * depth + '"x"' + ']}' * depth
+    deep = ('{"guid":1,"title":"T","content":"<p>Hi.</p>","link":"",'
+            '"published":null,"raw":' + raw + "}")
+    proc = subprocess.run([sys.executable, SCRIPT], input=deep,
+                          capture_output=True, text=True, env=BAD_ENV)
+    if proc.stdout:
+        try:
+            json.loads(proc.stdout)
+            intact = True
+        except ValueError:
+            intact = False
+    else:
+        intact = True
+    check("raw depth %d: exit 0" % depth, proc.returncode, 0)
+    check_true("raw depth %d: stdout is a full echo or empty" % depth,
+               intact, proc.stdout[:80])
+
 print()
 if failures:
     raise SystemExit("FAILED: %d test(s): %s" % (len(failures), ", ".join(failures)))

@@ -6,6 +6,11 @@ to stdin and reading the (possibly modified) item JSON back from stdout:
 
     {guid, title, content, link, published, lang?, raw, drop?}
 
+`raw` (the parsed feed entry) is read-only: srr restores its own typed copy
+over whatever comes back, so the reply omits the key entirely. `guid` and
+`published` are immutable — changing either is a pipeline error, which costs
+the article.
+
 This step narrates title + body text with piper (fully offline) and prepends
 
     <p><audio controls preload="none" src="#/tts/<hash>.wav"></audio></p>
@@ -555,13 +560,15 @@ def main():
         # the decode so the service unit's locale gets no vote — a strict
         # UTF-8 locale would crash on invalid bytes (UnicodeDecodeError → a
         # dropped article), a coerced C locale would smuggle them through as
-        # lone surrogates srr's decoder then mangles. ValueError covers both
-        # that crash and plain bad JSON; either way emit nothing, which srr
-        # reads as "leave the item unchanged".
+        # lone surrogates srr's decoder then mangles. ValueError covers that
+        # crash and plain bad JSON; RecursionError covers a hostile `raw` —
+        # srr caps XML nesting nowhere and Go ships arbitrary depth, but
+        # Python's JSON scanner gives up near depth 500. Either way emit
+        # nothing, which srr reads as "leave the item unchanged".
         try:
             sys.stdin.reconfigure(encoding="utf-8", errors="strict")
             item = json.load(sys.stdin)
-        except ValueError as e:
+        except (ValueError, RecursionError) as e:
             log("could not parse item on stdin (%s): emitting nothing" % e)
             return
     try:
@@ -577,8 +584,29 @@ def main():
     if pretty:
         json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
         print()
-    else:
-        json.dump(result, sys.stdout)
+        return
+    # `raw` is dropped, not echoed: srr saves the item's typed Raw payload
+    # before unmarshaling our reply and restores it immediately after, so
+    # whatever we send there is discarded either way. Echoing it re-encodes
+    # the feed entry's whole XML tree once per item — a tree whose depth
+    # nothing bounds (srr models it as a recursively nested map) — onto the
+    # one channel that must never carry a partial write. Sending the key at
+    # all is pure cost.
+    #
+    # Serialize BEFORE writing: json.dump streams the encoder's chunks
+    # straight out, so a failure mid-encode leaves PARTIAL JSON on stdout,
+    # which srr reads as a failed step — and the article is gone for good.
+    # Buffering into one string first makes the reply all-or-nothing; on any
+    # failure emit nothing, srr's "leave the item unchanged". allow_nan is
+    # off for the same reason: the default emits bare NaN/Infinity, which is
+    # not JSON and fails srr's parse just as a truncated body would.
+    try:
+        result.pop("raw", None)
+        out = json.dumps(result, allow_nan=False)
+    except Exception as e:
+        log("could not serialize item (%s): emitting nothing" % e)
+        return
+    sys.stdout.write(out)
 
 
 if __name__ == "__main__":
