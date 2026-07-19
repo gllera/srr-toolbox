@@ -47,14 +47,21 @@ KNOBS
                             step exits non-zero or times out, and keeps its
                             guid in BoundaryGUIDs, so a --cmd-timeout kill
                             loses the article permanently (never retried).
-                            Measured (piper medium voice): ~1000 chars per
-                            MINUTE of speech (~17 chars/s) and ~2.6 MB of WAV
-                            per 1000 chars, so 3000 chars is ~2.9 min of
-                            audio / ~7.8 MB. Synthesis measured on a 4-core
+                            Measured (piper medium voice, Latin prose): ~1000
+                            chars per MINUTE of speech (~17 chars/s) and
+                            ~2.6 MB of WAV per 1000 chars, so 3000 chars is
+                            ~3 min of audio / ~7.8 MB. End-to-end on a 4-core
                             ARM64 box (the class that runs the fetch loop):
-                            41s for 3000 chars — a 7x margin under the 5m
-                            default --cmd-timeout. 0 disables the cap: only
-                            do that on a feed whose article length you know.
+                            41s synthesis + 2s model load, plus a one-off 60
+                            MB voice download on first use (1.5s there, but
+                            it rides the SAME --cmd-timeout, so on a slow
+                            link pre-warm the voice with a manual run before
+                            opting a feed in). ~45s against the 5m default.
+                            Note the cap counts CHARACTERS: the ratios above
+                            are Latin-script; a CJK voice packs far more
+                            speech per character, so re-measure before
+                            reusing this default there. 0 disables the cap:
+                            only do that on a feed whose length you know.
   --voices-dir <dir>        piper models dir (default $XDG_DATA_HOME else
                             ~/.local/share, + /srr-tts); models auto-download
                             there on first use. Deliberately OUTSIDE srr's
@@ -79,7 +86,10 @@ import html
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
+import time
 import wave
 
 from bs4 import BeautifulSoup
@@ -100,6 +110,28 @@ LANG_VOICES = {
 }
 
 AUDIO_HTML = '<p><audio controls preload="none" src="%s"></audio></p>'
+
+# piper's own voice-name grammar (download_voices.VOICE_PATTERN): the
+# downloader REBUILDS the filename from these groups, so a name that doesn't
+# match — or that carries stray whitespace, which it strips — makes it write
+# files under a different name than we then look for. Validating at parse time
+# turns "every item of this feed fails forever, one 60 MB download each" into
+# one loud startup error.
+VOICE_RE = re.compile(r"^[^-\s]+_[^-\s]+-[^-\s]+-\S+$")
+
+# A voice model is downloaded into a .dl-* staging dir; a SIGKILL (srr's
+# --cmd-timeout) skips the cleanup, and voices_dir is deliberately outside
+# srr's age-swept cache, so nothing else reclaims them. Sweep our own debris,
+# but only when it is far older than any live download could be.
+STAGE_TTL = 6 * 3600
+
+# After a failed load we re-download once, assuming a corrupt cache. But
+# "failed to load" also covers environmental faults (OOM on a small box, fd
+# exhaustion) that a re-download cannot fix — and srr runs one process per
+# item, so nothing in-process remembers a failed heal. The model's mtime is
+# that memory: a model touched more recently than this was already healed,
+# so don't pull 60 MB again for every item of the feed.
+HEAL_COOLDOWN = 3600
 
 
 def log(*a):
@@ -179,11 +211,21 @@ def default_voices_dir() -> str:
     return os.path.join(base, "srr-tts")
 
 
+def norm_lang(s: str) -> str:
+    """Fold a language tag to the bare lowercase primary subtag ('ES' -> 'es',
+    'pt-BR' -> 'pt'), mirroring the backend's normalizeLang. srr's own
+    detection already emits bare codes, but the wire protocol lets an ingest
+    strategy DECLARE lang (an RSS <language> copied verbatim) and srr never
+    folds that onto the item — so fold here, or a declared 'pt-BR' silently
+    misses the table."""
+    return re.split(r"[-_]", s.strip().lower(), 1)[0]
+
+
 def resolve_voice(cfg: dict, language: str):
     """--voice > --lang-voice/built-in table by language > None."""
     if cfg["voice"]:
         return cfg["voice"]
-    return cfg["lang_voices"].get(language or "")
+    return cfg["lang_voices"].get(norm_lang(language or ""))
 
 
 def fetch_voice(voice: str, voices_dir: str, onnx: str, conf: str):
@@ -196,12 +238,16 @@ def fetch_voice(voice: str, voices_dir: str, onnx: str, conf: str):
     after. So stage into a sibling temp dir and os.replace each file into
     place (same filesystem, so the rename is atomic). Two feeds racing on a
     voice's first use both stage their own copy; last replace wins, same
-    bytes. Imports stay inside — see ensure_voice."""
-    import shutil
-    import tempfile
+    Note this covers the KILL case, not a silently short HTTP body: piper
+    checks neither Content-Length nor the md5 upstream publishes, so a dropped
+    connection still returns "success". ensure_voice's load-failure heal is
+    what catches that.
+
+    The piper import stays inside — see ensure_voice."""
     from pathlib import Path
     from piper.download_voices import download_voice
     os.makedirs(voices_dir, exist_ok=True)
+    sweep_stale_stages(voices_dir)
     log("downloading voice %s -> %s" % (voice, voices_dir))
     stage = tempfile.mkdtemp(dir=voices_dir, prefix=".dl-")
     try:
@@ -212,6 +258,30 @@ def fetch_voice(voice: str, voices_dir: str, onnx: str, conf: str):
         shutil.rmtree(stage, ignore_errors=True)
 
 
+def sweep_stale_stages(voices_dir: str):
+    """Reclaim .dl-* staging dirs an interrupted run left behind. The finally
+    above cannot run on SIGKILL, and voices_dir sits outside srr's age-swept
+    cache, so without this a killed download leaks ~60 MB permanently and
+    every retry can leak another. Only dirs older than STAGE_TTL go, so a
+    concurrent worker's live download is never pulled out from under it."""
+    cutoff = time.time() - STAGE_TTL
+    try:
+        names = os.listdir(voices_dir)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(".dl-"):
+            continue
+        path = os.path.join(voices_dir, name)
+        try:
+            stale = os.path.getmtime(path) < cutoff
+        except OSError:
+            continue
+        if stale:
+            log("removing stale download staging dir %s" % path)
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def ensure_voice(voice: str, voices_dir: str):
     """Load the piper voice, downloading its model on first use. Imports stay
     inside: onnxruntime is heavy and pass-through runs must not pay for it.
@@ -219,23 +289,29 @@ def ensure_voice(voice: str, voices_dir: str):
     A voice is two files (PiperVoice.load derives the .onnx.json config from
     the model path) and both must be complete. Missing files are the cheap
     case; a file that is present but CORRUPT is not detectable by stat, so a
-    load failure on files we did not just fetch is treated as a poisoned
-    cache and healed by one forced re-download. Without that, anything that
-    predates the staged download above (or damages a model later) wedges the
-    voice permanently: every cycle would fail load and pass the item
-    through."""
+    load failure is treated as a poisoned cache and healed by one
+    re-download. Without that, anything that predates the staged download
+    above — or a short HTTP body, which piper does not detect — wedges the
+    voice permanently: every cycle would fail load and pass the item through.
+
+    The heal is rate-limited by the model's own mtime (HEAL_COOLDOWN),
+    because a load failure is not proof of corruption: OOM on a small box
+    fails the same way, and re-downloading 60 MB for every item of the feed
+    would turn a memory problem into a bandwidth one."""
     from piper import PiperVoice
     onnx = os.path.join(voices_dir, voice + ".onnx")
     conf = onnx + ".json"
-    fresh = False
     if not (os.path.exists(onnx) and os.path.exists(conf)):
         fetch_voice(voice, voices_dir, onnx, conf)
-        fresh = True
     try:
         return PiperVoice.load(onnx)
     except Exception as e:
-        if fresh:
-            raise  # just downloaded and still broken — not a stale-cache problem
+        try:
+            healed_recently = time.time() - os.path.getmtime(onnx) < HEAL_COOLDOWN
+        except OSError:
+            healed_recently = False
+        if healed_recently:
+            raise  # freshly fetched and still broken — a re-download won't fix it
         log("voice %s failed to load (%s): re-downloading" % (voice, e))
         fetch_voice(voice, voices_dir, onnx, conf)
         return PiperVoice.load(onnx)
@@ -304,14 +380,37 @@ CFG_PARAMS = {"--voice": "voice", "--max-chars": "max_chars",
 ITEM_PARAMS = {"--title": "title", "--lang": "lang"}
 
 
+def check_voice(name: str, errors: list) -> str:
+    """Validate a voice name against piper's grammar, at parse time. piper
+    only rejects it at first synthesis — which, since srr runs one process
+    per item, means a silent per-item failure forever (and, for a name that
+    merely has stray whitespace, a completed 60 MB download thrown away each
+    time)."""
+    if not VOICE_RE.match(name):
+        errors.append("%r is not a piper voice name "
+                      "(want lang_REGION-name-quality, e.g. en_US-lessac-medium)"
+                      % name)
+    return name
+
+
 def parse_argv(argv):
     """-> (cfg, item-or-None). Manual mode (an HTML file argument) builds the
     same item dict srr sends as JSON on stdin (the toolbox's same-request
-    rule); protocol mode returns item=None and main reads stdin."""
+    rule); protocol mode returns item=None and main reads stdin.
+
+    Argv errors are COLLECTED, not raised, because what a bad flag should do
+    depends on the mode and we only know the mode once the whole argv is
+    read. A human at a terminal wants a non-zero exit; the fetch path must
+    never get one — srr drops an item whose step exits non-zero and never
+    retries it, and it does not validate external steps up front, so one
+    typo'd flag in a feed's `pipe` would silently destroy every article that
+    feed ever publishes. In protocol mode a config error therefore degrades
+    exactly like a per-item failure: complain on stderr, change nothing."""
     cfg = {"voice": "", "max_chars": DEFAULT_MAX_CHARS,
            "voices_dir": default_voices_dir(),
            "asset_dir": os.environ.get("SRR_ASSET_DIR", ""),
-           "lang_voices": dict(LANG_VOICES)}
+           "lang_voices": dict(LANG_VOICES), "error": ""}
+    errors = []
     manual = {}
     path = None
     i = 0
@@ -319,34 +418,50 @@ def parse_argv(argv):
         a = argv[i]
         if a in CFG_PARAMS or a in ITEM_PARAMS or a == "--lang-voice":
             if i + 1 >= len(argv):
-                sys.exit("srr-tts: %s needs a value" % a)
+                errors.append("%s needs a value" % a)
+                break
             val = argv[i + 1]
             if a == "--lang-voice":
                 lang, sep, v = val.partition("=")
                 if not sep or not lang or not v:
-                    sys.exit("srr-tts: --lang-voice wants xx=voice, got %r" % val)
-                cfg["lang_voices"][lang] = v
+                    errors.append("--lang-voice wants xx=voice, got %r" % val)
+                else:
+                    cfg["lang_voices"][norm_lang(lang)] = check_voice(v, errors)
+            elif a == "--voice":
+                cfg["voice"] = check_voice(val, errors)
             elif a in CFG_PARAMS:
                 cfg[CFG_PARAMS[a]] = val
             else:
                 manual[ITEM_PARAMS[a]] = val
             i += 2
         elif a.startswith("-"):
-            sys.exit("srr-tts: unknown option %r (see --help)" % a)
+            errors.append("unknown option %r (see --help)" % a)
+            i += 1
         elif path is None:
             path = a
             i += 1
         else:
-            sys.exit("srr-tts: more than one input file (%r, %r)" % (path, a))
+            errors.append("more than one input file (%r, %r)" % (path, a))
+            i += 1
     try:
         cfg["max_chars"] = int(cfg["max_chars"])
     except (TypeError, ValueError):
-        sys.exit("srr-tts: --max-chars must be an integer, got %r"
-                 % cfg["max_chars"])
+        errors.append("--max-chars must be an integer, got %r" % cfg["max_chars"])
+        cfg["max_chars"] = DEFAULT_MAX_CHARS
+    if cfg["max_chars"] < 0:
+        # truncate() treats any cap <= 0 as "no cap"; a negative almost
+        # certainly means a typo, and silently uncapping is the one outcome
+        # that can lose articles to --cmd-timeout. Say so.
+        errors.append("--max-chars cannot be negative (0 disables the cap)")
+    if path is None and manual:
+        errors.append("--title/--lang need an HTML file argument "
+                      "(protocol mode reads the item from stdin)")
+    if errors:
+        if path is not None:
+            sys.exit("srr-tts: " + errors[0])   # manual run: a human is reading
+        cfg["error"] = errors[0]
+        return cfg, None
     if path is None:
-        if manual:
-            sys.exit("srr-tts: --title/--lang need an HTML file argument "
-                     "(protocol mode reads the item from stdin)")
         return cfg, None
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -375,11 +490,19 @@ def main():
         return
     cfg, item = parse_argv(argv)
     pretty = item is not None
+    if cfg["error"]:
+        # Protocol mode only (a manual run already exited). Emitting nothing
+        # is srr's documented "leave the item unchanged" — the one response
+        # that neither drops the article nor pretends we narrated it.
+        log("%s: passing items through unchanged" % cfg["error"])
+        return
     if item is None:
         try:
             item = json.load(sys.stdin)
         except json.JSONDecodeError as e:
-            sys.exit("srr-tts: could not parse item on stdin: %s" % e)
+            # Same reasoning: a non-zero exit here would cost the article.
+            log("could not parse item on stdin (%s): emitting nothing" % e)
+            return
     try:
         result = run_item(item, cfg)
     except Exception as e:

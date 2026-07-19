@@ -130,12 +130,23 @@ it just does nothing.
 **Keep `--max-chars` honest.** srr *drops* an item whose pipe step exits non-zero or
 times out, and keeps its guid in `BoundaryGUIDs` — so blowing the per-step
 `--cmd-timeout` (default 5m) loses the article permanently, not just its narration.
-The cap is the safety bound against that. Measured with a piper medium voice: about
-**1000 characters per minute of speech and 2.6 MB of WAV per 1000 characters**, so the
-3000-char default is ~2.9 min of audio / ~7.8 MB per narrated article, and synthesis
-takes ~41 s on a 4-core ARM64 box — a 7× margin under the 5 m timeout. Raise it only
-if you've checked the synthesis still finishes comfortably on the box running the
-fetch loop; `0` disables the cap entirely.
+The cap is the safety bound against that. Measured with a piper medium voice on Latin
+prose: about **1000 characters per minute of speech and 2.6 MB of WAV per 1000
+characters**, so the 3000-char default is ~3 min of audio / ~7.8 MB per narrated
+article. End-to-end on a 4-core ARM64 box: ~41 s synthesis + ~2 s model load ≈ 45 s
+against the 5 m timeout. The cap counts *characters*, and those ratios are
+Latin-script — a CJK voice packs far more speech per character, so re-measure before
+reusing the default there. Raise it only if you've checked synthesis still finishes
+comfortably on the box running the fetch loop; `0` disables the cap entirely.
+
+**Pre-warm a new voice.** The first item needing a voice downloads its ~60 MB model
+*inside* the same `--cmd-timeout` as its synthesis (1.5 s on a fast link, but it is
+the article you'd lose on a slow one). Fetch it once with a manual run before opting
+the feed in:
+
+```bash
+srr-tts --voice es_ES-davefx-medium --asset-dir /tmp/warm article.html
+```
 
 ```bash
 srr-tts --voice es_ES-davefx-medium --asset-dir /tmp/store article.html

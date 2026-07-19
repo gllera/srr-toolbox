@@ -7,7 +7,9 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import tempfile
+import time
 import wave
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -80,28 +82,71 @@ with tempfile.TemporaryDirectory() as d:
     check("manual guid = fnv1a32(content)", item["guid"], tts.fnv1a32("<p>Hola.</p>"))
 
 
-def raises_systemexit(argv):
-    try:
-        tts.parse_argv(argv)
-        return False
-    except SystemExit:
-        return True
+# A bad flag must behave differently per mode. Manual run: exit non-zero, a
+# human is reading. Protocol mode: NEVER exit non-zero — srr drops an item
+# whose step fails and never retries it, and it does not validate external
+# steps up front, so one typo in a feed's `pipe` would otherwise destroy every
+# article that feed publishes.
+def protocol_error(argv):
+    cfg, item = tts.parse_argv(argv)      # must not raise
+    return cfg["error"]
 
 
-check_true("--lang-voice without = raises SystemExit",
-           raises_systemexit(["--lang-voice", "noequals"]))
-check_true("unknown option raises SystemExit",
-           raises_systemexit(["--bogus"]))
-check_true("--max-chars non-integer raises SystemExit",
-           raises_systemexit(["--max-chars", "abc"]))
+def manual_exits(argv):
+    with tempfile.TemporaryDirectory() as d:
+        page = os.path.join(d, "a.html")
+        with open(page, "w") as fh:
+            fh.write("<p>x</p>")
+        try:
+            # file FIRST: a trailing flag missing its value would otherwise
+            # swallow it as the value.
+            tts.parse_argv([page] + argv)
+            return False
+        except SystemExit:
+            return True
+
+
+for name, argv in [("--lang-voice without =", ["--lang-voice", "noequals"]),
+                   ("unknown option", ["--bogus"]),
+                   ("--max-chars non-integer", ["--max-chars", "abc"]),
+                   ("--max-chars negative", ["--max-chars", "-1"]),
+                   ("missing flag value", ["--voice"]),
+                   # piper rejects a bad voice name only when it downloads, and
+                   # strips whitespace before rebuilding the filename — so a
+                   # padded name downloads 60 MB and then can't find it, per
+                   # item, forever. Both must be caught at parse time.
+                   ("malformed voice name", ["--voice", "lessac"]),
+                   ("voice name with whitespace",
+                    ["--voice", " en_US-lessac-medium"]),
+                   ("--lang-voice's voice", ["--lang-voice", "es=nonsense"])]:
+    check_true("%s: reported, not raised, in protocol mode" % name,
+               bool(protocol_error(argv)), argv)
+    check_true("%s: exits in a manual run" % name, manual_exits(argv), argv)
+
+cfg, _ = tts.parse_argv(["--voice", "en_US-lessac-medium"])
+check("well-formed voice accepted", cfg["voice"], "en_US-lessac-medium")
+check("clean argv sets no error", cfg["error"], "")
 
 # --- resolve_voice --------------------------------------------------------
-cfg, _ = tts.parse_argv(["--voice", "xx_XX-explicit"])
-check("--voice wins", tts.resolve_voice(cfg, "es"), "xx_XX-explicit")
+cfg, _ = tts.parse_argv(["--voice", "en_US-onyx-medium"])
+check("--voice wins", tts.resolve_voice(cfg, "es"), "en_US-onyx-medium")
 cfg, _ = tts.parse_argv([])
 check("language via table", tts.resolve_voice(cfg, "es"), tts.LANG_VOICES["es"])
 check("unknown language -> None", tts.resolve_voice(cfg, "zz"), None)
 check("no language -> None", tts.resolve_voice(cfg, ""), None)
+
+# srr's own detection emits bare codes, but the wire protocol lets an ingest
+# strategy DECLARE lang (an RSS <language> verbatim) and srr never folds that
+# onto the item — so a declared "pt-BR"/"ES" must still hit the table.
+check("declared 'pt-BR' folds to pt", tts.resolve_voice(cfg, "pt-BR"),
+      tts.LANG_VOICES["pt"])
+check("declared 'ES' folds to es", tts.resolve_voice(cfg, "ES"),
+      tts.LANG_VOICES["es"])
+check("declared 'en_GB' folds to en", tts.resolve_voice(cfg, "en_GB"),
+      tts.LANG_VOICES["en"])
+cfg2, _ = tts.parse_argv(["--lang-voice", "pt-BR=pt_BR-cadu-medium"])
+check("--lang-voice keys fold too", tts.resolve_voice(cfg2, "pt"),
+      "pt_BR-cadu-medium")
 
 
 # --- synthesize (the real function — atomic-write path) --------------------
@@ -130,11 +175,25 @@ import types
 
 downloads = []
 
+# Mirror the real piper downloader's two name behaviours, or the fake is more
+# permissive than production and the tests below prove nothing: it strips the
+# name, and REBUILDS the filename from the regex groups rather than using the
+# string it was given.
+VOICE_PATTERN = re.compile(
+    r"^(?P<lang_family>[^-]+)_(?P<lang_region>[^-]+)-(?P<voice_name>[^-]+)-"
+    r"(?P<voice_quality>.+)$")
+
 
 def fake_download_voice(voice, download_dir, force_redownload=False):
-    downloads.append(voice)
+    voice = voice.strip()
+    m = VOICE_PATTERN.match(voice)
+    if not m:
+        raise ValueError("Voice %r did not match pattern" % voice)
+    code = "%s_%s-%s-%s" % (m.group("lang_family"), m.group("lang_region"),
+                            m.group("voice_name"), m.group("voice_quality"))
+    downloads.append(code)
     for suffix in (".onnx", ".onnx.json"):
-        with open(os.path.join(str(download_dir), voice + suffix), "wb") as fh:
+        with open(os.path.join(str(download_dir), code + suffix), "wb") as fh:
             fh.write(b"model-bytes")
 
 
@@ -148,11 +207,11 @@ sys.modules["piper"] = fake_piper
 sys.modules["piper.download_voices"] = fake_dl
 try:
     with tempfile.TemporaryDirectory() as vd:
-        onnx = os.path.join(vd, "xx_XX-test.onnx")
+        onnx = os.path.join(vd, "en_US-lessac-medium.onnx")
 
         del downloads[:]
-        tts.ensure_voice("xx_XX-test", vd)
-        check("first use downloads", downloads, ["xx_XX-test"])
+        tts.ensure_voice("en_US-lessac-medium", vd)
+        check("first use downloads", downloads, ["en_US-lessac-medium"])
         check_true("both voice files land",
                    os.path.exists(onnx) and os.path.exists(onnx + ".json"))
         check_true("no staging dir left behind",
@@ -160,15 +219,15 @@ try:
                    os.listdir(vd))
 
         del downloads[:]
-        tts.ensure_voice("xx_XX-test", vd)
+        tts.ensure_voice("en_US-lessac-medium", vd)
         check("complete voice is not re-downloaded", downloads, [])
 
         # Model present but config missing (a killed download): must redownload
         # rather than hand a half-voice to PiperVoice.load forever.
         os.remove(onnx + ".json")
         del downloads[:]
-        tts.ensure_voice("xx_XX-test", vd)
-        check("missing config triggers re-download", downloads, ["xx_XX-test"])
+        tts.ensure_voice("en_US-lessac-medium", vd)
+        check("missing config triggers re-download", downloads, ["en_US-lessac-medium"])
         check_true("config restored", os.path.exists(onnx + ".json"))
 
         # A download that dies mid-flight leaves the previous state intact.
@@ -181,7 +240,7 @@ try:
         os.remove(onnx)
         os.remove(onnx + ".json")
         try:
-            tts.ensure_voice("xx_XX-test", vd)
+            tts.ensure_voice("en_US-lessac-medium", vd)
             check_true("failed download raises", False)
         except OSError:
             check_true("failed download raises", True)
@@ -195,7 +254,7 @@ try:
         # Present-but-corrupt files can't be spotted by stat: a load failure
         # on a cached voice must heal via one forced re-download, or the
         # voice is wedged for every future cycle.
-        tts.ensure_voice("xx_XX-test", vd)          # populate the cache
+        tts.ensure_voice("en_US-lessac-medium", vd)          # populate the cache
         loads = []
 
         def picky_load(path, *a, **k):
@@ -206,15 +265,37 @@ try:
             return ("loaded", path)
 
         fake_piper.PiperVoice.load = staticmethod(picky_load)
-        with open(onnx, "wb") as fh:
-            fh.write(b"corrupt")
+
+        def corrupt(age_seconds):
+            """Break the cached model and age it, since the heal is gated on
+            the model's own mtime."""
+            with open(onnx, "wb") as fh:
+                fh.write(b"corrupt")
+            old = time.time() - age_seconds
+            os.utime(onnx, (old, old))
+
+        corrupt(tts.HEAL_COOLDOWN + 60)
         del downloads[:]
-        got = tts.ensure_voice("xx_XX-test", vd)
-        check("corrupt cached voice is re-downloaded", downloads, ["xx_XX-test"])
+        got = tts.ensure_voice("en_US-lessac-medium", vd)
+        check("corrupt cached voice is re-downloaded", downloads, ["en_US-lessac-medium"])
         check("...and then loads", got, ("loaded", onnx))
         check_true("load retried exactly once", len(loads) == 2, loads)
 
-        # A voice that is broken at the source must NOT loop re-downloading.
+        # The heal must NOT fire for a model touched within the cooldown: a
+        # load failure is not proof of corruption (OOM fails the same way),
+        # and srr runs one process per item, so an ungated heal would pull
+        # 60 MB for every item of the feed.
+        corrupt(0)
+        del downloads[:]
+        try:
+            tts.ensure_voice("en_US-lessac-medium", vd)
+            check_true("recently-fetched broken model raises", False)
+        except ValueError:
+            check_true("recently-fetched broken model raises", True)
+        check("no re-download inside the heal cooldown", downloads, [])
+
+        # A voice broken at the SOURCE must not loop either: the re-download
+        # refreshes mtime, so the next item is inside the cooldown.
         def bad_download(voice, download_dir, force_redownload=False):
             downloads.append(voice)
             for suffix in (".onnx", ".onnx.json"):
@@ -222,15 +303,37 @@ try:
                     fh.write(b"still-corrupt")
 
         fake_dl.download_voice = bad_download
-        os.remove(onnx)
-        os.remove(onnx + ".json")
+        corrupt(tts.HEAL_COOLDOWN + 60)
         del downloads[:]
         try:
-            tts.ensure_voice("xx_XX-test", vd)
-            check_true("freshly downloaded but broken still raises", False)
+            tts.ensure_voice("en_US-lessac-medium", vd)
+            check_true("still-broken after heal raises", False)
         except ValueError:
-            check_true("freshly downloaded but broken still raises", True)
-        check("no re-download loop on a fresh download", downloads, ["xx_XX-test"])
+            check_true("still-broken after heal raises", True)
+        check("heal downloads once", downloads, ["en_US-lessac-medium"])
+        del downloads[:]
+        try:
+            tts.ensure_voice("en_US-lessac-medium", vd)
+        except ValueError:
+            pass
+        check("next item does not re-download", downloads, [])
+        fake_dl.download_voice = fake_download_voice
+        fake_piper.PiperVoice.load = staticmethod(lambda path, *a, **k: ("loaded", path))
+
+        # Staging dirs an interrupted run leaked are reclaimed once stale —
+        # voices_dir sits outside srr's age-swept cache, so nothing else would.
+        fresh_stage = os.path.join(vd, ".dl-live")
+        stale_stage = os.path.join(vd, ".dl-old")
+        for p in (fresh_stage, stale_stage):
+            os.makedirs(p, exist_ok=True)
+        old = time.time() - tts.STAGE_TTL - 60
+        os.utime(stale_stage, (old, old))
+        os.remove(onnx)
+        os.remove(onnx + ".json")
+        tts.ensure_voice("en_US-lessac-medium", vd)
+        check_true("stale staging dir swept", not os.path.exists(stale_stage))
+        check_true("a concurrent worker's live staging dir is left alone",
+                   os.path.exists(fresh_stage))
 finally:
     for k, v in saved_mods.items():
         if v is None:
@@ -296,6 +399,39 @@ with tempfile.TemporaryDirectory() as store:
     finally:
         tts.ensure_voice = orig_ensure_voice
         tts.synthesize = orig_synthesize
+
+# --- end-to-end: a misconfigured feed must never lose articles -------------
+# The point of the mode split above, exercised through a real process. srr
+# reads a non-zero exit as "drop this item, permanently" and empty stdout as
+# "leave it unchanged".
+import subprocess
+
+ITEM = json.dumps({"guid": 1, "title": "T", "content": "<p>Hi.</p>",
+                   "link": "", "published": None, "lang": "en"})
+BAD_ENV = dict(os.environ, SRR_ASSET_DIR="/nonexistent")
+
+proc = subprocess.run([sys.executable, SCRIPT, "--voice", "bogus"],
+                      input=ITEM, capture_output=True, text=True, env=BAD_ENV)
+check("bad --voice: exit 0 (non-zero would drop the article)",
+      proc.returncode, 0)
+check("bad --voice: empty stdout (srr keeps the item unchanged)",
+      proc.stdout.strip(), "")
+check_true("bad --voice: says why on stderr",
+           "not a piper voice name" in proc.stderr, proc.stderr)
+
+proc = subprocess.run([sys.executable, SCRIPT], input="{not json",
+                      capture_output=True, text=True, env=BAD_ENV)
+check("malformed stdin: exit 0", proc.returncode, 0)
+check("malformed stdin: empty stdout", proc.stdout.strip(), "")
+
+# No asset dir (preview / older backend): item echoed verbatim, exit 0.
+env = dict(os.environ)
+env.pop("SRR_ASSET_DIR", None)
+proc = subprocess.run([sys.executable, SCRIPT], input=ITEM,
+                      capture_output=True, text=True, env=env)
+check("no asset dir: exit 0", proc.returncode, 0)
+check("no asset dir: item echoed unchanged", json.loads(proc.stdout),
+      json.loads(ITEM))
 
 print()
 if failures:
