@@ -4,7 +4,7 @@
 srr execs any non-#builtin `pipe` entry once per item, writing the item JSON
 to stdin and reading the (possibly modified) item JSON back from stdout:
 
-    {guid, title, content, link, published, language?, raw, drop?}
+    {guid, title, content, link, published, lang?, raw, drop?}
 
 This step narrates title + body text with piper (fully offline) and prepends
 
@@ -19,14 +19,17 @@ Opt a feed in (order matters: after #readability if the feed uses it, before
 #default so the marker rides the normal sanitize/upload path):
 
     srr feed upd <id> -p 'srr-tts --voice es_ES-davefx-medium' -p '#default'
-    srr feed upd <id> -l es -p 'srr-tts' -p '#default'   # voice via language
 
 VOICE RESOLUTION (first hit wins)
 ---------------------------------
   1. --voice <name>          explicit piper voice, e.g. en_US-lessac-medium
   2. --lang-voice xx=voice   per-feed extension/override of the table (repeatable)
-  3. built-in table          keyed by the item's `language` field (en es fr de pt it)
+  3. built-in table          keyed by the item's `lang` field (en es fr de pt it)
   none resolvable -> the item passes through unchanged (logged to stderr).
+  The `lang` field reaches srr-tts only when the ingest strategy (or an
+  earlier external mod) declared it — srr's own language detection stamps
+  at the END of the pipeline, after this step. Plain feeds arrive without
+  one; give those an explicit --voice.
 
 The asset dir arrives as $SRR_ASSET_DIR (set by srr on the fetch path; absent
 in `srr preview` and older backends -> pass through, never synthesize).
@@ -40,7 +43,10 @@ KNOBS
   --lang-voice xx=voice     extend/override the language->voice table (repeatable)
   --max-chars <n>           narration cap, default 10000; truncated at a
                             sentence boundary (bounds audio size + synthesis
-                            time vs srr's per-step --cmd-timeout)
+                            time vs srr's per-step --cmd-timeout); 0 disables
+                            the cap (unbounded synthesis can hit srr's
+                            per-step timeout — leave the default unless you
+                            know the feed)
   --voices-dir <dir>        piper models dir (default $XDG_DATA_HOME else
                             ~/.local/share, + /srr-tts); models auto-download
                             there on first use. Deliberately OUTSIDE srr's
@@ -54,11 +60,11 @@ Pass an HTML file as argument instead of item JSON on stdin — the same item
 dict is built from parameters and the result is pretty-printed:
 
     srr-tts --voice es_ES-davefx-medium --asset-dir /tmp/store article.html
-    srr-tts --language es --asset-dir /tmp/store --title "Titular" article.html
+    srr-tts --lang es --asset-dir /tmp/store --title "Titular" article.html
 
   <file>                    HTML file whose content becomes the item body
   --title <text>            item title (narrated first)
-  --language <xx>           item language field (drives the voice table)
+  --lang <xx>               item lang field (drives the voice table)
 """
 import hashlib
 import html
@@ -74,7 +80,7 @@ VERSION = "1.0"
 
 DEFAULT_MAX_CHARS = 10_000
 
-# language (lowercase primary subtag, the item's `language` field) -> default
+# language (lowercase primary subtag, the item's `lang` field) -> default
 # piper voice. --lang-voice overrides/extends per feed; --voice bypasses it.
 LANG_VOICES = {
     "en": "en_US-lessac-medium",
@@ -155,3 +161,191 @@ def audio_name(voice: str, text: str) -> str:
     so identical inputs reuse the same cache file (and dedup in the store)."""
     h = hashlib.sha256((voice + "\n" + text).encode("utf-8")).hexdigest()
     return "tts/%s.wav" % h[:32]
+
+
+def default_voices_dir() -> str:
+    # XDG data dir, NOT srr's asset cache: the cache is age-swept, voice
+    # models are not per-run artifacts.
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "srr-tts")
+
+
+def resolve_voice(cfg: dict, language: str):
+    """--voice > --lang-voice/built-in table by language > None."""
+    if cfg["voice"]:
+        return cfg["voice"]
+    return cfg["lang_voices"].get(language or "")
+
+
+def ensure_voice(voice: str, voices_dir: str):
+    """Load the piper voice, downloading its model on first use. Imports stay
+    inside: onnxruntime is heavy and pass-through runs must not pay for it."""
+    from pathlib import Path
+    from piper import PiperVoice
+    onnx = os.path.join(voices_dir, voice + ".onnx")
+    if not os.path.exists(onnx):
+        from piper.download_voices import download_voice
+        os.makedirs(voices_dir, exist_ok=True)
+        log("downloading voice %s -> %s" % (voice, voices_dir))
+        download_voice(voice, Path(voices_dir))
+    return PiperVoice.load(onnx)
+
+
+def synthesize(voice_obj, text: str, dest: str):
+    """Synthesize text to dest as WAV. .part + rename so a killed run never
+    leaves a truncated file for a later cycle (or a concurrent worker) to
+    reuse. The temp name is PID-suffixed so two concurrent workers
+    synthesizing the same voice+text can't tear each other's write (last
+    os.replace wins, which is harmless — same bytes)."""
+    tmp = "%s.%d.part" % (dest, os.getpid())
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    try:
+        with wave.open(tmp, "wb") as w:
+            voice_obj.synthesize_wav(text, w)
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def run_item(item: dict, cfg: dict) -> dict:
+    """One item through the step. Narration is an enhancement: every per-item
+    problem logs to stderr and returns the item unchanged — never fail the
+    feed's cycle."""
+    asset_dir = cfg["asset_dir"]
+    if not asset_dir:
+        log("no asset dir (preview or old backend): passing item through")
+        return item
+    text = extract_text(item.get("title") or "", item.get("content") or "")
+    if not text:
+        log("nothing to narrate: passing item through")
+        return item
+    text, truncated = truncate(text, cfg["max_chars"])
+    if truncated:
+        log("narration truncated to %d chars" % cfg["max_chars"])
+    voice = resolve_voice(cfg, item.get("lang") or "")
+    if not voice:
+        log("no voice for language %r: passing item through"
+            % (item.get("lang") or ""))
+        return item
+    rel = audio_name(voice, text)
+    dest = os.path.join(asset_dir, rel)
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        # Refresh the mtime so srr's post-cycle age-based cache sweep never
+        # deletes a file a live feed still consumes (srr-youtube's pattern).
+        os.utime(dest, None)
+    else:
+        try:
+            synthesize(ensure_voice(voice, cfg["voices_dir"]), text, dest)
+        except Exception as e:  # any failure degrades — never fails the cycle
+            log("synthesis failed (%s): %s" % (voice, e))
+            return item
+    item["content"] = (AUDIO_HTML % html.escape("#/" + rel, quote=True)
+                       + (item.get("content") or ""))
+    return item
+
+
+CFG_PARAMS = {"--voice": "voice", "--max-chars": "max_chars",
+              "--voices-dir": "voices_dir", "--asset-dir": "asset_dir"}
+ITEM_PARAMS = {"--title": "title", "--lang": "lang"}
+
+
+def parse_argv(argv):
+    """-> (cfg, item-or-None). Manual mode (an HTML file argument) builds the
+    same item dict srr sends as JSON on stdin (the toolbox's same-request
+    rule); protocol mode returns item=None and main reads stdin."""
+    cfg = {"voice": "", "max_chars": DEFAULT_MAX_CHARS,
+           "voices_dir": default_voices_dir(),
+           "asset_dir": os.environ.get("SRR_ASSET_DIR", ""),
+           "lang_voices": dict(LANG_VOICES)}
+    manual = {}
+    path = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in CFG_PARAMS or a in ITEM_PARAMS or a == "--lang-voice":
+            if i + 1 >= len(argv):
+                sys.exit("srr-tts: %s needs a value" % a)
+            val = argv[i + 1]
+            if a == "--lang-voice":
+                lang, sep, v = val.partition("=")
+                if not sep or not lang or not v:
+                    sys.exit("srr-tts: --lang-voice wants xx=voice, got %r" % val)
+                cfg["lang_voices"][lang] = v
+            elif a in CFG_PARAMS:
+                cfg[CFG_PARAMS[a]] = val
+            else:
+                manual[ITEM_PARAMS[a]] = val
+            i += 2
+        elif a.startswith("-"):
+            sys.exit("srr-tts: unknown option %r (see --help)" % a)
+        elif path is None:
+            path = a
+            i += 1
+        else:
+            sys.exit("srr-tts: more than one input file (%r, %r)" % (path, a))
+    try:
+        cfg["max_chars"] = int(cfg["max_chars"])
+    except (TypeError, ValueError):
+        sys.exit("srr-tts: --max-chars must be an integer, got %r"
+                 % cfg["max_chars"])
+    if path is None:
+        if manual:
+            sys.exit("srr-tts: --title/--lang need an HTML file argument "
+                     "(protocol mode reads the item from stdin)")
+        return cfg, None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+    except OSError as e:
+        sys.exit("srr-tts: cannot read %s: %s" % (path, e))
+    item = {
+        "guid": fnv1a32(content),
+        "title": manual.get("title", ""),
+        "content": content,
+        "link": "",
+        "published": None,
+    }
+    if manual.get("lang"):
+        item["lang"] = manual["lang"]
+    return cfg, item
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if argv and argv[0] in ("version", "--version", "-V"):
+        print("srr-tts", VERSION)
+        return
+    cfg, item = parse_argv(argv)
+    pretty = item is not None
+    if item is None:
+        try:
+            item = json.load(sys.stdin)
+        except json.JSONDecodeError as e:
+            sys.exit("srr-tts: could not parse item on stdin: %s" % e)
+    try:
+        result = run_item(item, cfg)
+    except Exception as e:
+        # Absolute backstop: run_item mutates item["content"] only as its
+        # final statement, so on any raise (e.g. a cache-hit TOCTOU between
+        # the getsize/utime checks and a concurrent evictor) the item is
+        # still pristine — emit it untouched rather than exit non-zero and
+        # have srr drop the article.
+        log("unexpected error: %s: passing item through" % e)
+        result = item
+    if pretty:
+        json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+    else:
+        json.dump(result, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()
