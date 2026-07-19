@@ -1,0 +1,852 @@
+#!/usr/bin/env srr-uvrun
+"""srr-digest-gen — daily Claude-written digest of the SRR store.
+
+Collects the articles fetched in the last N hours via `srr art ls` and has
+`claude -p` (headless, all tools disabled) write an editorial digest. A quiet
+day fits one call; a busy day goes map-reduce — chunks of full-text articles
+are condensed into relevance-scored plain-text story notes by one claude call
+each (on the cheaper --map-model, several in flight), notes below the
+relevance floor are dropped, then a final call on the default model writes the
+digest from the survivors. The result is a rolling RSS 2.0 feed handed to
+`srr syndicate push`, which writes it into the store as out/<name> under srr's
+own credentials — this script never sees the store's endpoint or keys. The
+store subscribes to the published URL as a normal feed.
+
+The tool is stateless: the previous days come from `srr syndicate fetch`, i.e.
+the published feed IS the history, so any box that can reach the store can run
+it. `--no-history` is the bootstrap for a feed that does not exist yet. That
+feed also dates the last edition, so the default window is the gap since it
+(floored at a day, capped by --max-hours) — a missed run is caught up, not
+skipped.
+
+Modes:
+  srr-digest-gen                 generate today's digest, rewrite the feed
+  srr-digest-gen --dump          print collected articles as JSON and exit
+                                 (consumed by the /srr-digest skill; no claude
+                                 call, no feed read back)
+  srr-digest-gen --dry-run       generate but print the RSS to stdout,
+                                 touching neither the store nor anything else
+
+Failure discipline: any error (store unreachable, window not covered, claude
+failure, output that is not shaped like a digest, push refused) aborts BEFORE
+the store is touched — yesterday's feed stays, SRR sees unchanged GUIDs and
+no-ops. An empty window is an error too: with feeds that work, no articles at
+all means the fetch loop is broken (--allow-empty says otherwise). Two
+exceptions, both deliberate: a lost map chunk (up to a third may fail and the
+day is still digested from the rest), and the calls whose loss would waste
+every other call — the single-pass and reduce steps get one retry.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime, parsedate_to_datetime
+from html.parser import HTMLParser
+from xml.sax.saxutils import escape
+from zoneinfo import ZoneInfo
+
+DEFAULT_NAME = "digest"
+DEFAULT_EXCLUDE_TAG = "digest"  # never digest the digest
+GUID_PREFIX = "srr-digest-"  # + the entry date. The dedup key SRR stores: never change it
+PAGE_SIZE = 500  # articles per `srr art ls` request while paging back to the cutoff
+DEFAULT_HOURS = 24  # window with nothing published to measure the gap from, and its floor
+DEFAULT_MAX_HOURS = 72  # ... and its ceiling: a long outage is not worth one giant edition
+MAX_ARTICLE_CHARS = 1500
+SINGLE_PASS_CHARS = 300_000  # prompt payload at/below this fits one claude call
+MAP_CHUNK_CHARS = 150_000  # prompt payload per map chunk (map-reduce path)
+MAP_WORKERS = 3  # map chunks in flight at once
+DEFAULT_MAX_CHUNKS = 30  # runaway guard: a normal day is ~7, a 3-day catch-up ~24
+REDUCE_CHARS = 150_000  # notes the reduce call may receive (see filter_notes)
+MIN_RELEVANCE = 3  # map notes scored below this never reach the reduce call
+MAX_RELEVANCE = 5  # ... and the highest the budget may push that floor to
+DEFAULT_MAP_MODEL = "sonnet"  # condense+score is mechanical; the editorial reduce keeps the default model
+KEEP_DAYS = 14
+CLAUDE_TIMEOUT = 900  # seconds per claude call
+CLAUDE_ATTEMPTS = 2  # for the calls whose loss costs the whole run (see with_retry)
+MIN_DIGEST_PARAS = 3  # a shorter "digest" is a refusal or an error page, not an edition
+
+FORMAT_RULES = """\
+Output a clean HTML fragment (no <html>/<head>/<body> wrapper), using only \
+these tags: h3, p, a, strong, em, small, br, hr, ul, li.
+
+Format, exactly:
+1. Open with one <p><strong>Top:</strong> two or three sentences naming the \
+day's few genuinely important stories.</p>
+2. Then <h3> topic sections, most significant section first. One <p> per story:
+   <p><strong><a href="URL">Headline-style claim of what happened</a></strong> \
+— one or two sentences of substance: the concrete facts, numbers, names, and \
+why it matters. <small>(Source feed)</small></p>
+   For items without a URL keep the same shape with bold plain text instead \
+of a link.
+3. Fold duplicate and near-duplicate coverage of one story into a single \
+entry citing the best link. Big stories get two sentences; minor ones one line.
+4. Close with <hr>, then <p><small>Also:</small></p> and a <ul> of one-line \
+minor mentions worth a glance, each item <li><small>mention</small></li>.
+
+Write each linked headline as an informative claim (what actually happened), \
+never the article's clickbait title. Prioritize significance over recency; \
+skip promotional/deal spam unless genuinely notable. Be selective: the \
+digest is the day's most relevant stories, not an inventory — at most ~15 \
+section stories and ~10 Also lines; silently ignore everything that doesn't \
+merit even an Also line. Output ONLY the HTML fragment — no markdown, no \
+code fences, no preamble."""
+
+PROMPT = """\
+You are writing the daily digest for a personal RSS reader. Below is a JSON \
+list of the articles fetched from the subscribed feeds in the last {hours} \
+hours (many are Spanish; write the digest in English).
+
+""" + FORMAT_RULES + """
+
+Articles:
+{articles}
+"""
+
+MAP_PROMPT = """\
+You are preparing notes for the daily digest of a personal RSS reader. Below \
+is a JSON list of articles fetched from the subscribed feeds in the last \
+{hours} hours — chunk {part} of {parts}; an editor merges all chunks' notes \
+into the final digest (many articles are Spanish; write the notes in English).
+
+Condense every newsworthy item into one plain-text line:
+* [R] Claim of what actually happened — the concrete facts, numbers, names, \
+and why it matters. (Source feed) URL
+
+R is the item's relevance, 1-5: 5 = major story any informed reader must \
+know; 4 = significant development; 3 = worth a one-line glance; 2 = marginal \
+(routine releases, minor local items, weak listicles); 1 = noise. Judge the \
+substance, not the source's own hype.
+
+Rules:
+- One line per story; fold duplicate coverage within this chunk into a \
+single line citing the best link — multi-feed coverage is itself a sign of \
+relevance.
+- Note every distinct story: scoring, not omission, is how you mark low \
+relevance (the editor filters by score). Give big stories a second sentence \
+rather than dropping detail.
+- Drop pure promotional/deal-spam items and content-free posts.
+- State what happened, never the article's clickbait title.
+- Output ONLY the `* [R] ` lines — no HTML, no markdown headings, no preamble.
+
+Articles:
+{articles}
+"""
+
+REDUCE_PROMPT = """\
+You are writing the daily digest for a personal RSS reader. Below are \
+condensed story notes covering the articles fetched from the subscribed \
+feeds in the last {hours} hours, prepared chunk by chunk from the full \
+articles — the same story may appear in more than one chunk; fold such \
+repeats (repetition across chunks is itself a relevance signal). Each note \
+starts with a relevance score [1-5], higher = more important; the lowest \
+tiers were already filtered out. Scores 5-4 belong in the topic sections, \
+3s at most in the Also tail — and never show the scores in the output. \
+Many sources are Spanish; write the digest in English.
+
+""" + FORMAT_RULES + """
+
+Notes:
+{notes}
+"""
+
+
+class DigestError(Exception):
+    """Anything that must abort the run before the store is touched.
+
+    Raised, not sys.exit()ed, so the map phase can catch one chunk's failure
+    without killing the run; main() turns whatever reaches it into exit 1.
+    """
+
+
+class TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def text(self):
+        return re.sub(r"\s+", " ", " ".join(self.parts)).strip()
+
+
+def strip_html(content):
+    p = TextExtractor()
+    try:
+        p.feed(content)
+        p.close()
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", content).strip()
+    return p.text()
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+_children = set()  # live subprocesses, so a signal can take them down with us
+_children_lock = threading.Lock()
+
+
+def kill_group(p, sig=signal.SIGTERM):
+    # By process group, not by pid: `claude` may be a wrapper that spawns the
+    # real process, and killing only the leader leaves the grandchild running
+    # AND holding the pipe open, so communicate() never returns.
+    try:
+        os.killpg(os.getpgid(p.pid), sig)
+    except OSError:
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
+def kill_children(grace=3.0):
+    """SIGTERM every live child, then SIGKILL whatever ignored it.
+
+    Without the escalation this asks politely and exits regardless: a `claude`
+    call that does not die on SIGTERM outlives the process that started it —
+    still running, still billing, with nothing left to reap it. Under systemd
+    the cgroup is the net; an interrupted terminal run has none.
+    """
+    with _children_lock:
+        live = list(_children)
+    for p in live:
+        kill_group(p)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if all(p.poll() is not None for p in live):
+            return
+        time.sleep(0.05)
+    for p in live:
+        if p.poll() is None:
+            log(f"pid {p.pid} ignored SIGTERM; killing")
+            kill_group(p, signal.SIGKILL)
+
+
+def run_cmd(cmd, stdin=None, timeout=None):
+    """Run a subprocess, or raise DigestError describing why it could not.
+
+    Every external call goes through here so a missing binary, a timeout and a
+    non-zero exit all read the same in the journal instead of as a traceback —
+    and so every child is registered: MAP_WORKERS claude calls are running by
+    the time anyone thinks to interrupt this, and they must not outlive it.
+    """
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,  # its own process group, for kill_children
+        )
+    except FileNotFoundError:
+        raise DigestError(f"{cmd[0]}: not found on PATH")
+    with _children_lock:
+        _children.add(p)
+    try:
+        out, err = p.communicate(stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(p, signal.SIGKILL)  # the group: a surviving grandchild holds
+        try:                           # the pipe open and communicate() waits
+            p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        raise DigestError(f"{' '.join(cmd[:2])}: timed out after {timeout}s")
+    finally:
+        with _children_lock:
+            _children.discard(p)
+        # Leaving the registry must mean being dead: anything that unwinds out
+        # of communicate() (an interrupt, a bug above) would otherwise drop the
+        # child from the set that kill_children walks while it is still running.
+        if p.poll() is None:
+            kill_group(p, signal.SIGKILL)
+    if p.returncode != 0:
+        detail = err.strip()[-2000:] or out.strip()[-2000:]
+        raise DigestError(f"{' '.join(cmd)} failed ({p.returncode}): {detail}")
+    return out
+
+
+def run_json(cmd):
+    out = run_cmd(cmd)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as e:
+        raise DigestError(f"{' '.join(cmd)}: unparsable JSON ({e}): {out[:200]!r}")
+
+
+def collect(hours, tag, limit, exclude_tag=DEFAULT_EXCLUDE_TAG):
+    """Every article fetched in the last `hours`, newest first.
+
+    The window is `--since`, so the backend does the filtering, but a page is
+    still a page: this walks next_cursor until the store runs out. The
+    client-side cutoff stays as a belt — an older `srr` that ignores --since
+    would otherwise hand back the entire store. Stopping early because `limit`
+    ran out would digest a silently partial window, so that is an error, not a
+    truncation.
+
+    The window is pinned to one instant before the first request, not sent as
+    a `{hours}h` duration per page: a duration is relative to whenever the
+    backend reads it, so it would creep forward page by page and drop the
+    oldest seconds of the window off the last page — and the belt below, fixed
+    at the start, could not see that happen.
+    """
+    feeds = {f["id"]: f for f in run_json(["srr", "feed", "ls"])}
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    cutoff = since.timestamp()
+    result, cursor, covered = [], None, False
+    while not covered:
+        cmd = ["srr", "art", "ls", "-l", str(PAGE_SIZE),
+               "--since", since.strftime("%Y-%m-%dT%H:%M:%SZ")]
+        if tag:
+            cmd += ["-g", tag]
+        if cursor is not None:
+            cmd += ["-b", str(cursor)]
+        resp = run_json(cmd)
+        arts = resp.get("articles") or []
+        for a in arts:
+            if a["a"] < cutoff:
+                covered = True  # newest-first; everything after is older
+                break
+            feed = feeds.get(a["f"], {})
+            if exclude_tag and feed.get("tag") == exclude_tag:
+                continue
+            if len(result) >= limit:
+                age = (datetime.now(timezone.utc).timestamp() - a["a"]) / 3600
+                raise DigestError(
+                    f"--limit {limit} reached {age:.1f}h into a {hours}h window: "
+                    f"the digest would silently miss the rest. Raise --limit or "
+                    f"shorten --hours."
+                )
+            text = strip_html(a.get("c", ""))[:MAX_ARTICLE_CHARS]
+            title = a.get("t", "").strip()
+            if not title:
+                title = text[:80] or "(untitled)"
+            result.append(
+                {
+                    "feed": feed.get("title", f"feed {a['f']}"),
+                    "title": title,
+                    "link": a.get("l", ""),
+                    "text": text,
+                }
+            )
+        prev, cursor = cursor, resp.get("next_cursor")
+        if not arts or cursor is None:
+            covered = True  # store exhausted: the window is as covered as it gets
+        elif cursor == prev:
+            # A cursor that does not advance would page this loop forever
+            # against the store. Stop and say so rather than hammer it.
+            raise DigestError(f"srr art ls returned the same cursor twice ({cursor}); "
+                              f"stopping rather than paging forever")
+    return result
+
+
+STATS = {"calls": 0, "prompt_chars": 0}
+_stats_lock = threading.Lock()
+
+
+def run_claude(prompt, model=None):
+    cmd = ["claude", "-p", "--tools", ""]
+    if model:
+        cmd += ["--model", model]
+    with _stats_lock:
+        STATS["calls"] += 1
+        STATS["prompt_chars"] += len(prompt)
+    out = run_cmd(cmd, stdin=prompt, timeout=CLAUDE_TIMEOUT).strip()
+    # strip markdown fences despite the prompt
+    out = re.sub(r"\A```[a-z]*\s*\n", "", out)
+    out = re.sub(r"\n```\s*\Z", "", out)
+    return out.strip()
+
+
+def with_retry(what, fn, attempts=CLAUDE_ATTEMPTS):
+    """Retry a call+validate step whose failure would waste every other call.
+
+    The map phase deliberately does not use this: a lost chunk is survivable
+    and retrying a systematically failing day just doubles the bill.
+    """
+    for i in range(1, attempts + 1):
+        try:
+            return fn()
+        except DigestError as e:
+            log(f"{what} failed (attempt {i}/{attempts}): {e}")
+            if i == attempts:
+                raise
+
+
+XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def xml_text(s):
+    # Escaping is not enough: XML 1.0 has no representation for most control
+    # characters at all, so one echoed \x0b would publish a feed the store
+    # cannot parse — and the input this passes through is untrusted text.
+    return escape(XML_ILLEGAL.sub("", s))
+
+
+def clean_html(out):
+    # drop any chatty preamble despite the prompt
+    first_tag = out.find("<")
+    if first_tag > 0:
+        out = out[first_tag:]
+    stripped = XML_ILLEGAL.sub("", out)
+    if stripped != out:
+        log("dropped control characters the digest could not be published with")
+        out = stripped
+    # The prompt dictates the shape, so check it: an apology or an error page
+    # ("<p>I can't help with that…</p>") clears any mere length floor, and a
+    # published refusal is worse than a failed run.
+    problems = []
+    if "Top:" not in out:
+        problems.append("no <strong>Top:</strong> opener")
+    if out.count("<p") < MIN_DIGEST_PARAS:
+        problems.append(f"{out.count('<p')} paragraphs, want >= {MIN_DIGEST_PARAS}")
+    if problems:
+        raise DigestError(
+            f"claude output is not a digest ({'; '.join(problems)}): {out[:300]!r}"
+        )
+    if "<a href" not in out:
+        log("warning: the digest links to nothing — every story came without a URL?")
+    return out
+
+
+NOTE_RE = re.compile(r"^\*\s*\[([1-5])\]\s*")
+
+
+def notes_size(scored):
+    return sum(len(ln) + 1 for ln, _ in scored)
+
+
+def filter_notes(notes, budget=REDUCE_CHARS):
+    # Rejoin hard-wrapped note lines, then drop notes the map phase scored
+    # below MIN_RELEVANCE. Fail open: if most lines came back unscored, the
+    # format drifted — keep everything rather than gut the digest.
+    items = []
+    for chunk in notes:
+        for line in chunk.splitlines():
+            if line.lstrip().startswith("*"):
+                items.append(line.strip())
+            elif items and line.strip():
+                items[-1] += " " + line.strip()
+    scored = [(ln, (m := NOTE_RE.match(ln)) and int(m.group(1))) for ln in items]
+    n_scored = sum(s is not None for _, s in scored)
+    ranked = n_scored >= len(scored) / 2
+    if not ranked:
+        log(f"relevance filter: only {n_scored}/{len(scored)} notes scored; keeping all")
+        kept = scored
+    else:
+        kept = [(ln, s) for ln, s in scored if s is None or s >= MIN_RELEVANCE]
+        log(f"relevance filter: kept {len(kept)}/{len(scored)} notes "
+            f"(score >= {MIN_RELEVANCE})")
+
+    # A wide window means many chunks means a reduce prompt with no natural
+    # bound. Raise the floor rather than cut the list somewhere arbitrary: the
+    # least relevant notes are the ones the digest can afford to lose. Every
+    # drop is logged — a quiet truncation would read as "covered everything".
+    floor = MIN_RELEVANCE
+    while ranked and notes_size(kept) > budget and floor < MAX_RELEVANCE:
+        floor += 1
+        before = len(kept)
+        kept = [(ln, s) for ln, s in kept if s is not None and s >= floor]
+        log(f"notes over the {budget}-char reduce budget: floor raised to "
+            f"{floor}, {before} -> {len(kept)} notes")
+    if notes_size(kept) > budget:
+        capped, size = [], 0
+        for ln, s in kept:
+            if size + len(ln) + 1 > budget:
+                break
+            capped.append((ln, s))
+            size += len(ln) + 1
+        log(f"still over budget at floor {floor}: dropping the last "
+            f"{len(kept) - len(capped)} of {len(kept)} notes")
+        kept = capped
+    if not kept:
+        # Handing the reduce call an empty list would spend it (twice, with the
+        # retry) to be told the obvious. A day where nothing cleared the floor
+        # is a day with no digest.
+        raise DigestError(
+            f"no note cleared relevance {floor} out of {len(scored)} from the "
+            f"map phase: nothing worth a digest in this window"
+        )
+    return "\n".join(ln for ln, _ in kept)
+
+
+def payload_size(article):
+    # What the article actually costs in the prompt: the serialized JSON, not
+    # just its text — feed, title and link are a third of a short item.
+    return len(json.dumps(article, ensure_ascii=False))
+
+
+def chunk_articles(articles):
+    chunks, cur, size = [], [], 0
+    for a in articles:
+        n = payload_size(a)
+        if cur and size + n > MAP_CHUNK_CHARS:
+            chunks.append(cur)
+            cur, size = [], 0
+        cur.append(a)
+        size += n
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def map_chunk(chunk, part, parts, hours, model):
+    out = run_claude(
+        MAP_PROMPT.format(
+            hours=hours,
+            part=part,
+            parts=parts,
+            articles=json.dumps(chunk, ensure_ascii=False),
+        ),
+        model=model,
+    )
+    if len(out) < 100:
+        raise DigestError(f"output suspiciously short: {out[:200]!r}")
+    if not any(ln.lstrip().startswith("*") for ln in out.splitlines()):
+        # same reasoning as clean_html: a wordy refusal clears the length floor
+        raise DigestError(f"output holds no `* ` note lines: {out[:200]!r}")
+    return out
+
+
+def map_chunks(chunks, hours, model):
+    """Condense every chunk, MAP_WORKERS at a time, keeping chunk order.
+
+    A chunk that fails is dropped rather than sacrificing the whole day's
+    digest (and the calls already paid for) — but a mostly-failed map is not a
+    digest, so a third is as much as may go missing.
+    """
+    notes = [None] * len(chunks)
+    ex = ThreadPoolExecutor(max_workers=MAP_WORKERS)
+    try:
+        futures = {
+            ex.submit(map_chunk, c, i + 1, len(chunks), hours, model): i
+            for i, c in enumerate(chunks)
+        }
+        pending = set(futures)
+        while pending:
+            # Polled rather than parked in as_completed(): a signal handler
+            # only runs when the main thread comes back to the interpreter,
+            # and an interrupt that arrives mid-map must not wait out three
+            # 15-minute claude calls before anyone tidies up.
+            done, pending = futures_wait(pending, timeout=0.5)
+            for fut in done:
+                i = futures[fut]
+                try:
+                    notes[i] = fut.result()
+                    log(f"map {i + 1}/{len(chunks)}: {len(notes[i])} note chars")
+                except Exception as e:  # incl. a bug in here: a worker must not
+                    # escape as a traceback past the clean-exit discipline
+                    log(f"map {i + 1}/{len(chunks)} FAILED: {type(e).__name__}: {e}")
+    except BaseException:
+        kill_children()
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    ex.shutdown(wait=True)
+    lost = [i + 1 for i, n in enumerate(notes) if n is None]
+    if len(lost) > len(chunks) // 3:
+        raise DigestError(
+            f"{len(lost)}/{len(chunks)} map chunks failed (chunks {lost}); "
+            f"at most {len(chunks) // 3} may be lost before the digest is not one"
+        )
+    if lost:
+        log(f"continuing without chunk(s) {lost}")
+    return [n for n in notes if n is not None]
+
+
+def summarize(articles, hours, model=None, map_model=DEFAULT_MAP_MODEL,
+              max_chunks=DEFAULT_MAX_CHUNKS):
+    total = sum(payload_size(a) for a in articles)
+    if total <= SINGLE_PASS_CHARS:
+        log(f"single pass: {len(articles)} articles, {total} payload chars")
+        prompt = PROMPT.format(hours=hours, articles=json.dumps(articles, ensure_ascii=False))
+        return with_retry("single-pass digest",
+                          lambda: clean_html(run_claude(prompt, model=model)))
+    chunks = chunk_articles(articles)
+    # Said before a single call is paid for, so the bill is never a surprise.
+    log(f"map-reduce: {len(articles)} articles, {total} payload chars, "
+        f"{len(chunks)} chunks, {MAP_WORKERS} at a time — "
+        f"{len(chunks)} {map_model or 'default-model'} calls + 1 reduce")
+    if max_chunks and len(chunks) > max_chunks:
+        raise DigestError(
+            f"{len(chunks)} map chunks needed, --max-chunks is {max_chunks}: "
+            f"refusing to spend that unasked. Shorten --hours (or --max-hours), "
+            f"or raise --max-chunks."
+        )
+    kept = filter_notes(map_chunks(chunks, hours, map_model))
+    log(f"reduce: {len(kept)} note chars")
+    reduce_prompt = REDUCE_PROMPT.format(hours=hours, notes=kept)
+    return with_retry("reduce", lambda: clean_html(run_claude(reduce_prompt, model=model)))
+
+
+def publish(name, rss):
+    # srr owns the store: it holds the endpoint and credentials and decides
+    # where out/<name> lives. This script only hands over the bytes.
+    run_cmd(["srr", "syndicate", "push", name, "-"], stdin=rss)
+
+
+def fetch_history(name):
+    """The published feed IS the history — read it back and parse it.
+
+    Keeping a local copy of the last 14 days would be a second source of truth
+    that can drift from the store (a restore, another box, a stale path), and
+    drift here silently truncates the feed. Round-tripping our own XML is
+    exact, so the store stays the only state.
+    """
+    return parse_history(run_cmd(["srr", "syndicate", "fetch", name]))
+
+
+def parse_history(rss):
+    try:
+        root = ET.fromstring(rss)
+    except ET.ParseError as e:
+        raise DigestError(f"published feed is not parsable XML ({e})")
+    history, seen = [], set()
+    for item in root.iterfind("./channel/item"):
+        guid = (item.findtext("guid") or "").strip()
+        if not guid.startswith(GUID_PREFIX):
+            continue  # not ours; leave it alone rather than guess a date
+        date = guid[len(GUID_PREFIX):]
+        if date in seen:
+            log(f"published feed holds a second {date} item; keeping the first")
+            continue  # one GUID per day: never render a duplicate back out
+        seen.add(date)
+        try:
+            ts = int(parsedate_to_datetime(item.findtext("pubDate")).timestamp())
+        except (TypeError, ValueError):
+            try:  # no usable pubDate: midnight UTC on the day the guid names
+                ts = int(datetime.strptime(date, "%Y-%m-%d")
+                         .replace(tzinfo=timezone.utc).timestamp())
+            except ValueError:
+                log(f"published feed holds {guid!r} with no usable date; skipping it")
+                continue
+        history.append(
+            {
+                "date": date,
+                "ts": ts,
+                "title": item.findtext("title") or "",
+                "html": item.findtext("description") or "",
+            }
+        )
+    return history
+
+
+def render_rss(history, link=None):
+    # link is the feed's own public URL and belongs to the channel, not to the
+    # items: an item <link> would send every digest in the reader to the raw
+    # .rss file, and the digest carries its own links inside. It is deployment
+    # knowledge this script does not have unless told, so the channel element
+    # is omitted when it is absent rather than guessed.
+    items = []
+    for e in history:
+        ts = datetime.fromtimestamp(e["ts"], timezone.utc)
+        items.append(
+            "<item>"
+            + f"<title>{xml_text(e['title'])}</title>"
+            + f"<guid isPermaLink=\"false\">{GUID_PREFIX}{e['date']}</guid>"
+            + f"<pubDate>{format_datetime(ts)}</pubDate>"
+            + f"<description>{xml_text(e['html'])}</description>"
+            + "</item>"
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<rss version="2.0"><channel>'
+        "<title>SRR Daily Digest</title>"
+        + (f"<link>{xml_text(link)}</link>" if link else "")
+        + "<description>Claude-written daily digest of the SRR store</description>"
+        + "".join(items)
+        + "</channel></rss>\n"
+    )
+
+
+def window_hours(history, max_hours):
+    """How far back to collect: everything since the last published digest.
+
+    A fixed 24h window silently loses a day whenever a run is missed — the
+    catch-up run digests only the last day and the skipped one is never
+    covered by anything. The published feed knows when the last edition was,
+    so the gap is measurable. Floored at DEFAULT_HOURS so a same-day rerun
+    still digests a whole day, capped so a long outage is not one giant
+    edition.
+    """
+    if not history:
+        return DEFAULT_HOURS
+    last = max(e["ts"] for e in history)
+    gap = math.ceil((datetime.now(timezone.utc).timestamp() - last) / 3600)
+    hours = min(max(gap, DEFAULT_HOURS), max_hours)
+    if gap > max_hours:
+        log(f"window: {hours}h — capped at --max-hours; the {gap}h since the "
+            f"last edition will not be fully covered")
+    else:
+        log(f"window: {hours}h (last edition {gap}h ago)")
+    return hours
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--hours", type=int,
+                    help="collection window in hours (default: the gap since "
+                         "the last published edition, at least %d and at most "
+                         "--max-hours; %d flat with --dump or --no-history)"
+                         % (DEFAULT_HOURS, DEFAULT_HOURS))
+    ap.add_argument("--max-hours", type=int, default=DEFAULT_MAX_HOURS,
+                    help="ceiling on the computed window (default %(default)s); "
+                         "after a longer outage the missing days stay missing")
+    ap.add_argument("--tag", help="restrict collection to one tag (srr art ls -g)")
+    ap.add_argument("--limit", type=int, default=5000,
+                    help="safety cap on articles collected (default 5000); "
+                         "hitting it before the window is covered is an error, "
+                         "never a silent partial digest")
+    ap.add_argument("--exclude-tag", default=DEFAULT_EXCLUDE_TAG,
+                    help="tag never collected (default %(default)r — never digest "
+                         "the digest); empty collects everything")
+    ap.add_argument("--name", default=DEFAULT_NAME,
+                    help="syndication feed read back and pushed to (default %(default)r)")
+    ap.add_argument("--link",
+                    help="public URL the published feed is served at, for the "
+                         "channel <link>; omitted emits none")
+    ap.add_argument("--max-chunks", type=int, default=DEFAULT_MAX_CHUNKS,
+                    help="refuse to run more than this many map calls "
+                         "(default %(default)s); a normal day needs ~7")
+    ap.add_argument("--tz", help="IANA zone deciding an entry's date "
+                                 "(default: the machine's local time)")
+    ap.add_argument("--no-history", action="store_true",
+                    help="start from an empty history instead of reading the "
+                         "published feed back; bootstrap for a feed that does "
+                         "not exist yet — it drops every older day from it")
+    ap.add_argument("--force", action="store_true",
+                    help="replace today's entry if the feed already has one "
+                         "(SRR has likely ingested that GUID already and will "
+                         "not re-read it, so readers keep the first version)")
+    ap.add_argument("--model", help="model writing the digest (default: the claude CLI's)")
+    ap.add_argument("--map-model", default=DEFAULT_MAP_MODEL,
+                    help="model condensing+scoring the map chunks (default %(default)r)")
+    ap.add_argument("--allow-empty", action="store_true",
+                    help="treat an empty window as a quiet day instead of an "
+                         "error; without it, no articles at all is taken as a "
+                         "broken fetch loop and reported as one")
+    ap.add_argument("--dump", action="store_true",
+                    help="print the collected articles as JSON and exit; no "
+                         "claude call, no feed read back, plain %d-hour default"
+                         % DEFAULT_HOURS)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the RSS instead of pushing it; skips the "
+                         "already-published check, writes nothing anywhere")
+    return ap
+
+
+def now_local(tz):
+    if not tz:
+        return datetime.now().astimezone()
+    try:
+        return datetime.now(ZoneInfo(tz))
+    except Exception as e:
+        raise DigestError(f"--tz {tz!r}: {e}")
+
+
+def generate(args):
+    # --dump is a query, not a run: it never reads the feed back, so the skill
+    # path keeps working against a backend without `srr syndicate`.
+    if args.dump:
+        hours = DEFAULT_HOURS if args.hours is None else args.hours
+        articles = collect(hours, args.tag, args.limit, args.exclude_tag)
+        json.dump(articles, sys.stdout, ensure_ascii=False, indent=1)
+        print()
+        return
+
+    if args.no_history:
+        log(f"--no-history: out/{args.name} will be rewritten with today alone")
+        history = []
+    else:
+        history = fetch_history(args.name)
+
+    now = now_local(args.tz)
+    date = now.strftime("%Y-%m-%d")
+    if any(e["date"] == date for e in history) and not (args.force or args.dry_run):
+        raise DigestError(
+            f"{date} is already published in out/{args.name}; rerun with --force "
+            f"to replace it (SRR has probably ingested {GUID_PREFIX}{date} "
+            f"already and will not re-read a known GUID, so readers keep the "
+            f"version they have)"
+        )
+
+    hours = (window_hours(history, args.max_hours)
+             if args.hours is None else args.hours)
+    articles = collect(hours, args.tag, args.limit, args.exclude_tag)
+    if not articles:
+        if not args.allow_empty:
+            raise DigestError(
+                f"no articles at all in the last {hours}h — with a healthy "
+                f"store that means the fetch loop is broken, not that the news "
+                f"stopped. Pass --allow-empty if an empty window is expected."
+            )
+        print("no articles in window; leaving published digest untouched")
+        return
+
+    digest = summarize(articles, hours, model=args.model, map_model=args.map_model,
+                       max_chunks=args.max_chunks)
+    entry = {
+        "date": date,
+        "ts": int(now.timestamp()),
+        "title": f"Daily Digest — {date} ({len(articles)} articles)",
+        "html": digest,
+    }
+    history = [e for e in history if e["date"] != date]
+    history.append(entry)
+    history.sort(key=lambda e: e["date"], reverse=True)  # ISO dates sort lexically
+    history = history[:KEEP_DAYS]
+
+    rss = render_rss(history, args.link)
+    if args.dry_run:
+        print(rss)
+        return
+    publish(args.name, rss)
+    print(f"published {date}: {len(articles)} articles -> out/{args.name}")
+
+
+def _on_signal(signum, frame):
+    log(f"signal {signum}: terminating {len(_children)} child process(es)")
+    # From the handler, not from an except clause: the main thread is parked in
+    # ThreadPoolExecutor.__exit__, which joins its workers before any handler
+    # further up could run. Kill the children first and they unblock.
+    kill_children()
+    raise KeyboardInterrupt
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, _on_signal)
+    started = time.monotonic()
+    try:
+        return generate(args)
+    except DigestError as e:
+        sys.exit(f"srr-digest-gen: {e}")
+    except KeyboardInterrupt:
+        kill_children()
+        sys.exit("srr-digest-gen: interrupted")
+    finally:
+        # what the run cost, on the way out either way — a failed run's bill is
+        # exactly the number you want in the journal
+        if STATS["calls"]:
+            log(f"run: {STATS['calls']} claude call{'' if STATS['calls'] == 1 else 's'}, "
+                f"{STATS['prompt_chars'] // 1000}k prompt chars, "
+                f"{time.monotonic() - started:.0f}s")
+
+
+if __name__ == "__main__":
+    main()

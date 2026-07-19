@@ -4,13 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-External ingest strategies for SRR (the Go `srr` backend + TS frontend in
+Companion scripts for SRR (the Go `srr` backend + TS frontend in
 `~/ws/srr`, which has its own CLAUDE.md — backend/frontend *code* changes go there,
-not here). `bin/` holds **`srr-telegram` / `srr-youtube` / `srr-x`** (python ingest
+not here). `bin/` holds three kinds. Exec'd by `srr` by bare name, resolved from
+`PATH`: **`srr-telegram` / `srr-youtube` / `srr-x`** (python ingest
 strategies — one process per feed, JSON stdin -> JSON stdout) and **`srr-tts`**
 (python pipeline step — one process per item, item JSON stdin -> item JSON stdout,
-prepends a piper TTS narration) — all exec'd by `srr` by bare name, resolved from
-`PATH` — plus the `srr-uvrun` shebang wrapper. On this machine `bin/` reaches `PATH` via
+prepends a piper TTS narration). Running the other way round, driving the `srr` CLI as
+a subprocess: **`srr-digest-gen`** (store tool — collects recent articles, has
+`claude -p` write a digest, pushes it back as a syndication feed). Plus the
+`srr-uvrun` shebang wrapper. On this machine `bin/` reaches `PATH` via
 `~/.local/bin` symlinks managed from the private srr-config repo; the `srr`
 skill is the full ops runbook (this repo is destined to be public, so it only
 states the generic PATH contract).
@@ -29,6 +32,10 @@ srr-x --instance https://nitter.poast.org "@handle"
 
 # Manual run of the srr-tts pipeline step (HTML file instead of the stdin item JSON):
 srr-tts --voice en_US-lessac-medium --asset-dir /tmp/store article.html
+
+# Manual run of the digest generator without spending claude calls or touching the store:
+srr-digest-gen --dump --hours 2      # collected articles as JSON
+srr-digest-gen --dry-run             # full run, RSS to stdout, nothing pushed
 
 # Run the backend directly (nothing wraps it). There is ONE srr: ~/.config/srr/srr.yaml
 # is the only config and also the SRR_CONFIG-unset default, so bare `srr` operates on
@@ -56,6 +63,16 @@ survive srr's `#sanitize` (img src / a href allowlisted; no iframes/scripts),
 asset_dir (e.g. `srr preview`) means hotlink/placeholder, never download. Each
 script also maps CLI parameters onto the *same* request dict for manual testing —
 keep the two entry paths building identical requests.
+
+**Store tools drive the CLI, never the store** (`srr-digest-gen`): they read through
+`srr feed ls` / `srr art ls` / `srr syndicate fetch <name>` and write through
+`srr syndicate push <name> -`. The store's location, endpoint and credentials are the
+backend's business — a script here must never open `srr.yaml`, sign an S3 request, or
+learn a bucket key. Whatever the deployment still needs to say (public feed URL,
+timezone, syndication name) is a flag with a generic default or none at all; nothing
+in this repo names the owner's infrastructure. They also keep **no local state**: what
+was already published is read back out of the store, so the store stays the single
+source of truth and the tool runs from any box.
 
 **Python env plumbing**: one root `pyproject.toml` declares deps for every `bin/`
 script, pinned by the committed `uv.lock`. Shebangs are `#!/usr/bin/env srr-uvrun`;
