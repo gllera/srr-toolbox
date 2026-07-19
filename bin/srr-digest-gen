@@ -323,7 +323,9 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
 
     `max_chars` caps each article's text; 0 keeps the full text. Longer text
     costs nothing structurally — chunking is payload-sized, so bigger
-    articles just mean more chunks (still bounded by --max-chunks).
+    articles just mean more chunks (still bounded by --max-chunks), except
+    that chunks never split within an article: one article over the chunk
+    budget rides one oversized chunk and risks only its own map call.
 
     An explicit `since` (an aware datetime the caller pinned once) replaces
     the hours-derived instant as both the backend window and the belt below;
@@ -403,11 +405,13 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
                     f"narrow the window."
                 )
             text = strip_html(a.get("c", ""))
-            if max_chars:
-                text = text[:max_chars]
             title = a.get("t", "").strip()
             if not title:
+                # From the uncapped text: a tiny max_chars must shorten the
+                # body, not behead the stand-in title with it.
                 title = text[:80] or "(untitled)"
+            if max_chars:
+                text = text[:max_chars]
             result.append(
                 {
                     "feed": feed.get("title", f"feed {a['f']}"),

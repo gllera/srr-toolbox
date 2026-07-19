@@ -148,6 +148,10 @@ check("collect: max_chars moves the truncation point",
       len(dg.collect(24, [], [], 1000, max_chars=100)[0]["text"]), 100)
 check("collect: max_chars 0 keeps the full text",
       len(dg.collect(24, [], [], 1000, max_chars=0)[0]["text"]), 5000)
+ARTS = [dict(long_art[0], t=" ")]
+check("collect: the blank-title fallback reads the uncapped text, not the "
+      "stub a tiny max_chars leaves of it",
+      dg.collect(24, [], [], 1000, max_chars=2)[0]["title"], "x" * 80)
 ARTS = ARTS_SAVE
 
 # --- parse_time_bound: the forms `srr art ls --since` takes ----------------
