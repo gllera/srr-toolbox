@@ -95,11 +95,11 @@ real_collect = dg.collect
 
 
 def spy_collect(hours, tags, feed_ids, limit, exclude_tag=dg.DEFAULT_EXCLUDE_TAG,
-                since=None, before=None):
+                since=None, until=None, before=None):
     windows.append(hours)
-    collect_kwargs.append({"since": since, "before": before})
+    collect_kwargs.append({"since": since, "until": until, "before": before})
     return real_collect(hours, tags, feed_ids, limit, exclude_tag,
-                        since=since, before=before)
+                        since=since, until=until, before=before)
 
 
 dg.run_json = fake_run_json
@@ -219,6 +219,41 @@ check_exits("bounds: a --since in the future is refused up front",
             ["--dump", "--since", "2099-01-01T00:00:00Z"], "future")
 check_exits("bounds: an empty --since is refused, not a silent fallback "
             "to the default window", ["--dump", "--since", ""], "--since ''")
+
+check("bounds: --until is stored verbatim for the resolver",
+      dg.build_parser().parse_args(["--until", "36h"]).until, "36h")
+
+reset()
+run(["--dump", "--since", "72h", "--until", "24h"])
+check("bounds: --until closes the window — the hours phrased are its width",
+      windows, [48])
+check_true("bounds: --until reaches collect as a pinned instant",
+           collect_kwargs[0]["until"] is not None, collect_kwargs)
+
+reset()
+run(["--dump", "--until", "48h"])
+check("bounds: --until alone takes the flat default width ending there",
+      windows, [dg.DEFAULT_HOURS])
+check_true("bounds: ...with the start pinned that width below the end",
+           abs(collect_kwargs[0]["since"].timestamp()
+               - (time.time() - (48 + dg.DEFAULT_HOURS) * 3600)) < 60,
+           collect_kwargs)
+
+reset()
+run(["--dump", "--until", "48h", "--hours", "6"])
+check("bounds: --hours composes with --until as the window's width",
+      windows, [6])
+
+check_exits("bounds: an inverted window is refused",
+            ["--dump", "--since", "24h", "--until", "48h"], "window is empty")
+check_exits("bounds: an empty --until is refused like an empty --since",
+            ["--dump", "--until", ""], "--until ''")
+
+reset()
+HISTORY[:] = []
+run(["--dry-run", "--before", "123"])
+check("bounds: --before reaches the publish path's collect too",
+      [c["before"] for c in collect_kwargs], [123])
 
 # --- --dry-run ------------------------------------------------------------
 reset()
@@ -401,6 +436,9 @@ check("empty window: no claude call either", claude_calls, [])
 reset()
 check_exits("empty window: an explicit --since/--before window is not blamed "
             "on the fetch loop", ["--since", "24h"], "requested window")
+reset()
+check_exits("empty window: ...same for an explicit --until",
+            ["--until", "24h"], "requested window")
 
 reset()
 out = run(["--allow-empty"])

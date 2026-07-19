@@ -164,6 +164,9 @@ check("parse_time_bound: bare date is local midnight, like the backend",
       datetime(2026, 7, 15).astimezone())
 check_raises("parse_time_bound: garbage is a named error",
              lambda: dg.parse_time_bound("yesterday", T0), "--since 'yesterday'")
+check_raises("parse_time_bound: the error names the flag it came from",
+             lambda: dg.parse_time_bound("yesterday", T0, "--until"),
+             "--until 'yesterday'")
 
 # --- collect: explicit --since instant / --before cursor -------------------
 calls.clear()
@@ -185,6 +188,17 @@ calls.clear()
 dg.collect(24, [], [], 1000, before=77)
 check("collect: --before seeds the first page's cursor (srr art ls -b)",
       calls[1][7:], ["-b", "77"])
+
+until = datetime.fromtimestamp(NOW - 100, timezone(timedelta(hours=2)))
+until_wire = until.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+calls.clear()
+dg.collect(24, [], [], 1000, until=until)
+check("collect: an explicit until rides every page, normalized to UTC",
+      calls[1][7:], ["--until", until_wire])
+check("collect: ...and belts the top of the window (skip, not stop: "
+      "older articles still count)",
+      [a["feed"] for a in dg.collect(24, [], [], 1000, until=until)],
+      ["Untagged"])
 
 # --- collect: paging back to the cutoff -----------------------------------
 # The window is only "covered" once an article older than the cutoff shows up,

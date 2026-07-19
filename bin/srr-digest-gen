@@ -292,8 +292,8 @@ DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)([smhdw])")
 DURATION_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
-def parse_time_bound(s, now):
-    """A --since value, in the forms `srr art ls --since` takes: a duration
+def parse_time_bound(s, now, flag="--since"):
+    """A --since/--until value, in the forms `srr art ls` takes: a duration
     before `now` (24h, 7d, 2w, compounds like 1d12h), a bare date (local
     midnight, as the backend reads it), or an RFC3339 instant. Resolved
     against the caller's `now` rather than reading the clock here, so the
@@ -311,17 +311,18 @@ def parse_time_bound(s, now):
         t = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         raise DigestError(
-            f"--since {s!r}: want a duration before now (24h, 7d, 2w), a date "
+            f"{flag} {s!r}: want a duration before now (24h, 7d, 2w), a date "
             f"(2026-07-15), or an RFC3339 instant (2026-07-15T10:00:00Z)")
     return t if t.tzinfo else t.astimezone()
 
 
 def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
-            since=None, before=None):
+            since=None, until=None, before=None):
     """Every article fetched in the last `hours`, newest first.
 
     An explicit `since` (an aware datetime the caller pinned once) replaces
     the hours-derived instant as both the backend window and the belt below;
+    `until` closes the window's top the same way (inclusive, belted too);
     `before` seeds the first page's cursor (srr art ls -b, exclusive), and
     paging continues downward from there.
 
@@ -362,11 +363,15 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
         # The strftime below stamps a Z: a bare-date since arrives in local
         # time and would otherwise be sent mislabeled as UTC.
         since = since.astimezone(timezone.utc)
+    if until is not None:
+        until = until.astimezone(timezone.utc)
     cutoff = since.timestamp()
     result, cursor, covered = [], before, False
     while not covered:
         cmd = ["srr", "art", "ls", "-l", str(PAGE_SIZE),
                "--since", since.strftime("%Y-%m-%dT%H:%M:%SZ")]
+        if until is not None:
+            cmd += ["--until", until.strftime("%Y-%m-%dT%H:%M:%SZ")]
         for tag in tags:
             cmd += ["-g", tag]
         for fid in feed_ids:
@@ -379,6 +384,9 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
             if a["a"] < cutoff:
                 covered = True  # newest-first; everything after is older
                 break
+            if until is not None and a["a"] > until.timestamp():
+                continue  # the cutoff belt's twin: too new is skipped, not
+                # stopped at — the in-window articles come after it
             feed = feeds.get(a["f"], {})
             if exclude_tag and feed.get("tag") == exclude_tag:
                 continue
@@ -774,26 +782,43 @@ def feed_id_list(value):
     return ids
 
 
-def window_since(args):
-    """--since resolved to (hours, instant), or None when absent.
+def window_bounds(args):
+    """--since/--until resolved to (hours, since, until), or None when neither
+    is given (the window is then --hours/the gap, ending now).
 
-    One `now` serves both the instant and the hours derived from it, so a
-    `--since 48h` window is phrased as exactly 48 hours; the instant rides
-    every page while the hours ride the prompts and logs.
+    One `now` serves the instants and the hours derived from them, so a
+    `--since 48h` window is phrased as exactly 48 hours; the instants ride
+    every page while the hours — the window's width — ride the prompts and
+    logs. --until moves the window's end (default: now); --since and --hours
+    set its start and stay one mode each, so --until alone bounds a window of
+    --hours (or the flat default) ending there.
     """
-    # None-check, not truthiness: --since "" must die in parse_time_bound as
-    # the named error, never fall back to the default window unasked.
-    if args.since is None:
+    # None-checks, not truthiness: --since "" / --until "" must die in
+    # parse_time_bound as the named error, never fall back unasked.
+    if args.since is None and args.until is None:
         return None
-    if args.hours is not None:
-        raise DigestError("--hours and --since both set the window's start; "
-                          "pass one of them")
     now = datetime.now(timezone.utc)
-    since = parse_time_bound(args.since, now)
+    until = (parse_time_bound(args.until, now, "--until")
+             if args.until is not None else None)
+    if args.since is not None:
+        if args.hours is not None:
+            raise DigestError("--hours and --since both set the window's "
+                              "start; pass one of them")
+        since = parse_time_bound(args.since, now, "--since")
+        if until is not None and since > until:
+            raise DigestError(f"--since {args.since!r} is after --until "
+                              f"{args.until!r}: the window is empty")
+    else:
+        width = DEFAULT_HOURS if args.hours is None else args.hours
+        since = until - timedelta(hours=width)
     if since > now:
-        raise DigestError(f"--since {args.since!r} resolves to the future; "
-                          f"nothing can have been fetched there yet")
-    return max(1, math.ceil((now - since).total_seconds() / 3600)), since
+        raise DigestError(
+            f"the window starts in the future "
+            f"({since.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}); "
+            f"nothing can have been fetched there yet")
+    end = now if until is None else min(until, now)
+    return (max(1, math.ceil((end - since).total_seconds() / 3600)),
+            since, until)
 
 
 def build_parser():
@@ -801,9 +826,10 @@ def build_parser():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--hours", type=int,
-                    help="collection window in hours (default: the gap since "
-                         "the last published edition, at least %d and at most "
-                         "--max-hours; %d flat with --dump or --no-history)"
+                    help="collection window in hours, ending now or at --until "
+                         "(default: the gap since the last published edition, "
+                         "at least %d and at most --max-hours; %d flat with "
+                         "--dump, --no-history or --until)"
                          % (DEFAULT_HOURS, DEFAULT_HOURS))
     ap.add_argument("--max-hours", type=int, default=DEFAULT_MAX_HOURS,
                     help="ceiling on the computed window (default %(default)s); "
@@ -814,6 +840,10 @@ def build_parser():
                          "before now (24h, 7d, 2w), a date (2026-07-15), or "
                          "an RFC3339 instant; resolved once so pages cannot "
                          "creep")
+    ap.add_argument("--until",
+                    help="collect up to this time instead of now (inclusive) — "
+                         "same forms as --since; alone it bounds a window of "
+                         "--hours (or the flat %d) ending there" % DEFAULT_HOURS)
     ap.add_argument("--before", type=int,
                     help="collect only articles below this article id "
                          "(exclusive), srr art ls -b; paging continues "
@@ -879,10 +909,10 @@ def now_local(tz):
 
 
 def generate(args):
-    # Resolved first: a --since/--hours contradiction is a pure flag error and
-    # must die before any subprocess — behind fetch_history a down store would
-    # mask it.
-    win = window_since(args)
+    # Resolved first: a --since/--hours contradiction or an inverted window is
+    # a pure flag error and must die before any subprocess — behind
+    # fetch_history a down store would mask it.
+    win = window_bounds(args)
 
     # --dump is a query, not a run: it never reads the feed back, so the skill
     # path keeps working against a backend without `srr syndicate`.
@@ -890,7 +920,8 @@ def generate(args):
         hours = ((DEFAULT_HOURS if args.hours is None else args.hours)
                  if win is None else win[0])
         articles = collect(hours, args.tag, args.feed, args.limit, args.exclude_tag,
-                           since=win and win[1], before=args.before)
+                           since=win and win[1], until=win and win[2],
+                           before=args.before)
         json.dump(articles, sys.stdout, ensure_ascii=False, indent=1)
         print()
         return
@@ -912,16 +943,17 @@ def generate(args):
         )
 
     if win is not None:
-        hours, since = win
+        hours, since, until = win
     else:
         hours = (window_hours(history, args.max_hours)
                  if args.hours is None else args.hours)
-        since = None
+        since = until = None
     articles = collect(hours, args.tag, args.feed, args.limit, args.exclude_tag,
-                       since=since, before=args.before)
+                       since=since, until=until, before=args.before)
     if not articles:
         if not args.allow_empty:
-            if args.since or args.before is not None:
+            if (args.since is not None or args.until is not None
+                    or args.before is not None):
                 # An explicit historical window can genuinely be empty; the
                 # broken-fetch-loop diagnosis below only holds for the rolling
                 # default window.
