@@ -93,9 +93,11 @@ windows = []
 real_collect = dg.collect
 
 
-def spy_collect(hours, tags, feed_ids, limit, exclude_tag=dg.DEFAULT_EXCLUDE_TAG):
+def spy_collect(hours, tags, feed_ids, limit, exclude_tag=dg.DEFAULT_EXCLUDE_TAG,
+                since=None, before=None):
     windows.append(hours)
-    return real_collect(hours, tags, feed_ids, limit, exclude_tag)
+    return real_collect(hours, tags, feed_ids, limit, exclude_tag,
+                        since=since, before=before)
 
 
 dg.run_json = fake_run_json
@@ -173,6 +175,24 @@ check_exits("selection: an unknown tag aborts with a clear error",
             ["--dump", "--tag", "nope"], "unknown tag 'nope'")
 check("selection: the unknown tag cost no claude call", claude_calls, [])
 check("selection: ...and pushed nothing", pushed, [])
+
+# --- explicit window bounds (--since / --before) ----------------------------
+check("bounds: --before parses as an int",
+      dg.build_parser().parse_args(["--before", "123"]).before, 123)
+check("bounds: --since is stored verbatim for the resolver",
+      dg.build_parser().parse_args(["--since", "36h"]).since, "36h")
+check_parse_fails("bounds: a non-numeric --before is refused at parse time",
+                  ["--before", "en"])
+
+reset()
+run(["--dump", "--since", "48h"])
+check("bounds: --since sets the window the digest is phrased in "
+      "(one now for the instant and the hours, so 48h is exactly 48)",
+      windows, [48])
+check_exits("bounds: --hours and --since are one mode each, not a fallback",
+            ["--dump", "--since", "48h", "--hours", "6"], "pass one of them")
+check_exits("bounds: a --since in the future is refused up front",
+            ["--dump", "--since", "2099-01-01T00:00:00Z"], "future")
 
 # --- --dry-run ------------------------------------------------------------
 reset()

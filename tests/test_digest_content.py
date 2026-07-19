@@ -10,7 +10,7 @@ import importlib.util
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "bin", "srr-digest-gen")
@@ -145,6 +145,44 @@ ARTS = long_art
 check("collect: article text truncated",
       len(dg.collect(24, [], [], 1000)[0]["text"]), dg.MAX_ARTICLE_CHARS)
 ARTS = ARTS_SAVE
+
+# --- parse_time_bound: the forms `srr art ls --since` takes ----------------
+T0 = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
+check("parse_time_bound: hours duration", dg.parse_time_bound("24h", T0),
+      T0 - timedelta(hours=24))
+check("parse_time_bound: weeks duration", dg.parse_time_bound("2w", T0),
+      T0 - timedelta(days=14))
+check("parse_time_bound: compound duration", dg.parse_time_bound("1d12h", T0),
+      T0 - timedelta(hours=36))
+check("parse_time_bound: RFC3339 instant, Z accepted",
+      dg.parse_time_bound("2026-07-15T10:00:00Z", T0),
+      datetime(2026, 7, 15, 10, 0, 0, tzinfo=timezone.utc))
+check("parse_time_bound: bare date is local midnight, like the backend",
+      dg.parse_time_bound("2026-07-15", T0),
+      datetime(2026, 7, 15).astimezone())
+check_raises("parse_time_bound: garbage is a named error",
+             lambda: dg.parse_time_bound("yesterday", T0), "--since 'yesterday'")
+
+# --- collect: explicit --since instant / --before cursor -------------------
+calls.clear()
+pinned = datetime.fromtimestamp(NOW - 3600, timezone.utc)
+dg.collect(24, [], [], 1000, since=pinned)
+check("collect: an explicit since instant is sent verbatim, not recomputed",
+      calls[1][6], pinned.strftime("%Y-%m-%dT%H:%M:%SZ"))
+calls.clear()
+dg.collect(24, [], [], 1000,
+           since=datetime.fromtimestamp(NOW - 3600, timezone(timedelta(hours=2))))
+check("collect: a non-UTC since is normalized before the Z-suffixed strftime",
+      calls[1][6], pinned.strftime("%Y-%m-%dT%H:%M:%SZ"))
+check("collect: the explicit since drives the client-side belt too",
+      [a["feed"] for a in dg.collect(
+          24, [], [], 1000,
+          since=datetime.fromtimestamp(NOW - 150, timezone.utc))],
+      ["Tech News"])
+calls.clear()
+dg.collect(24, [], [], 1000, before=77)
+check("collect: --before seeds the first page's cursor (srr art ls -b)",
+      calls[1][7:], ["-b", "77"])
 
 # --- collect: paging back to the cutoff -----------------------------------
 # The window is only "covered" once an article older than the cutoff shows up,
