@@ -100,13 +100,15 @@ DEFAULT_MAX_CHARS = 3_000
 
 # language (lowercase primary subtag, the item's `lang` field) -> default
 # piper voice. --lang-voice overrides/extends per feed; --voice bypasses it.
+# All "medium" on purpose: one quality tier across languages, so the size and
+# timing figures documented for --max-chars hold whichever voice is picked.
 LANG_VOICES = {
     "en": "en_US-lessac-medium",
     "es": "es_ES-davefx-medium",
     "fr": "fr_FR-siwis-medium",
     "de": "de_DE-thorsten-medium",
     "pt": "pt_BR-faber-medium",
-    "it": "it_IT-riccardo-x_low",
+    "it": "it_IT-paola-medium",
 }
 
 AUDIO_HTML = '<p><audio controls preload="none" src="%s"></audio></p>'

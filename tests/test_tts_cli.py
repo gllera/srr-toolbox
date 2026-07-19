@@ -127,6 +127,16 @@ cfg, _ = tts.parse_argv(["--voice", "en_US-lessac-medium"])
 check("well-formed voice accepted", cfg["voice"], "en_US-lessac-medium")
 check("clean argv sets no error", cfg["error"], "")
 
+# The built-in table must satisfy the same grammar --voice does, and stay on
+# one quality tier: the size/timing figures documented for --max-chars assume
+# a medium voice, and an x_low entry silently halves the sample rate.
+check("table keys are bare primary subtags",
+      [k for k in tts.LANG_VOICES if k != tts.norm_lang(k)], [])
+check("every table voice is well-formed",
+      [v for v in tts.LANG_VOICES.values() if not tts.VOICE_RE.match(v)], [])
+check("every table voice is medium quality",
+      [v for v in tts.LANG_VOICES.values() if not v.endswith("-medium")], [])
+
 # --- resolve_voice --------------------------------------------------------
 cfg, _ = tts.parse_argv(["--voice", "en_US-onyx-medium"])
 check("--voice wins", tts.resolve_voice(cfg, "es"), "en_US-onyx-medium")
