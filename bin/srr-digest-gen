@@ -317,8 +317,13 @@ def parse_time_bound(s, now, flag="--since"):
 
 
 def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
-            since=None, until=None, before=None):
+            since=None, until=None, before=None,
+            max_chars=MAX_ARTICLE_CHARS):
     """Every article fetched in the last `hours`, newest first.
+
+    `max_chars` caps each article's text; 0 keeps the full text. Longer text
+    costs nothing structurally — chunking is payload-sized, so bigger
+    articles just mean more chunks (still bounded by --max-chunks).
 
     An explicit `since` (an aware datetime the caller pinned once) replaces
     the hours-derived instant as both the backend window and the belt below;
@@ -397,7 +402,9 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
                     f"the digest would silently miss the rest. Raise --limit or "
                     f"narrow the window."
                 )
-            text = strip_html(a.get("c", ""))[:MAX_ARTICLE_CHARS]
+            text = strip_html(a.get("c", ""))
+            if max_chars:
+                text = text[:max_chars]
             title = a.get("t", "").strip()
             if not title:
                 title = text[:80] or "(untitled)"
@@ -782,6 +789,19 @@ def feed_id_list(value):
     return ids
 
 
+def chars_limit(value):
+    # Refused at parse time rather than clamped: a negative limit would slice
+    # from the text's END, quietly handing the prompts beheaded articles.
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer")
+    if n < 0:
+        raise argparse.ArgumentTypeError(
+            f"{value!r}: a limit cannot be negative (0 removes it)")
+    return n
+
+
 def window_bounds(args):
     """--since/--until resolved to (hours, since, until), or None when neither
     is given (the window is then --hours/the gap, ending now).
@@ -860,6 +880,11 @@ def build_parser():
                     help="safety cap on articles collected (default 5000); "
                          "hitting it before the window is covered is an error, "
                          "never a silent partial digest")
+    ap.add_argument("--max-article-chars", type=chars_limit,
+                    default=MAX_ARTICLE_CHARS,
+                    help="cap on each article's text as it reaches the "
+                         "prompts and --dump (default %(default)s); "
+                         "0 removes the cap and keeps the full text")
     ap.add_argument("--exclude-tag", default=DEFAULT_EXCLUDE_TAG,
                     help="tag never collected, even when its feed is selected "
                          "by --tag/--feed (default %(default)r — never digest "
@@ -921,7 +946,7 @@ def generate(args):
                  if win is None else win[0])
         articles = collect(hours, args.tag, args.feed, args.limit, args.exclude_tag,
                            since=win and win[1], until=win and win[2],
-                           before=args.before)
+                           before=args.before, max_chars=args.max_article_chars)
         json.dump(articles, sys.stdout, ensure_ascii=False, indent=1)
         print()
         return
@@ -949,7 +974,8 @@ def generate(args):
                  if args.hours is None else args.hours)
         since = until = None
     articles = collect(hours, args.tag, args.feed, args.limit, args.exclude_tag,
-                       since=since, until=until, before=args.before)
+                       since=since, until=until, before=args.before,
+                       max_chars=args.max_article_chars)
     if not articles:
         if not args.allow_empty:
             if (args.since is not None or args.until is not None

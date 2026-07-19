@@ -95,11 +95,14 @@ real_collect = dg.collect
 
 
 def spy_collect(hours, tags, feed_ids, limit, exclude_tag=dg.DEFAULT_EXCLUDE_TAG,
-                since=None, until=None, before=None):
+                since=None, until=None, before=None,
+                max_chars=dg.MAX_ARTICLE_CHARS):
     windows.append(hours)
-    collect_kwargs.append({"since": since, "until": until, "before": before})
+    collect_kwargs.append({"since": since, "until": until, "before": before,
+                           "max_chars": max_chars})
     return real_collect(hours, tags, feed_ids, limit, exclude_tag,
-                        since=since, until=until, before=before)
+                        since=since, until=until, before=before,
+                        max_chars=max_chars)
 
 
 dg.run_json = fake_run_json
@@ -254,6 +257,33 @@ HISTORY[:] = []
 run(["--dry-run", "--before", "123"])
 check("bounds: --before reaches the publish path's collect too",
       [c["before"] for c in collect_kwargs], [123])
+
+# --- article length limit ---------------------------------------------------
+check("article limit: defaults to MAX_ARTICLE_CHARS",
+      dg.build_parser().parse_args([]).max_article_chars, dg.MAX_ARTICLE_CHARS)
+check_parse_fails("article limit: a negative limit is refused at parse time "
+                  "(a negative slice would cut from the text's end)",
+                  ["--max-article-chars", "-1"])
+check_parse_fails("article limit: a non-numeric limit is refused at parse time",
+                  ["--max-article-chars", "lots"])
+
+reset()
+out = run(["--dump", "--max-article-chars", "2"])
+check("article limit: --max-article-chars reaches --dump's collect",
+      [c["max_chars"] for c in collect_kwargs], [2])
+check("article limit: ...and truncates the dumped text",
+      json.loads(out)[0]["text"], "bo")
+
+reset()
+run(["--dump", "--max-article-chars", "0"])
+check("article limit: 0 (no limit) reaches collect, not a fallback to the default",
+      [c["max_chars"] for c in collect_kwargs], [0])
+
+reset()
+HISTORY[:] = []
+run(["--dry-run", "--max-article-chars", "2"])
+check("article limit: --max-article-chars reaches the publish path's collect too",
+      [c["max_chars"] for c in collect_kwargs], [2])
 
 # --- --dry-run ------------------------------------------------------------
 reset()
