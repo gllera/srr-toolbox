@@ -106,9 +106,9 @@ srr feed upd <id> -p 'srr-tts --voice es_ES-davefx-medium' -p '#default'
 Voice resolution (first hit wins):
 1. `--voice <name>` — explicit piper voice, e.g. `en_US-lessac-medium`
 2. `--lang-voice xx=voice` — per-feed extension/override of the table (repeatable)
-3. the built-in table, keyed by the item's `lang` field — only present when an earlier
-   ingest strategy or pipeline step set it (srr's own language detection stamps *after*
-   this step, so plain feeds need an explicit `--voice`)
+3. the built-in table, keyed by the item's `lang` field — srr auto-detects it *before*
+   the pipeline runs (a declared value from the ingest strategy wins), so the table
+   works on plain feeds too; `--voice` forces a voice when detection is empty/wrong
 
 None resolvable, or any other per-item failure, passes the item through unchanged
 (logged to stderr) — srr-tts never fails the feed cycle.

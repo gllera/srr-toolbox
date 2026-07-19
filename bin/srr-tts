@@ -26,10 +26,10 @@ VOICE RESOLUTION (first hit wins)
   2. --lang-voice xx=voice   per-feed extension/override of the table (repeatable)
   3. built-in table          keyed by the item's `lang` field (en es fr de pt it)
   none resolvable -> the item passes through unchanged (logged to stderr).
-  The `lang` field reaches srr-tts only when the ingest strategy (or an
-  earlier external mod) declared it — srr's own language detection stamps
-  at the END of the pipeline, after this step. Plain feeds arrive without
-  one; give those an explicit --voice.
+  srr auto-detects `lang` BEFORE the pipeline runs (a declared value from
+  the ingest strategy wins; short/uncertain text leaves it empty), so the
+  language-keyed table works on plain feeds too. Use --voice to force a
+  voice when detection stays empty or picks wrong.
 
 The asset dir arrives as $SRR_ASSET_DIR (set by srr on the fetch path; absent
 in `srr preview` and older backends -> pass through, never synthesize).
