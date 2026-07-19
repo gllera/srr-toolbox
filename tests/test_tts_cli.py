@@ -121,6 +121,83 @@ with tempfile.TemporaryDirectory() as d:
     leftover = [n for n in os.listdir(d) if ".part" in n]
     check_true("synthesize: no leftover .part files", leftover == [], leftover)
 
+# --- ensure_voice (staged download; piper faked out of sys.modules) --------
+# A voice is model + config, and piper's downloader skips any file that merely
+# exists and is non-empty — so a half-downloaded model must not be left in
+# place, or it poisons the cache forever.
+import sys
+import types
+
+downloads = []
+
+
+def fake_download_voice(voice, download_dir, force_redownload=False):
+    downloads.append(voice)
+    for suffix in (".onnx", ".onnx.json"):
+        with open(os.path.join(str(download_dir), voice + suffix), "wb") as fh:
+            fh.write(b"model-bytes")
+
+
+fake_piper = types.ModuleType("piper")
+fake_piper.PiperVoice = type("PiperVoice", (), {
+    "load": staticmethod(lambda path, *a, **k: ("loaded", path))})
+fake_dl = types.ModuleType("piper.download_voices")
+fake_dl.download_voice = fake_download_voice
+saved_mods = {k: sys.modules.get(k) for k in ("piper", "piper.download_voices")}
+sys.modules["piper"] = fake_piper
+sys.modules["piper.download_voices"] = fake_dl
+try:
+    with tempfile.TemporaryDirectory() as vd:
+        onnx = os.path.join(vd, "xx_XX-test.onnx")
+
+        del downloads[:]
+        tts.ensure_voice("xx_XX-test", vd)
+        check("first use downloads", downloads, ["xx_XX-test"])
+        check_true("both voice files land",
+                   os.path.exists(onnx) and os.path.exists(onnx + ".json"))
+        check_true("no staging dir left behind",
+                   [n for n in os.listdir(vd) if n.startswith(".dl-")] == [],
+                   os.listdir(vd))
+
+        del downloads[:]
+        tts.ensure_voice("xx_XX-test", vd)
+        check("complete voice is not re-downloaded", downloads, [])
+
+        # Model present but config missing (a killed download): must redownload
+        # rather than hand a half-voice to PiperVoice.load forever.
+        os.remove(onnx + ".json")
+        del downloads[:]
+        tts.ensure_voice("xx_XX-test", vd)
+        check("missing config triggers re-download", downloads, ["xx_XX-test"])
+        check_true("config restored", os.path.exists(onnx + ".json"))
+
+        # A download that dies mid-flight leaves the previous state intact.
+        def dying_download(voice, download_dir, force_redownload=False):
+            with open(os.path.join(str(download_dir), voice + ".onnx"), "wb") as fh:
+                fh.write(b"trunc")
+            raise OSError("connection reset")
+
+        fake_dl.download_voice = dying_download
+        os.remove(onnx)
+        os.remove(onnx + ".json")
+        try:
+            tts.ensure_voice("xx_XX-test", vd)
+            check_true("failed download raises", False)
+        except OSError:
+            check_true("failed download raises", True)
+        check_true("no truncated model left in place", not os.path.exists(onnx),
+                   os.listdir(vd))
+        check_true("no staging dir left after failure",
+                   [n for n in os.listdir(vd) if n.startswith(".dl-")] == [],
+                   os.listdir(vd))
+        fake_dl.download_voice = fake_download_voice
+finally:
+    for k, v in saved_mods.items():
+        if v is None:
+            sys.modules.pop(k, None)
+        else:
+            sys.modules[k] = v
+
 # --- run_item -------------------------------------------------------------
 BASE = {"guid": 42, "title": "T", "content": "<p>Hola mundo.</p>",
         "link": "https://e.com/a", "published": "2026-07-19T00:00:00Z",

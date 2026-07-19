@@ -853,7 +853,7 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12" },
     { name = "cryptg", specifier = ">=0.4" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.27" },
-    { name = "piper-tts", specifier = ">=1.2" },
+    { name = "piper-tts", specifier = ">=1.5" },
     { name = "telethon", specifier = ">=1.43,<2" },
 ]
 

@@ -15,5 +15,9 @@ dependencies = [
     "cryptg>=0.4",         # srr-telegram: fast Telethon crypto
     "beautifulsoup4>=4.12", # srr-telegram web (no-auth) mode + srr-x: HTML parsing
     "httpx[http2]>=0.27",   # srr-x: feed fetch over HTTP/2 (nitter.poast.org 403s HTTP/1.1)
-    "piper-tts>=1.2",   # local TTS (ONNX voices via piper.download_voices)
+    # srr-tts: local TTS. >=1.5 is the floor actually exercised — the script
+    # uses PiperVoice.synthesize_wav + piper.download_voices.download_voice.
+    # Pulls onnxruntime/numpy into the shared venv every bin/ script installs;
+    # srr-tts imports it lazily so only real synthesis pays at runtime.
+    "piper-tts>=1.5",
 ]

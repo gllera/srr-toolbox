@@ -41,12 +41,19 @@ KNOBS
 -----
   --voice <name>            explicit piper voice (wins over everything)
   --lang-voice xx=voice     extend/override the language->voice table (repeatable)
-  --max-chars <n>           narration cap, default 10000; truncated at a
-                            sentence boundary (bounds audio size + synthesis
-                            time vs srr's per-step --cmd-timeout); 0 disables
-                            the cap (unbounded synthesis can hit srr's
-                            per-step timeout — leave the default unless you
-                            know the feed)
+  --max-chars <n>           narration cap, default 3000; truncated at a
+                            sentence boundary. This bound is a SAFETY limit,
+                            not a preference: srr drops an item whose pipe
+                            step exits non-zero or times out, and keeps its
+                            guid in BoundaryGUIDs, so a --cmd-timeout kill
+                            loses the article permanently (never retried).
+                            Measured (piper medium voice): ~59 chars/s of
+                            speech, ~2.6 MB of WAV per 1000 chars — 3000
+                            chars is ~2.9 min of audio / ~7.8 MB, seconds of
+                            synthesis on a fast box and well inside the 5m
+                            default --cmd-timeout on a small ARM one. 0
+                            disables the cap: only do that on a feed whose
+                            article length you know.
   --voices-dir <dir>        piper models dir (default $XDG_DATA_HOME else
                             ~/.local/share, + /srr-tts); models auto-download
                             there on first use. Deliberately OUTSIDE srr's
@@ -78,7 +85,7 @@ from bs4 import BeautifulSoup
 
 VERSION = "1.0"
 
-DEFAULT_MAX_CHARS = 10_000
+DEFAULT_MAX_CHARS = 3_000
 
 # language (lowercase primary subtag, the item's `lang` field) -> default
 # piper voice. --lang-voice overrides/extends per feed; --voice bypasses it.
@@ -180,15 +187,34 @@ def resolve_voice(cfg: dict, language: str):
 
 def ensure_voice(voice: str, voices_dir: str):
     """Load the piper voice, downloading its model on first use. Imports stay
-    inside: onnxruntime is heavy and pass-through runs must not pay for it."""
+    inside: onnxruntime is heavy and pass-through runs must not pay for it.
+
+    A voice is two files (PiperVoice.load derives the .onnx.json config from
+    the model path), and both must be complete. piper's own downloader skips
+    any file that merely exists and is non-empty, so a run killed mid-download
+    — srr's --cmd-timeout can land there, the model is ~60 MB — would leave a
+    truncated .onnx that is NEVER re-downloaded and fails load every cycle
+    after. So: stage the download in a sibling temp dir and os.replace each
+    file into place (same filesystem, so the rename is atomic). Two feeds
+    racing on a voice's first use both stage their own copy; last replace
+    wins, same bytes."""
+    import shutil
+    import tempfile
     from pathlib import Path
     from piper import PiperVoice
     onnx = os.path.join(voices_dir, voice + ".onnx")
-    if not os.path.exists(onnx):
+    conf = onnx + ".json"
+    if not (os.path.exists(onnx) and os.path.exists(conf)):
         from piper.download_voices import download_voice
         os.makedirs(voices_dir, exist_ok=True)
         log("downloading voice %s -> %s" % (voice, voices_dir))
-        download_voice(voice, Path(voices_dir))
+        stage = tempfile.mkdtemp(dir=voices_dir, prefix=".dl-")
+        try:
+            download_voice(voice, Path(stage))
+            for dest in (onnx, conf):
+                os.replace(os.path.join(stage, os.path.basename(dest)), dest)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
     return PiperVoice.load(onnx)
 
 
@@ -226,7 +252,8 @@ def run_item(item: dict, cfg: dict) -> dict:
         return item
     text, truncated = truncate(text, cfg["max_chars"])
     if truncated:
-        log("narration truncated to %d chars" % cfg["max_chars"])
+        log("narration truncated to %d chars (cap %d)"
+            % (len(text), cfg["max_chars"]))
     voice = resolve_voice(cfg, item.get("lang") or "")
     if not voice:
         log("no voice for language %r: passing item through"

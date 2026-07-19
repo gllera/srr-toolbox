@@ -118,9 +118,23 @@ in `srr preview` and older backends, where the step passes through rather than
 synthesizing. Narration is written as WAV under `tts/` in the asset dir and shipped
 through the same `#/`-marker upload as other self-hosted media; the store-side asset
 processor (webify on this deployment) transcodes it to web audio before upload.
-`--max-chars` (default 10000, truncated at a sentence boundary; 0 disables) bounds
-synthesis time against srr's per-step `--cmd-timeout`. Voice models auto-download to
-`~/.local/share/srr-tts/` (or `--voices-dir`) on first use.
+Voice models auto-download to `~/.local/share/srr-tts/` (or `--voices-dir`) on first
+use — staged in a temp dir and renamed into place, so an interrupted download can't
+leave a truncated model behind.
+
+**Backend requirement:** `$SRR_ASSET_DIR` on external pipe steps, and the pre-pipeline
+`lang` stamp the voice table keys off, are both recent backend features. Against an
+older `srr` the step simply passes items through unchanged — it never breaks a feed,
+it just does nothing.
+
+**Keep `--max-chars` honest.** srr *drops* an item whose pipe step exits non-zero or
+times out, and keeps its guid in `BoundaryGUIDs` — so blowing the per-step
+`--cmd-timeout` (default 5m) loses the article permanently, not just its narration.
+The cap is the safety bound against that. Measured with a piper medium voice: about
+**59 characters per second of speech and 2.6 MB of WAV per 1000 characters**, so the
+3000-char default is ~2.9 min of audio / ~7.8 MB per narrated article. Raise it only
+if you've checked the synthesis still finishes comfortably on the box running the
+fetch loop; `0` disables the cap entirely.
 
 ```bash
 srr-tts --voice es_ES-davefx-medium --asset-dir /tmp/store article.html
