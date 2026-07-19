@@ -299,7 +299,9 @@ def parse_time_bound(s, now):
     against the caller's `now` rather than reading the clock here, so the
     caller can pin one instant for everything derived from it — the backend
     re-resolves a duration on every invocation, which would creep from page
-    to page (see collect).
+    to page (see collect). Slightly laxer than the backend: a naive
+    RFC3339-style datetime (no offset) is read as local time rather than
+    rejected — only the normalized instant ever reaches the backend.
     """
     if DURATION_RE.fullmatch(s):
         secs = sum(float(n) * DURATION_UNIT[u]
@@ -385,7 +387,7 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
                 raise DigestError(
                     f"--limit {limit} reached {age:.1f}h into a {hours}h window: "
                     f"the digest would silently miss the rest. Raise --limit or "
-                    f"shorten --hours."
+                    f"narrow the window."
                 )
             text = strip_html(a.get("c", ""))[:MAX_ARTICLE_CHARS]
             title = a.get("t", "").strip()
@@ -779,7 +781,9 @@ def window_since(args):
     `--since 48h` window is phrased as exactly 48 hours; the instant rides
     every page while the hours ride the prompts and logs.
     """
-    if not args.since:
+    # None-check, not truthiness: --since "" must die in parse_time_bound as
+    # the named error, never fall back to the default window unasked.
+    if args.since is None:
         return None
     if args.hours is not None:
         raise DigestError("--hours and --since both set the window's start; "
@@ -875,10 +879,14 @@ def now_local(tz):
 
 
 def generate(args):
+    # Resolved first: a --since/--hours contradiction is a pure flag error and
+    # must die before any subprocess — behind fetch_history a down store would
+    # mask it.
+    win = window_since(args)
+
     # --dump is a query, not a run: it never reads the feed back, so the skill
     # path keeps working against a backend without `srr syndicate`.
     if args.dump:
-        win = window_since(args)
         hours = ((DEFAULT_HOURS if args.hours is None else args.hours)
                  if win is None else win[0])
         articles = collect(hours, args.tag, args.feed, args.limit, args.exclude_tag,
@@ -903,7 +911,6 @@ def generate(args):
             f"version they have)"
         )
 
-    win = window_since(args)
     if win is not None:
         hours, since = win
     else:
@@ -914,6 +921,14 @@ def generate(args):
                        since=since, before=args.before)
     if not articles:
         if not args.allow_empty:
+            if args.since or args.before is not None:
+                # An explicit historical window can genuinely be empty; the
+                # broken-fetch-loop diagnosis below only holds for the rolling
+                # default window.
+                raise DigestError(
+                    "no articles in the requested window — nothing to digest. "
+                    "Pass --allow-empty if that is expected."
+                )
             raise DigestError(
                 f"no articles at all in the last {hours}h — with a healthy "
                 f"store that means the fetch loop is broken, not that the news "

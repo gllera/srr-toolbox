@@ -90,12 +90,14 @@ def fake_fetch_history(name):
 
 
 windows = []
+collect_kwargs = []  # so a refactor cannot silently drop since=/before= wiring
 real_collect = dg.collect
 
 
 def spy_collect(hours, tags, feed_ids, limit, exclude_tag=dg.DEFAULT_EXCLUDE_TAG,
                 since=None, before=None):
     windows.append(hours)
+    collect_kwargs.append({"since": since, "before": before})
     return real_collect(hours, tags, feed_ids, limit, exclude_tag,
                         since=since, before=before)
 
@@ -120,6 +122,7 @@ def reset():
     pushed.clear()
     fetched.clear()
     windows.clear()
+    collect_kwargs.clear()
 
 
 # --- --dump ---------------------------------------------------------------
@@ -189,10 +192,33 @@ run(["--dump", "--since", "48h"])
 check("bounds: --since sets the window the digest is phrased in "
       "(one now for the instant and the hours, so 48h is exactly 48)",
       windows, [48])
+check_true("bounds: --since reaches collect as the pinned instant",
+           abs(collect_kwargs[0]["since"].timestamp()
+               - (time.time() - 48 * 3600)) < 60, collect_kwargs)
+
+reset()
+run(["--dump", "--before", "123"])
+check("bounds: --before reaches collect",
+      [c["before"] for c in collect_kwargs], [123])
+
+reset()
+HISTORY[:] = []
+run(["--dry-run", "--since", "48h"])
+check("bounds: --since reaches the publish path's collect too, bypassing "
+      "the --hours/gap arithmetic", windows, [48])
+check_true("bounds: ...as the pinned instant",
+           collect_kwargs[0]["since"] is not None, collect_kwargs)
+
 check_exits("bounds: --hours and --since are one mode each, not a fallback",
             ["--dump", "--since", "48h", "--hours", "6"], "pass one of them")
+reset()
+check_exits("bounds: the contradiction dies before any store read",
+            ["--since", "48h", "--hours", "6"], "pass one of them")
+check("bounds: ...no history fetched for it", fetched, [])
 check_exits("bounds: a --since in the future is refused up front",
             ["--dump", "--since", "2099-01-01T00:00:00Z"], "future")
+check_exits("bounds: an empty --since is refused, not a silent fallback "
+            "to the default window", ["--dump", "--since", ""], "--since ''")
 
 # --- --dry-run ------------------------------------------------------------
 reset()
@@ -371,6 +397,10 @@ check_exits("empty window: an error, because that is a broken fetch loop, "
             "not a quiet news day", [], "no articles at all")
 check("empty window: nothing published", pushed, [])
 check("empty window: no claude call either", claude_calls, [])
+
+reset()
+check_exits("empty window: an explicit --since/--before window is not blamed "
+            "on the fetch loop", ["--since", "24h"], "requested window")
 
 reset()
 out = run(["--allow-empty"])

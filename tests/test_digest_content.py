@@ -154,6 +154,8 @@ check("parse_time_bound: weeks duration", dg.parse_time_bound("2w", T0),
       T0 - timedelta(days=14))
 check("parse_time_bound: compound duration", dg.parse_time_bound("1d12h", T0),
       T0 - timedelta(hours=36))
+check("parse_time_bound: float duration", dg.parse_time_bound("1.5h", T0),
+      T0 - timedelta(hours=1.5))
 check("parse_time_bound: RFC3339 instant, Z accepted",
       dg.parse_time_bound("2026-07-15T10:00:00Z", T0),
       datetime(2026, 7, 15, 10, 0, 0, tzinfo=timezone.utc))
