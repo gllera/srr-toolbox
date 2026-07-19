@@ -10,6 +10,7 @@ ingest sources that don't speak usable RSS.
 bin/srr-telegram  ingest strategy: Telegram channel (incl. private) -> SRR items
 bin/srr-youtube   ingest strategy: YouTube channel Atom feed -> SRR items
 bin/srr-x         ingest strategy: X/Twitter account (via a Nitter instance) -> SRR items
+bin/srr-tts       pipeline step: prepend a piper TTS narration to the article
 bin/srr-uvrun     shebang wrapper that runs the Python scripts in this repo's uv venv
 tests/            self-checking test scripts + fixtures
 pyproject.toml    shared dependencies for every bin/ script, pinned by uv.lock
@@ -83,6 +84,46 @@ for measured per-instance quirks (rate limits, an HTTP/2-only WAF, whitelisting)
 
 ```bash
 srr feed add -t "NASA" -u "https://x.com/NASA" -i "srr-x"
+```
+
+## Pipeline steps
+
+Pipeline steps run once per *item*, not once per *feed*: `srr` execs any non-`#builtin`
+`pipe` entry with the item JSON on stdin and reads the (possibly modified) item back on
+stdout — a different contract from the ingest strategies above.
+
+### `srr-tts`
+
+Prepends a self-hosted piper TTS narration of the title + body to the article. Opt a
+feed in via its `pipe` config, after `#readability` if the feed uses it and before
+`#default` so the narration marker rides the normal sanitize/upload path:
+
+```bash
+srr feed upd <id> -p 'srr-tts --voice es_ES-davefx-medium' -p '#default'
+# feeds using #readability: put srr-tts after it, before #default
+```
+
+Voice resolution (first hit wins):
+1. `--voice <name>` — explicit piper voice, e.g. `en_US-lessac-medium`
+2. `--lang-voice xx=voice` — per-feed extension/override of the table (repeatable)
+3. the built-in table, keyed by the item's `lang` field — only present when an earlier
+   ingest strategy or pipeline step set it (srr's own language detection stamps *after*
+   this step, so plain feeds need an explicit `--voice`)
+
+None resolvable, or any other per-item failure, passes the item through unchanged
+(logged to stderr) — srr-tts never fails the feed cycle.
+
+The asset dir arrives as `$SRR_ASSET_DIR` (set by srr on the fetch path); it's absent
+in `srr preview` and older backends, where the step passes through rather than
+synthesizing. Narration is written as WAV under `tts/` in the asset dir and shipped
+through the same `#/`-marker upload as other self-hosted media; the store-side asset
+processor (webify on this deployment) transcodes it to web audio before upload.
+`--max-chars` (default 10000, truncated at a sentence boundary; 0 disables) bounds
+synthesis time against srr's per-step `--cmd-timeout`. Voice models auto-download to
+`~/.local/share/srr-tts/` (or `--voices-dir`) on first use.
+
+```bash
+srr-tts --voice es_ES-davefx-medium --asset-dir /tmp/store article.html
 ```
 
 ## Python setup

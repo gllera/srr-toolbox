@@ -6,9 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 External ingest strategies for SRR (the Go `srr` backend + TS frontend in
 `~/ws/srr`, which has its own CLAUDE.md — backend/frontend *code* changes go there,
-not here). `bin/` holds **`srr-telegram` / `srr-youtube` / `srr-x`** (python) —
-strategies that `srr` execs by bare name, resolved from `PATH` — plus the
-`srr-uvrun` shebang wrapper. On this machine `bin/` reaches `PATH` via
+not here). `bin/` holds **`srr-telegram` / `srr-youtube` / `srr-x`** (python ingest
+strategies — one process per feed, JSON stdin -> JSON stdout) and **`srr-tts`**
+(python pipeline step — one process per item, item JSON stdin -> item JSON stdout,
+prepends a piper TTS narration) — all exec'd by `srr` by bare name, resolved from
+`PATH` — plus the `srr-uvrun` shebang wrapper. On this machine `bin/` reaches `PATH` via
 `~/.local/bin` symlinks managed from the private srr-config repo; the `srr`
 skill is the full ops runbook (this repo is destined to be public, so it only
 states the generic PATH contract).
@@ -24,6 +26,9 @@ for t in tests/test_*.py; do uv run "$t" || break; done   # all of them
 # pretty-prints the response):
 srr-youtube "https://www.youtube.com/feeds/videos.xml?channel_id=UC..."
 srr-x --instance https://nitter.poast.org "@handle"
+
+# Manual run of the srr-tts pipeline step (HTML file instead of the stdin item JSON):
+srr-tts --voice en_US-lessac-medium --asset-dir /tmp/store article.html
 
 # Run the backend directly (nothing wraps it). There is ONE srr: ~/.config/srr/srr.yaml
 # is the only config and also the SRR_CONFIG-unset default, so bare `srr` operates on
