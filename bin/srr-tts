@@ -1,0 +1,157 @@
+#!/usr/bin/env srr-uvrun
+"""SRR external pipeline step: prepend a self-hosted TTS narration to articles.
+
+srr execs any non-#builtin `pipe` entry once per item, writing the item JSON
+to stdin and reading the (possibly modified) item JSON back from stdout:
+
+    {guid, title, content, link, published, language?, raw, drop?}
+
+This step narrates title + body text with piper (fully offline) and prepends
+
+    <p><audio controls preload="none" src="#/tts/<hash>.wav"></audio></p>
+
+The "#/"-marker file is written under the fetch run's asset dir; srr's
+end-of-pipeline upload step ships it to the store content-addressed (and the
+store-side asset processor — webify on this deployment — transcodes the WAV
+to web audio before upload).
+
+Opt a feed in (order matters: after #readability if the feed uses it, before
+#default so the marker rides the normal sanitize/upload path):
+
+    srr feed upd <id> -p 'srr-tts --voice es_ES-davefx-medium' -p '#default'
+    srr feed upd <id> -l es -p 'srr-tts' -p '#default'   # voice via language
+
+VOICE RESOLUTION (first hit wins)
+---------------------------------
+  1. --voice <name>          explicit piper voice, e.g. en_US-lessac-medium
+  2. --lang-voice xx=voice   per-feed extension/override of the table (repeatable)
+  3. built-in table          keyed by the item's `language` field (en es fr de pt it)
+  none resolvable -> the item passes through unchanged (logged to stderr).
+
+The asset dir arrives as $SRR_ASSET_DIR (set by srr on the fetch path; absent
+in `srr preview` and older backends -> pass through, never synthesize).
+Synthesized WAVs are cached there under tts/ keyed by voice+text hash: a
+cache hit only refreshes the file's mtime (so srr's age-based sweep keeps
+live files) and never re-synthesizes.
+
+KNOBS
+-----
+  --voice <name>            explicit piper voice (wins over everything)
+  --lang-voice xx=voice     extend/override the language->voice table (repeatable)
+  --max-chars <n>           narration cap, default 10000; truncated at a
+                            sentence boundary (bounds audio size + synthesis
+                            time vs srr's per-step --cmd-timeout)
+  --voices-dir <dir>        piper models dir (default $XDG_DATA_HOME else
+                            ~/.local/share, + /srr-tts); models auto-download
+                            there on first use. Deliberately OUTSIDE srr's
+                            age-swept asset cache.
+  --asset-dir <dir>         manual runs: where tts/ audio goes (what
+                            $SRR_ASSET_DIR carries on the fetch path)
+
+MANUAL RUNS (parameters instead of stdin)
+-----------------------------------------
+Pass an HTML file as argument instead of item JSON on stdin — the same item
+dict is built from parameters and the result is pretty-printed:
+
+    srr-tts --voice es_ES-davefx-medium --asset-dir /tmp/store article.html
+    srr-tts --language es --asset-dir /tmp/store --title "Titular" article.html
+
+  <file>                    HTML file whose content becomes the item body
+  --title <text>            item title (narrated first)
+  --language <xx>           item language field (drives the voice table)
+"""
+import hashlib
+import html
+import json
+import os
+import re
+import sys
+import wave
+
+from bs4 import BeautifulSoup
+
+VERSION = "1.0"
+
+DEFAULT_MAX_CHARS = 10_000
+
+# language (lowercase primary subtag, the item's `language` field) -> default
+# piper voice. --lang-voice overrides/extends per feed; --voice bypasses it.
+LANG_VOICES = {
+    "en": "en_US-lessac-medium",
+    "es": "es_ES-davefx-medium",
+    "fr": "fr_FR-siwis-medium",
+    "de": "de_DE-thorsten-medium",
+    "pt": "pt_BR-faber-medium",
+    "it": "it_IT-riccardo-x_low",
+}
+
+AUDIO_HTML = '<p><audio controls preload="none" src="%s"></audio></p>'
+
+
+def log(*a):
+    print("srr-tts:", *a, file=sys.stderr)
+
+
+def fnv1a32(s: str) -> int:
+    h = 0x811C9DC5
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+# Subtrees that must never reach the narration (content is pre-#sanitize
+# here: scripts/styles may still be present; audio/video keeps a re-run from
+# narrating its own player markup) and elements whose boundaries read as
+# paragraph breaks. Inline tags (a, b, span, ...) flow into the sentence.
+DROP_TAGS = ("script", "style", "noscript", "template", "iframe",
+             "audio", "video", "svg", "math", "head")
+BLOCK_TAGS = ("p", "div", "li", "ul", "ol", "blockquote", "pre", "table",
+              "tr", "figure", "figcaption", "article", "section", "aside",
+              "header", "footer", "details", "summary",
+              "h1", "h2", "h3", "h4", "h5", "h6",
+              "dl", "dt", "dd", "td", "th", "caption")
+
+
+def extract_text(title: str, content_html: str) -> str:
+    """Item title + content HTML -> the plain text to narrate. Attribute text
+    (alt, URLs) is never included; block boundaries become paragraph breaks
+    so piper phrases them as pauses. '' when there is nothing to say."""
+    soup = BeautifulSoup(content_html or "", "html.parser")
+    for t in soup(list(DROP_TAGS)):
+        t.decompose()
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    for t in soup.find_all(list(BLOCK_TAGS)):
+        t.insert_before("\n\n")
+        t.insert_after("\n\n")
+    body = soup.get_text()
+    body = re.sub(r"[ \t\r\f\v]+", " ", body)
+    body = re.sub(r" ?\n ?", "\n", body)
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    title = (title or "").strip()
+    if title and body:
+        return title + "\n\n" + body
+    return title or body
+
+
+SENTENCE_END = re.compile(r"[.!?…](?=\s)")
+
+
+def truncate(text: str, cap: int):
+    """-> (text, truncated?). Over-cap text is cut at the last sentence end
+    past 60% of the cap, else hard at the cap (a boundary too early would
+    silently drop most of the article)."""
+    if cap <= 0 or len(text) <= cap:
+        return text, False
+    cut = text[:cap]
+    ends = [m.end() for m in SENTENCE_END.finditer(cut)]
+    if ends and ends[-1] >= int(cap * 0.6):
+        return cut[: ends[-1]].rstrip(), True
+    return cut.rstrip(), True
+
+
+def audio_name(voice: str, text: str) -> str:
+    """Store-relative name for a narration: content-addressed by voice+text
+    so identical inputs reuse the same cache file (and dedup in the store)."""
+    h = hashlib.sha256((voice + "\n" + text).encode("utf-8")).hexdigest()
+    return "tts/%s.wav" % h[:32]
