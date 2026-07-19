@@ -101,6 +101,9 @@ feed in via its `pipe` config, after `#readability` if the feed uses it and befo
 ```bash
 srr feed upd <id> -p 'srr-tts --voice es_ES-davefx-medium' -p '#default'
 # feeds using #readability: put srr-tts after it, before #default
+# feeds using #filter:      put srr-tts after it — a drop short-circuits the
+#                           rest of the pipe, so filtering first avoids
+#                           synthesizing articles that are about to be dropped
 ```
 
 Voice resolution (first hit wins):
@@ -149,10 +152,6 @@ the feed in:
 
 ```bash
 srr-tts --voice es_ES-davefx-medium --asset-dir /tmp/warm article.html
-```
-
-```bash
-srr-tts --voice es_ES-davefx-medium --asset-dir /tmp/store article.html
 ```
 
 ## Python setup

@@ -37,6 +37,13 @@ Synthesized WAVs are cached there under tts/ keyed by voice+text hash: a
 cache hit only refreshes the file's mtime (so srr's age-based sweep keeps
 live files) and never re-synthesizes.
 
+ON THE FETCH PATH THIS STEP NEVER EXITS NON-ZERO. srr drops an item whose
+pipe step fails and keeps its guid, so the article is gone for good — worse
+than losing the narration. Every failure, INCLUDING a typo'd flag in the
+feed's `pipe`, therefore reports on stderr and leaves the item alone. Run the
+step manually (an HTML file argument) to have mistakes reported loudly with a
+non-zero exit.
+
 KNOBS
 -----
   --voice <name>            explicit piper voice (wins over everything)
@@ -253,6 +260,8 @@ def fetch_voice(voice: str, voices_dir: str, onnx: str, conf: str):
     after. So stage into a sibling temp dir and os.replace each file into
     place (same filesystem, so the rename is atomic). Two feeds racing on a
     voice's first use both stage their own copy; last replace wins, same
+    bytes.
+
     Note this covers the KILL case, not a silently short HTTP body: piper
     checks neither Content-Length nor the md5 upstream publishes, so a dropped
     connection still returns "success". ensure_voice's load-failure heal is
@@ -477,10 +486,11 @@ def parse_argv(argv):
     # is indistinguishable from a filename, and a stray token in a feed's
     # `pipe` looks like one too. Reading a file is the only evidence a human
     # is driving this, so it is the only thing that may authorize a non-zero
-    # exit; anything else degrades to the fetch-safe path.
-    # The FIRST positional that opens is the file: an unknown flag's orphaned
-    # value sits in the positional list too, ahead of the real filename.
+    # exit; anything else degrades to the fetch-safe path. The FIRST positional
+    # that OPENS wins, because that orphaned value sits ahead of the real
+    # filename in the natural ordering ("--voce X article.html").
     content = None
+    last_err = None
     for candidate in paths:
         try:
             with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
