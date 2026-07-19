@@ -76,7 +76,7 @@ def fake_run_json(cmd):
 
 dg.run_json = fake_run_json
 
-got = dg.collect(24, None, 1000)
+got = dg.collect(24, [], [], 1000)
 check("collect: window stops at the first article older than --hours "
       "(3 in window, 1 dropped by tag)", len(got), 2)
 check("collect: feed titles resolved", [a["feed"] for a in got], ["Tech News", "Untagged"])
@@ -92,22 +92,58 @@ check_true("collect: --since is an instant, not a duration that creeps "
                .replace(tzinfo=timezone.utc).timestamp()
                - (time.time() - 24 * 3600)) < 60)
 calls.clear()
-dg.collect(24, "news", 5)
-check("collect: --tag reaches srr art ls", calls[1][7:], ["-g", "news"])
+dg.collect(24, ["news/tech"], [], 5)
+check("collect: --tag reaches srr art ls", calls[1][7:], ["-g", "news/tech"])
+calls.clear()
+dg.collect(24, ["news/tech", "digest"], [], 5)
+check("collect: several tags become repeated -g flags",
+      calls[1][7:], ["-g", "news/tech", "-g", "digest"])
+calls.clear()
+dg.collect(24, [], [1, 3], 5)
+check("collect: feed ids become repeated -i flags",
+      calls[1][7:], ["-i", "1", "-i", "3"])
+calls.clear()
+dg.collect(24, ["digest"], [3], 5)
+check("collect: tags and feeds ride one query — the backend unions them",
+      calls[1][7:], ["-g", "digest", "-i", "3"])
 
-wide = dg.collect(24, None, 1000, exclude_tag="")
+# a typo'd selection must be a clear error, not an empty window that the
+# empty-window check then blames on the fetch loop
+calls.clear()
+check_raises("collect: an unknown tag is an error naming the known ones",
+             lambda: dg.collect(24, ["newz"], [], 5),
+             "unknown tag 'newz'; srr feed ls knows: digest, news/tech")
+check("collect: the unknown tag was refused before any article query",
+      len(calls), 1)
+calls.clear()
+check_raises("collect: an unknown feed id is an error naming the known ones",
+             lambda: dg.collect(24, [], [9], 5),
+             "unknown feed id 9; srr feed ls knows: 1, 2, 3")
+check("collect: the unknown feed id was refused before any article query",
+      len(calls), 1)
+
+# exclusion wins even over explicit selection: feed 2 carries the default
+# exclude tag, so asking for it by id still yields the other feeds only
+# (the stub returns every article regardless of filters — what is under test
+# is the client-side exclude, not the backend)
+calls.clear()
+check("collect: --exclude-tag wins over an explicitly selected feed",
+      [a["feed"] for a in dg.collect(24, [], [2], 1000)],
+      ["Tech News", "Untagged"])
+
+wide = dg.collect(24, [], [], 1000, exclude_tag="")
 check("collect: empty exclude-tag digests everything in the window", len(wide), 3)
 check("collect: the digest feed is what the default exclude-tag drops",
       wide[1]["feed"], "Daily Digest")
 check("collect: exclude-tag is an exact tag match, not a prefix "
       "('news' leaves 'news/tech' alone)",
-      len(dg.collect(24, None, 1000, exclude_tag="news")), 3)
+      len(dg.collect(24, [], [], 1000, exclude_tag="news")), 3)
 
 long_art = [{"f": 1, "a": NOW, "t": "Long", "l": "", "c": "x" * 5000}]
 ARTS_SAVE = ARTS
 ARTS = long_art
 check("collect: article text truncated",
-      len(dg.collect(24, None, 1000)[0]["text"]), dg.MAX_ARTICLE_CHARS)
+      len(dg.collect(24, [], [], 1000)[0]["text"]), dg.MAX_ARTICLE_CHARS)
 ARTS = ARTS_SAVE
 
 # --- collect: paging back to the cutoff -----------------------------------
@@ -130,7 +166,7 @@ def paged_run_json(cmd):
 
 dg.run_json = paged_run_json
 calls.clear()
-paged = dg.collect(24, None, 1000)
+paged = dg.collect(24, [], [], 1000)
 check("collect: keeps paging past a page boundary inside the window", len(paged), 2)
 check("collect: pages with the returned cursor",
       [c[c.index("-b") + 1] for c in calls if "-b" in c], ["900"])
@@ -141,13 +177,13 @@ check("collect: stops paging at the first article past the cutoff",
 EXHAUSTED = {None: {"articles": ARTS[:1]}}
 PAGES_SAVE = PAGES
 PAGES = EXHAUSTED
-check("collect: an exhausted store ends collection", len(dg.collect(24, None, 1000)), 1)
+check("collect: an exhausted store ends collection", len(dg.collect(24, [], [], 1000)), 1)
 PAGES = PAGES_SAVE
 
 # hitting --limit before the window is covered is an error, never a quiet
 # partial digest
 check_raises("collect: --limit reached mid-window aborts the run",
-             lambda: dg.collect(24, None, 1), "--limit 1 reached")
+             lambda: dg.collect(24, [], [], 1), "--limit 1 reached")
 
 
 def stuck_run_json(cmd):
@@ -159,7 +195,7 @@ def stuck_run_json(cmd):
 dg.run_json = stuck_run_json
 check_raises("collect: a cursor that never advances stops the loop, "
              "rather than paging the store forever",
-             lambda: dg.collect(24, None, 1000), "same cursor twice")
+             lambda: dg.collect(24, [], [], 1000), "same cursor twice")
 dg.run_json = fake_run_json
 
 # --- filter_notes ---------------------------------------------------------

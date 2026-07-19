@@ -14,7 +14,7 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -93,9 +93,9 @@ windows = []
 real_collect = dg.collect
 
 
-def spy_collect(hours, tag, limit, exclude_tag=dg.DEFAULT_EXCLUDE_TAG):
+def spy_collect(hours, tags, feed_ids, limit, exclude_tag=dg.DEFAULT_EXCLUDE_TAG):
     windows.append(hours)
-    return real_collect(hours, tag, limit, exclude_tag)
+    return real_collect(hours, tags, feed_ids, limit, exclude_tag)
 
 
 dg.run_json = fake_run_json
@@ -130,6 +130,49 @@ check("--dump: never calls claude", claude_calls, [])
 check("--dump: never publishes", pushed, [])
 check("--dump: never reads the feed back", fetched, [])
 check("--dump: plain default window, no gap arithmetic", windows, [dg.DEFAULT_HOURS])
+
+# --- selection flags --------------------------------------------------------
+p = dg.build_parser()
+check("selection: --tag defaults to no filter", p.parse_args([]).tag, [])
+check("selection: --feed defaults to no filter", p.parse_args([]).feed, [])
+check("selection: --tag is repeatable and comma-splittable",
+      p.parse_args(["--tag", "a", "--tag", "b,c"]).tag, ["a", "b", "c"])
+check("selection: --feed is repeatable, comma-splittable, and numeric",
+      p.parse_args(["--feed", "3", "--feed", "4,5"]).feed, [3, 4, 5])
+
+
+def check_parse_fails(name, argv):
+    """argparse rejections exit(2) before main() ever runs; usage noise on
+    stderr is swallowed so the suite output stays one line per check."""
+    try:
+        with open(os.devnull, "w") as null, redirect_stderr(null):
+            dg.build_parser().parse_args(argv)
+    except SystemExit:
+        check_true(name, True)
+        return
+    check_true(name, False, "argparse accepted it")
+
+
+check_parse_fails("selection: a non-numeric --feed is refused at parse time",
+                  ["--feed", "nasa"])
+check_parse_fails("selection: an empty --tag token is refused at parse time "
+                  "(it would silently select nothing, i.e. widen the digest)",
+                  ["--tag", "a,,b"])
+check_parse_fails("selection: an empty --feed token is refused at parse time",
+                  ["--feed", ""])
+
+# end-to-end: the single-tag form the /srr-digest skill uses keeps working
+reset()
+out = run(["--dump", "--tag", "news"])
+check("selection: --dump --tag <one tag> still collects (back-compat)",
+      json.loads(out),
+      [{"feed": "Tech News", "title": "Story", "link": "http://e/1", "text": "body"}])
+
+reset()
+check_exits("selection: an unknown tag aborts with a clear error",
+            ["--dump", "--tag", "nope"], "unknown tag 'nope'")
+check("selection: the unknown tag cost no claude call", claude_calls, [])
+check("selection: ...and pushed nothing", pushed, [])
 
 # --- --dry-run ------------------------------------------------------------
 reset()

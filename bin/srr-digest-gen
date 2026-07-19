@@ -287,8 +287,14 @@ def run_json(cmd):
         raise DigestError(f"{' '.join(cmd)}: unparsable JSON ({e}): {out[:200]!r}")
 
 
-def collect(hours, tag, limit, exclude_tag=DEFAULT_EXCLUDE_TAG):
+def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG):
     """Every article fetched in the last `hours`, newest first.
+
+    `tags` and `feed_ids` restrict collection to the union the backend builds
+    from `-g`/`-i` (a feed is in when its id is listed or its tag matches);
+    both empty collects every feed. The selection is validated against
+    `srr feed ls` first: a typo'd tag would otherwise collect an empty window
+    and the empty-window error would blame the fetch loop.
 
     The window is `--since`, so the backend does the filtering, but a page is
     still a page: this walks next_cursor until the store runs out. The
@@ -304,14 +310,27 @@ def collect(hours, tag, limit, exclude_tag=DEFAULT_EXCLUDE_TAG):
     at the start, could not see that happen.
     """
     feeds = {f["id"]: f for f in run_json(["srr", "feed", "ls"])}
+    known_tags = {f["tag"] for f in feeds.values() if f.get("tag")}
+    for tag in tags:
+        if tag not in known_tags:
+            raise DigestError(
+                f"unknown tag {tag!r}; srr feed ls knows: "
+                f"{', '.join(sorted(known_tags)) or '(no tags at all)'}")
+    for fid in feed_ids:
+        if fid not in feeds:
+            raise DigestError(
+                f"unknown feed id {fid}; srr feed ls knows: "
+                f"{', '.join(str(i) for i in sorted(feeds))}")
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     cutoff = since.timestamp()
     result, cursor, covered = [], None, False
     while not covered:
         cmd = ["srr", "art", "ls", "-l", str(PAGE_SIZE),
                "--since", since.strftime("%Y-%m-%dT%H:%M:%SZ")]
-        if tag:
+        for tag in tags:
             cmd += ["-g", tag]
+        for fid in feed_ids:
+            cmd += ["-i", str(fid)]
         if cursor is not None:
             cmd += ["-b", str(cursor)]
         resp = run_json(cmd)
@@ -694,6 +713,27 @@ def window_hours(history, max_hours):
     return hours
 
 
+def tag_list(value):
+    # One --tag value -> tags. Empty tokens are refused, not dropped: a token
+    # that selects nothing would silently widen the digest.
+    tags = [t.strip() for t in value.split(",")]
+    if any(not t for t in tags):
+        raise argparse.ArgumentTypeError(f"empty tag in {value!r}")
+    return tags
+
+
+def feed_id_list(value):
+    ids = []
+    for t in value.split(","):
+        try:
+            ids.append(int(t))
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"feed id {t.strip()!r} is not an integer "
+                f"(srr feed ls prints the ids)")
+    return ids
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -706,13 +746,21 @@ def build_parser():
     ap.add_argument("--max-hours", type=int, default=DEFAULT_MAX_HOURS,
                     help="ceiling on the computed window (default %(default)s); "
                          "after a longer outage the missing days stay missing")
-    ap.add_argument("--tag", help="restrict collection to one tag (srr art ls -g)")
+    ap.add_argument("--tag", type=tag_list, action="extend", default=[],
+                    help="restrict collection to feeds carrying one of these "
+                         "tags (repeatable and comma-splittable; unions with "
+                         "--feed; srr art ls -g)")
+    ap.add_argument("--feed", type=feed_id_list, action="extend", default=[],
+                    help="restrict collection to these feed IDs, as printed "
+                         "by srr feed ls (repeatable and comma-splittable; "
+                         "unions with --tag; srr art ls -i)")
     ap.add_argument("--limit", type=int, default=5000,
                     help="safety cap on articles collected (default 5000); "
                          "hitting it before the window is covered is an error, "
                          "never a silent partial digest")
     ap.add_argument("--exclude-tag", default=DEFAULT_EXCLUDE_TAG,
-                    help="tag never collected (default %(default)r — never digest "
+                    help="tag never collected, even when its feed is selected "
+                         "by --tag/--feed (default %(default)r — never digest "
                          "the digest); empty collects everything")
     ap.add_argument("--name", default=DEFAULT_NAME,
                     help="syndication feed read back and pushed to (default %(default)r)")
@@ -763,7 +811,7 @@ def generate(args):
     # path keeps working against a backend without `srr syndicate`.
     if args.dump:
         hours = DEFAULT_HOURS if args.hours is None else args.hours
-        articles = collect(hours, args.tag, args.limit, args.exclude_tag)
+        articles = collect(hours, args.tag, args.feed, args.limit, args.exclude_tag)
         json.dump(articles, sys.stdout, ensure_ascii=False, indent=1)
         print()
         return
@@ -786,7 +834,7 @@ def generate(args):
 
     hours = (window_hours(history, args.max_hours)
              if args.hours is None else args.hours)
-    articles = collect(hours, args.tag, args.limit, args.exclude_tag)
+    articles = collect(hours, args.tag, args.feed, args.limit, args.exclude_tag)
     if not articles:
         if not args.allow_empty:
             raise DigestError(
