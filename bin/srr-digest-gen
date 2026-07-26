@@ -1,7 +1,7 @@
 #!/usr/bin/env srr-uvrun
 """srr-digest-gen — daily Claude-written digest of the SRR store.
 
-Collects the articles fetched in the last N hours via `srr art ls` and has
+Collects the articles fetched in the last N hours via `srr art` and has
 `claude -p` (headless, all tools disabled) write an editorial digest. A quiet
 day fits one call; a busy day goes map-reduce — chunks of full-text articles
 are condensed into relevance-scored plain-text story notes by one claude call
@@ -59,7 +59,7 @@ from zoneinfo import ZoneInfo
 DEFAULT_NAME = "digest"
 DEFAULT_EXCLUDE_TAG = "digest"  # never digest the digest
 GUID_PREFIX = "srr-digest-"  # + the entry date. The dedup key SRR stores: never change it
-PAGE_SIZE = 500  # articles per `srr art ls` request while paging back to the cutoff
+PAGE_SIZE = 500  # articles per `srr art` request while paging back to the cutoff
 DEFAULT_HOURS = 24  # window with nothing published to measure the gap from, and its floor
 DEFAULT_MAX_HOURS = 72  # ... and its ceiling: a long outage is not worth one giant edition
 MAX_ARTICLE_CHARS = 1500
@@ -293,7 +293,7 @@ DURATION_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
 def parse_time_bound(s, now, flag="--since"):
-    """A --since/--until value, in the forms `srr art ls` takes: a duration
+    """A --since/--until value, in the forms `srr art` takes: a duration
     before `now` (24h, 7d, 2w, compounds like 1d12h), a bare date (local
     midnight, as the backend reads it), or an RFC3339 instant. Resolved
     against the caller's `now` rather than reading the clock here, so the
@@ -330,7 +330,7 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
     An explicit `since` (an aware datetime the caller pinned once) replaces
     the hours-derived instant as both the backend window and the belt below;
     `until` closes the window's top the same way (inclusive, belted too);
-    `before` seeds the first page's cursor (srr art ls -b, exclusive), and
+    `before` seeds the first page's cursor (srr art -b, exclusive), and
     paging continues downward from there.
 
     `tags` and `feed_ids` restrict collection to the union the backend builds
@@ -375,7 +375,7 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
     cutoff = since.timestamp()
     result, cursor, covered = [], before, False
     while not covered:
-        cmd = ["srr", "art", "ls", "-l", str(PAGE_SIZE),
+        cmd = ["srr", "art", "-l", str(PAGE_SIZE),
                "--since", since.strftime("%Y-%m-%dT%H:%M:%SZ")]
         if until is not None:
             cmd += ["--until", until.strftime("%Y-%m-%dT%H:%M:%SZ")]
@@ -426,7 +426,7 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
         elif cursor == prev:
             # A cursor that does not advance would page this loop forever
             # against the store. Stop and say so rather than hammer it.
-            raise DigestError(f"srr art ls returned the same cursor twice ({cursor}); "
+            raise DigestError(f"srr art returned the same cursor twice ({cursor}); "
                               f"stopping rather than paging forever")
     return result
 
@@ -860,7 +860,7 @@ def build_parser():
                          "after a longer outage the missing days stay missing")
     ap.add_argument("--since",
                     help="collect from this time instead of --hours/the gap — "
-                         "the forms srr art ls --since takes: a duration "
+                         "the forms srr art --since takes: a duration "
                          "before now (24h, 7d, 2w), a date (2026-07-15), or "
                          "an RFC3339 instant; resolved once so pages cannot "
                          "creep")
@@ -870,16 +870,16 @@ def build_parser():
                          "--hours (or the flat %d) ending there" % DEFAULT_HOURS)
     ap.add_argument("--before", type=int,
                     help="collect only articles below this article id "
-                         "(exclusive), srr art ls -b; paging continues "
+                         "(exclusive), srr art -b; paging continues "
                          "downward from there")
     ap.add_argument("--tag", type=tag_list, action="extend", default=[],
                     help="restrict collection to feeds carrying one of these "
                          "tags (repeatable and comma-splittable; unions with "
-                         "--feed; srr art ls -g)")
+                         "--feed; srr art -g)")
     ap.add_argument("--feed", type=feed_id_list, action="extend", default=[],
                     help="restrict collection to these feed IDs, as printed "
                          "by srr feed ls (repeatable and comma-splittable; "
-                         "unions with --tag; srr art ls -i)")
+                         "unions with --tag; srr art -i)")
     ap.add_argument("--limit", type=int, default=5000,
                     help="safety cap on articles collected (default 5000); "
                          "hitting it before the window is covered is an error, "

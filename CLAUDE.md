@@ -65,7 +65,7 @@ script also maps CLI parameters onto the *same* request dict for manual testing 
 keep the two entry paths building identical requests.
 
 **Store tools drive the CLI, never the store** (`srr-digest-gen`): they read through
-`srr feed ls` / `srr art ls` / `srr syndicate fetch <name>` and write through
+`srr feed ls` / `srr art` / `srr syndicate fetch <name>` and write through
 `srr syndicate push <name> -`. The store's location, endpoint and credentials are the
 backend's business — a script here must never open `srr.yaml`, sign an S3 request, or
 learn a bucket key. Whatever the deployment still needs to say (public feed URL,

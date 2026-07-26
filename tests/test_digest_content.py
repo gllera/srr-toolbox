@@ -55,7 +55,7 @@ FEEDS = [
     {"id": 2, "title": "Daily Digest", "tag": "digest"},
     {"id": 3, "title": "Untagged"},
 ]
-ARTS = [  # newest first, as `srr art ls` returns them
+ARTS = [  # newest first, as `srr art` returns them
     {"f": 1, "a": NOW - 60, "t": "Fresh story", "l": "http://e/1",
      "c": "<p>Body <b>text</b>\n  here</p>"},
     {"f": 2, "a": NOW - 120, "t": "Yesterday's digest", "l": "", "c": "<p>self</p>"},
@@ -85,27 +85,27 @@ check("collect: link kept", got[0]["link"], "http://e/1")
 check("collect: blank title falls back to the body", got[1]["title"], "untitled body")
 
 check("collect: the window is the backend's --since, a page at a time",
-      calls[1][:5], ["srr", "art", "ls", "-l", str(dg.PAGE_SIZE)])
+      calls[1][:4], ["srr", "art", "-l", str(dg.PAGE_SIZE)])
 check_true("collect: --since is an instant, not a duration that creeps "
            "forward from page to page",
-           abs(datetime.strptime(calls[1][6], "%Y-%m-%dT%H:%M:%SZ")
+           abs(datetime.strptime(calls[1][5], "%Y-%m-%dT%H:%M:%SZ")
                .replace(tzinfo=timezone.utc).timestamp()
                - (time.time() - 24 * 3600)) < 60)
 calls.clear()
 dg.collect(24, ["news/tech"], [], 5)
-check("collect: --tag reaches srr art ls", calls[1][7:], ["-g", "news/tech"])
+check("collect: --tag reaches srr art", calls[1][6:], ["-g", "news/tech"])
 calls.clear()
 dg.collect(24, ["news/tech", "digest"], [], 5)
 check("collect: several tags become repeated -g flags",
-      calls[1][7:], ["-g", "news/tech", "-g", "digest"])
+      calls[1][6:], ["-g", "news/tech", "-g", "digest"])
 calls.clear()
 dg.collect(24, [], [1, 3], 5)
 check("collect: feed ids become repeated -i flags",
-      calls[1][7:], ["-i", "1", "-i", "3"])
+      calls[1][6:], ["-i", "1", "-i", "3"])
 calls.clear()
 dg.collect(24, ["digest"], [3], 5)
 check("collect: tags and feeds ride one query — the backend unions them",
-      calls[1][7:], ["-g", "digest", "-i", "3"])
+      calls[1][6:], ["-g", "digest", "-i", "3"])
 
 # a typo'd selection must be a clear error, not an empty window that the
 # empty-window check then blames on the fetch loop
@@ -154,7 +154,7 @@ check("collect: the blank-title fallback reads the uncapped text, not the "
       dg.collect(24, [], [], 1000, max_chars=2)[0]["title"], "x" * 80)
 ARTS = ARTS_SAVE
 
-# --- parse_time_bound: the forms `srr art ls --since` takes ----------------
+# --- parse_time_bound: the forms `srr art --since` takes ----------------
 T0 = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
 check("parse_time_bound: hours duration", dg.parse_time_bound("24h", T0),
       T0 - timedelta(hours=24))
@@ -181,12 +181,12 @@ calls.clear()
 pinned = datetime.fromtimestamp(NOW - 3600, timezone.utc)
 dg.collect(24, [], [], 1000, since=pinned)
 check("collect: an explicit since instant is sent verbatim, not recomputed",
-      calls[1][6], pinned.strftime("%Y-%m-%dT%H:%M:%SZ"))
+      calls[1][5], pinned.strftime("%Y-%m-%dT%H:%M:%SZ"))
 calls.clear()
 dg.collect(24, [], [], 1000,
            since=datetime.fromtimestamp(NOW - 3600, timezone(timedelta(hours=2))))
 check("collect: a non-UTC since is normalized before the Z-suffixed strftime",
-      calls[1][6], pinned.strftime("%Y-%m-%dT%H:%M:%SZ"))
+      calls[1][5], pinned.strftime("%Y-%m-%dT%H:%M:%SZ"))
 check("collect: the explicit since drives the client-side belt too",
       [a["feed"] for a in dg.collect(
           24, [], [], 1000,
@@ -194,15 +194,15 @@ check("collect: the explicit since drives the client-side belt too",
       ["Tech News"])
 calls.clear()
 dg.collect(24, [], [], 1000, before=77)
-check("collect: --before seeds the first page's cursor (srr art ls -b)",
-      calls[1][7:], ["-b", "77"])
+check("collect: --before seeds the first page's cursor (srr art -b)",
+      calls[1][6:], ["-b", "77"])
 
 until = datetime.fromtimestamp(NOW - 100, timezone(timedelta(hours=2)))
 until_wire = until.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 calls.clear()
 dg.collect(24, [], [], 1000, until=until)
 check("collect: an explicit until rides every page, normalized to UTC",
-      calls[1][7:], ["--until", until_wire])
+      calls[1][6:], ["--until", until_wire])
 check("collect: ...and belts the top of the window (skip, not stop: "
       "older articles still count)",
       [a["feed"] for a in dg.collect(24, [], [], 1000, until=until)],
@@ -233,7 +233,7 @@ check("collect: keeps paging past a page boundary inside the window", len(paged)
 check("collect: pages with the returned cursor",
       [c[c.index("-b") + 1] for c in calls if "-b" in c], ["900"])
 check("collect: stops paging at the first article past the cutoff",
-      len([c for c in calls if c[:3] == ["srr", "art", "ls"]]), 2)
+      len([c for c in calls if c[:2] == ["srr", "art"]]), 2)
 
 # store exhausted before the window is: no cursor, no error, no infinite loop
 EXHAUSTED = {None: {"articles": ARTS[:1]}}

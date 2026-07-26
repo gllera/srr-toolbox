@@ -164,7 +164,7 @@ call the CLI.
 
 ### `srr-digest-gen`
 
-Reads the last N hours of articles out of the store (`srr feed ls` + `srr art ls`),
+Reads the last N hours of articles out of the store (`srr feed ls` + `srr art`),
 has `claude -p` write an editorial digest of them, and hands the resulting rolling
 14-day RSS feed back to `srr syndicate push`, which writes it into the store as
 `out/<name>.rss`. Subscribe the store to that feed's public URL and the digest shows up in
@@ -214,7 +214,7 @@ push refused — aborts *before* the store is touched and prints the reason, nev
 traceback. Yesterday's feed stays published, and SRR sees unchanged GUIDs and no-ops.
 Four deliberate refusals to guess:
 
-- **The window is covered or the run fails.** `srr art ls` returns a page at a time,
+- **The window is covered or the run fails.** `srr art` returns a page at a time,
   so collection pages back until it sees an article older than the window. `--limit`
   is a safety cap, and hitting it before the window is covered is an error — a digest
   that silently omits half its day is worse than no digest.
