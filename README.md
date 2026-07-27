@@ -206,8 +206,10 @@ Deployment knowledge is all flags, none of it baked in: `--name` (syndication fe
 name), `--link` (the feed's public URL, for the RSS channel's `<link>` — omitted, no
 `<link>` is emitted; the items deliberately get none, or every digest in the
 reader would open the raw feed file), `--tz` (which day an entry is dated, default the machine's),
-`--exclude-tag` (default `digest`, so the digest never digests itself). Run it from a
-timer for a daily edition.
+`--exclude-tag` (default `digest`, so the digest never digests itself), `--lang` (the
+language the digest is written in, default `English` — free-form, anything that names
+a language to claude; the whole edition follows it, `Top:`/`Also:` labels included).
+Run it from a timer for a daily edition.
 
 Failure discipline: any error — store unreachable, claude failure, non-HTML output,
 push refused — aborts *before* the store is touched and prints the reason, never a
@@ -224,7 +226,8 @@ Four deliberate refusals to guess:
 - **An empty window is an error**, not a quiet day. With feeds that work, "no articles
   at all in the last 24 h" means the fetch loop is broken — exiting 0 would hide that
   for as long as it takes someone to notice a stale feed. `--allow-empty` opts out.
-- **The output has to be shaped like a digest** — the `Top:` opener and at least three
+- **The output has to be shaped like a digest** — the `<p><strong>` opener paragraph
+  (the check is structural, since the labels follow `--lang`) and at least three
   paragraphs. The input is untrusted text, so the likeliest bad day is a refusal or an
   error page, and `<p>I can't help with that…</p>` clears any mere length floor. Same
   gate on the map phase: notes that contain no `* ` lines are not notes.

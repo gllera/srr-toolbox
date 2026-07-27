@@ -429,6 +429,37 @@ check("--max-chunks: refused before any claude call", claude_calls, [])
 dg.run_claude = fake_run_claude
 ARTS = [{"f": 1, "a": NOW - 60, "t": "Story", "l": "http://e/1", "c": "<p>body</p>"}]
 
+# --- --lang ---------------------------------------------------------------
+reset()
+run([])
+check_true("default: the prompt asks for English",
+           "write the digest in English" in claude_calls[0][0], claude_calls[0][0][:300])
+check("default --lang", dg.build_parser().parse_args([]).lang, dg.DEFAULT_LANG)
+reset()
+run(["--lang", "Español"])
+check_true("--lang rides the digest prompt",
+           "write the digest in Español" in claude_calls[0][0], claude_calls[0][0][:300])
+check_true("--lang rides the format rules (labels included)",
+           "Write the whole digest in Español" in claude_calls[0][0],
+           claude_calls[0][0][:300])
+# ... and the map-reduce path: notes and reduce both in the asked language
+reset()
+ARTS = [{"f": 1, "a": NOW - 60, "t": "S%d" % i, "l": "", "c": big}
+        for i in range(dg.SINGLE_PASS_CHARS // dg.MAX_ARTICLE_CHARS + 2)]
+dg.run_claude = fake_map_claude
+try:
+    run(["--lang", "Español"])
+except SystemExit:  # the reduce output is notes, not html — expected here
+    pass
+check_true("map-reduce: --lang rides every map prompt",
+           all("write the notes in Español" in p for p, _ in claude_calls[:-2])
+           and len(claude_calls) > 2, len(claude_calls))
+check_true("map-reduce: --lang rides the reduce prompt",
+           "Write the digest in Español" in claude_calls[-1][0],
+           claude_calls[-1][0][:300])
+dg.run_claude = fake_run_claude
+ARTS = [{"f": 1, "a": NOW - 60, "t": "Story", "l": "http://e/1", "c": "<p>body</p>"}]
+
 # --- failure discipline ---------------------------------------------------
 reset()
 

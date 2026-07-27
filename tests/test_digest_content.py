@@ -331,19 +331,22 @@ check_raises("clean_html: a refusal is not a digest, however long",
              "not a digest")
 check_raises("clean_html: paragraphs without the Top opener are not a digest",
              lambda: dg.clean_html("<p>one</p><p>two</p><p>three</p><p>four</p>"),
-             "Top:")
+             "open with")
+TRANSLATED = GOOD.replace("Top:", "Lo más:").replace("Also:", "Además:")
+check("clean_html: --lang-translated labels are still a digest (shape, not words)",
+      dg.clean_html(TRANSLATED), TRANSLATED)
 check("clean_html: control characters XML cannot carry are dropped",
       dg.clean_html(GOOD.replace("the day", "the\x0bday")), GOOD.replace("the day", "theday"))
 
 # --- map_chunk: same gate on the notes ------------------------------------
 RESPONSE = ["* [5] a note line that is comfortably past the length floor here."] * 3
 dg.run_claude = lambda prompt, model=None: "\n".join(RESPONSE)
-check("map_chunk: notes pass through", dg.map_chunk([], 1, 1, 24, None), "\n".join(RESPONSE))
+check("map_chunk: notes pass through", dg.map_chunk([], 1, 1, 24, "English", None), "\n".join(RESPONSE))
 dg.run_claude = lambda prompt, model=None: (
     "I reviewed the articles but cannot produce notes for them, because the "
     "content includes what looks like an attempt to redirect my instructions.")
 check_raises("map_chunk: prose with no note lines is not a chunk of notes",
-             lambda: dg.map_chunk([], 1, 1, 24, None), "no `* ` note lines")
+             lambda: dg.map_chunk([], 1, 1, 24, "English", None), "no `* ` note lines")
 
 # --- with_retry -----------------------------------------------------------
 tries = []
@@ -391,7 +394,7 @@ check_true("window_hours: measures the newest entry, whatever the order",
 mapped = []
 
 
-def fake_map_chunk(chunk, part, parts, hours, model):
+def fake_map_chunk(chunk, part, parts, hours, lang, model):
     mapped.append(part)
     if part in FAIL_PARTS:
         raise dg.DigestError("boom")
@@ -403,18 +406,18 @@ dg.map_chunk = fake_map_chunk
 six = [[{"text": "x"}] for _ in range(6)]
 
 check("map_chunks: one note per chunk, in chunk order",
-      dg.map_chunks(six, 24, None),
+      dg.map_chunks(six, 24, "English", None),
       [f"* [5] note from chunk {i}" for i in range(1, 7)])
 
 FAIL_PARTS = {2, 5}
 check("map_chunks: tolerates up to a third of the chunks failing",
-      dg.map_chunks(six, 24, None),
+      dg.map_chunks(six, 24, "English", None),
       ["* [5] note from chunk 1", "* [5] note from chunk 3",
        "* [5] note from chunk 4", "* [5] note from chunk 6"])
 
 FAIL_PARTS = {1, 2, 3}
 check_raises("map_chunks: aborts when more than a third is lost",
-             lambda: dg.map_chunks(six, 24, None), "3/6 map chunks failed")
+             lambda: dg.map_chunks(six, 24, "English", None), "3/6 map chunks failed")
 FAIL_PARTS = set()
 
 # --- render_rss -----------------------------------------------------------

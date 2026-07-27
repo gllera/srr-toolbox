@@ -71,6 +71,7 @@ REDUCE_CHARS = 150_000  # notes the reduce call may receive (see filter_notes)
 MIN_RELEVANCE = 3  # map notes scored below this never reach the reduce call
 MAX_RELEVANCE = 5  # ... and the highest the budget may push that floor to
 DEFAULT_MAP_MODEL = "sonnet"  # condense+score is mechanical; the editorial reduce keeps the default model
+DEFAULT_LANG = "English"  # language the digest (and the map notes) are written in
 KEEP_DAYS = 14
 CLAUDE_TIMEOUT = 900  # seconds per claude call
 CLAUDE_ATTEMPTS = 2  # for the calls whose loss costs the whole run (see with_retry)
@@ -99,13 +100,16 @@ never the article's clickbait title. Prioritize significance over recency; \
 skip promotional/deal spam unless genuinely notable. Be selective: the \
 digest is the day's most relevant stories, not an inventory — at most ~15 \
 section stories and ~10 Also lines; silently ignore everything that doesn't \
-merit even an Also line. Output ONLY the HTML fragment — no markdown, no \
-code fences, no preamble."""
+merit even an Also line. Write the whole digest in {lang} — the prose, the \
+headlines, and the Top:/Also: labels themselves (translate the labels \
+naturally). Output ONLY the HTML fragment — no markdown, no code fences, no \
+preamble."""
 
 PROMPT = """\
 You are writing the daily digest for a personal RSS reader. Below is a JSON \
 list of the articles fetched from the subscribed feeds in the last {hours} \
-hours (many are Spanish; write the digest in English).
+hours (the articles come in whatever languages the feeds use; write the \
+digest in {lang}).
 
 """ + FORMAT_RULES + """
 
@@ -117,7 +121,8 @@ MAP_PROMPT = """\
 You are preparing notes for the daily digest of a personal RSS reader. Below \
 is a JSON list of articles fetched from the subscribed feeds in the last \
 {hours} hours — chunk {part} of {parts}; an editor merges all chunks' notes \
-into the final digest (many articles are Spanish; write the notes in English).
+into the final digest (the articles come in whatever languages the feeds \
+use; write the notes in {lang}).
 
 Condense every newsworthy item into one plain-text line:
 * [R] Claim of what actually happened — the concrete facts, numbers, names, \
@@ -152,7 +157,7 @@ repeats (repetition across chunks is itself a relevance signal). Each note \
 starts with a relevance score [1-5], higher = more important; the lowest \
 tiers were already filtered out. Scores 5-4 belong in the topic sections, \
 3s at most in the Also tail — and never show the scores in the output. \
-Many sources are Spanish; write the digest in English.
+Write the digest in {lang}.
 
 """ + FORMAT_RULES + """
 
@@ -485,10 +490,12 @@ def clean_html(out):
         out = stripped
     # The prompt dictates the shape, so check it: an apology or an error page
     # ("<p>I can't help with that…</p>") clears any mere length floor, and a
-    # published refusal is worse than a failed run.
+    # published refusal is worse than a failed run. Structural, not literal:
+    # the Top:/Also: labels follow --lang, so the opener's shape is the one
+    # thing every language's digest shares.
     problems = []
-    if "Top:" not in out:
-        problems.append("no <strong>Top:</strong> opener")
+    if not re.match(r"<p>\s*<strong>", out):
+        problems.append("does not open with the <p><strong> Top paragraph")
     if out.count("<p") < MIN_DIGEST_PARAS:
         problems.append(f"{out.count('<p')} paragraphs, want >= {MIN_DIGEST_PARAS}")
     if problems:
@@ -581,12 +588,13 @@ def chunk_articles(articles):
     return chunks
 
 
-def map_chunk(chunk, part, parts, hours, model):
+def map_chunk(chunk, part, parts, hours, lang, model):
     out = run_claude(
         MAP_PROMPT.format(
             hours=hours,
             part=part,
             parts=parts,
+            lang=lang,
             articles=json.dumps(chunk, ensure_ascii=False),
         ),
         model=model,
@@ -599,7 +607,7 @@ def map_chunk(chunk, part, parts, hours, model):
     return out
 
 
-def map_chunks(chunks, hours, model):
+def map_chunks(chunks, hours, lang, model):
     """Condense every chunk, MAP_WORKERS at a time, keeping chunk order.
 
     A chunk that fails is dropped rather than sacrificing the whole day's
@@ -610,7 +618,7 @@ def map_chunks(chunks, hours, model):
     ex = ThreadPoolExecutor(max_workers=MAP_WORKERS)
     try:
         futures = {
-            ex.submit(map_chunk, c, i + 1, len(chunks), hours, model): i
+            ex.submit(map_chunk, c, i + 1, len(chunks), hours, lang, model): i
             for i, c in enumerate(chunks)
         }
         pending = set(futures)
@@ -644,12 +652,13 @@ def map_chunks(chunks, hours, model):
     return [n for n in notes if n is not None]
 
 
-def summarize(articles, hours, model=None, map_model=DEFAULT_MAP_MODEL,
-              max_chunks=DEFAULT_MAX_CHUNKS):
+def summarize(articles, hours, lang=DEFAULT_LANG, model=None,
+              map_model=DEFAULT_MAP_MODEL, max_chunks=DEFAULT_MAX_CHUNKS):
     total = sum(payload_size(a) for a in articles)
     if total <= SINGLE_PASS_CHARS:
         log(f"single pass: {len(articles)} articles, {total} payload chars")
-        prompt = PROMPT.format(hours=hours, articles=json.dumps(articles, ensure_ascii=False))
+        prompt = PROMPT.format(hours=hours, lang=lang,
+                               articles=json.dumps(articles, ensure_ascii=False))
         return with_retry("single-pass digest",
                           lambda: clean_html(run_claude(prompt, model=model)))
     chunks = chunk_articles(articles)
@@ -663,9 +672,9 @@ def summarize(articles, hours, model=None, map_model=DEFAULT_MAP_MODEL,
             f"refusing to spend that unasked. Shorten --hours (or --max-hours), "
             f"or raise --max-chunks."
         )
-    kept = filter_notes(map_chunks(chunks, hours, map_model))
+    kept = filter_notes(map_chunks(chunks, hours, lang, map_model))
     log(f"reduce: {len(kept)} note chars")
-    reduce_prompt = REDUCE_PROMPT.format(hours=hours, notes=kept)
+    reduce_prompt = REDUCE_PROMPT.format(hours=hours, lang=lang, notes=kept)
     return with_retry("reduce", lambda: clean_html(run_claude(reduce_prompt, model=model)))
 
 
@@ -911,6 +920,10 @@ def build_parser():
                     help="replace today's entry if the feed already has one "
                          "(SRR has likely ingested that GUID already and will "
                          "not re-read it, so readers keep the first version)")
+    ap.add_argument("--lang", default=DEFAULT_LANG,
+                    help="language the digest is written in (default "
+                         "%(default)r); free-form — anything that names a "
+                         "language to claude (Spanish, es, Deutsch)")
     ap.add_argument("--model", help="model writing the digest (default: the claude CLI's)")
     ap.add_argument("--map-model", default=DEFAULT_MAP_MODEL,
                     help="model condensing+scoring the map chunks (default %(default)r)")
@@ -999,8 +1012,8 @@ def generate(args):
         print("no articles in window; leaving published digest untouched")
         return
 
-    digest = summarize(articles, hours, model=args.model, map_model=args.map_model,
-                       max_chunks=args.max_chunks)
+    digest = summarize(articles, hours, lang=args.lang, model=args.model,
+                       map_model=args.map_model, max_chunks=args.max_chunks)
     entry = {
         "date": date,
         "ts": int(now.timestamp()),
