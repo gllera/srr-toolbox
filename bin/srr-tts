@@ -55,27 +55,32 @@ KNOBS
 -----
   --voice <name>            explicit piper voice (wins over everything)
   --lang-voice xx=voice     extend/override the language->voice table (repeatable)
-  --max-chars <n>           narration cap, default 3000; truncated at a
-                            sentence boundary. This bound is a SAFETY limit,
-                            not a preference: srr drops an item whose pipe
-                            step exits non-zero or times out, and keeps its
-                            guid in BoundaryGUIDs, so a --cmd-timeout kill
-                            loses the article permanently (never retried).
-                            Measured (piper medium voice, Latin prose): ~1000
-                            chars per MINUTE of speech (~17 chars/s) and
-                            ~2.6 MB of WAV per 1000 chars, so 3000 chars is
-                            ~3 min of audio / ~7.8 MB. End-to-end on a 4-core
-                            ARM64 box (the class that runs the fetch loop):
-                            41s synthesis + 2s model load, plus a one-off 60
-                            MB voice download on first use (1.5s there, but
-                            it rides the SAME --cmd-timeout, so on a slow
-                            link pre-warm the voice with a manual run before
-                            opting a feed in). ~45s against the 5m default.
-                            Note the cap counts CHARACTERS: the ratios above
-                            are Latin-script; a CJK voice packs far more
-                            speech per character, so re-measure before
-                            reusing this default there. 0 disables the cap:
-                            only do that on a feed whose length you know.
+  --max-chars <n>           narration cap, truncated at a sentence boundary;
+                            0 disables it. The default (32768) is a backstop
+                            real articles stay under (a full daily digest is
+                            ~8k chars), bounding the damage of a pathological
+                            one — NOT a guarantee against srr's timeout: srr
+                            drops an item whose pipe step exits non-zero or
+                            times out, and keeps its guid in BoundaryGUIDs,
+                            so a --cmd-timeout kill loses the article
+                            permanently (never retried). Measured (piper
+                            medium voice, Latin prose): ~1000 chars per
+                            MINUTE of speech (~17 chars/s), ~2.6 MB of WAV
+                            per 1000 chars, and ~41s synthesis per 3000
+                            chars + 2s model load on a 4-core ARM64 box (the
+                            class that runs the fetch loop) — so an article
+                            FILLING the default cap is ~33 min of audio /
+                            ~85 MB / ~7.5 min of synthesis, past the default
+                            5m --cmd-timeout. A feed that can genuinely hit
+                            the cap needs a smaller one (~18000 fits the 5m
+                            timeout with margin) or a raised --cmd-timeout.
+                            First use also downloads the ~60 MB voice model
+                            inside the SAME timeout (1.5s on a fast link; on
+                            a slow one pre-warm the voice with a manual run
+                            before opting a feed in). The cap counts
+                            CHARACTERS and the ratios above are Latin-script:
+                            a CJK voice packs far more speech per character,
+                            so re-measure before sizing a cap there.
   --voices-dir <dir>        piper models dir (default $XDG_DATA_HOME else
                             ~/.local/share, + /srr-tts); models auto-download
                             there on first use. Deliberately OUTSIDE srr's
@@ -108,9 +113,11 @@ import wave
 
 from bs4 import BeautifulSoup
 
-VERSION = "1.1"
+VERSION = "1.2"
 
-DEFAULT_MAX_CHARS = 3_000
+DEFAULT_MAX_CHARS = 32_768  # roomy backstop, not timeout-proof: an article
+# filling it outruns the default --cmd-timeout on the fetch-loop box class
+# (the KNOBS entry owns the sizing math)
 
 # language (lowercase primary subtag, the item's `lang` field) -> default
 # piper voice. --lang-voice overrides/extends per feed; --voice bypasses it.
@@ -486,8 +493,8 @@ def parse_argv(argv):
         cfg["max_chars"] = DEFAULT_MAX_CHARS
     if cfg["max_chars"] < 0:
         # truncate() treats any cap <= 0 as "no cap"; a negative almost
-        # certainly means a typo, and silently uncapping is the one outcome
-        # that can lose articles to --cmd-timeout. Say so.
+        # certainly means a typo, and reading it as "no cap" would quietly
+        # defeat the one thing a cap is set for. Say so.
         errors.append("--max-chars cannot be negative (0 disables the cap)")
     if not paths and manual:
         errors.append("--title/--lang need an HTML file argument "

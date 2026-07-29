@@ -54,6 +54,7 @@ cfg, item = tts.parse_argv([])
 check("protocol mode: no item from argv", item, None)
 check("asset dir defaults empty without env", cfg["asset_dir"], "")
 check("default max chars", cfg["max_chars"], tts.DEFAULT_MAX_CHARS)
+check("default cap: the 32k backstop", tts.DEFAULT_MAX_CHARS, 32_768)
 
 os.environ["SRR_ASSET_DIR"] = "/tmp/x"
 cfg, _ = tts.parse_argv([])
