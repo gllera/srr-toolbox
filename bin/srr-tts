@@ -13,12 +13,26 @@ the article.
 
 This step narrates title + body text with piper (fully offline) and prepends
 
-    <p><audio controls preload="none" src="#/tts/<hash>.wav"></audio></p>
+    <p><audio controls preload="none" data-tts-t="0,4.2,..." src="#/tts/<hash>.wav"></audio></p>
 
 The "#/"-marker file is written under the fetch run's asset dir; srr's
 end-of-pipeline upload step ships it to the store content-addressed (and the
 store-side asset processor — webify on this deployment — transcodes the WAV
 to web audio before upload).
+
+PARAGRAPH SYNC
+--------------
+The narration is synthesized per block segment, so each segment's exact
+start offset is known (piper yields per-sentence chunks; counting frames
+costs nothing). The audio tag carries the table as
+data-tts-t="0,4.2,11.8,..." and every narrated block is stamped
+data-tts="<segment index>" — segment 0 is the TITLE when there is one, and
+the reader highlights its own title node for it. The SRR frontend uses the
+pair to highlight the block being read and to seek on click; the backend's
+#sanitize allowlists exactly these two attributes (digits / a comma-joined
+decimal list). Start offsets are cached in a sidecar
+(tts/<hash>.wav.json) next to the WAV; a cached WAV without one (pre-1.3
+cache) degrades to a plain audio tag rather than re-synthesizing.
 
 Opt a feed in (order matters: after #readability if the feed uses it, before
 #default so the marker rides the normal sanitize/upload path):
@@ -115,7 +129,7 @@ import wave
 from bs4 import BeautifulSoup
 from bs4.element import CData, NavigableString, PreformattedString, Tag
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 DEFAULT_MAX_CHARS = 32_768  # roomy backstop, not timeout-proof: an article
 # filling it outruns the default --cmd-timeout on the fetch-loop box class
