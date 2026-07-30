@@ -181,6 +181,17 @@ check("empty blocks yield no segment",
       [t for _, t in tts.segment_html("<p>x</p><p>  </p><p>y</p>")[1]],
       ["x", "y"])
 
+soup, segs = tts.segment_html("<p>a<![CDATA[x]]>b</p>")
+check("CDATA text is narrated (get_text parity)", [t for _, t in segs], ["axb"])
+
+soup, segs = tts.segment_html("<p>One.</p><p>Two.</p>")
+check_true("segment elements are live nodes of the returned soup",
+           segs[0][0] is soup.find("p"))
+soup, segs = tts.segment_html("<p>para</p>tail")
+check("tail text after a top-level block attributes to None",
+      [(e.name if e is not None else None, t) for e, t in segs],
+      [("p", "para"), (None, "tail")])
+
 # The equivalence contract, spelled out: html_to_text == join(segments).
 for frag in ["<p>One.</p><p>Two.</p>", "lead<div>intro<p>p1</p>outro</div>",
              "<ul><li>a</li><li>b</li></ul>", "a<br>b<br><br>c",

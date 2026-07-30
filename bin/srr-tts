@@ -112,7 +112,7 @@ import time
 import wave
 
 from bs4 import BeautifulSoup
-from bs4.element import NavigableString, PreformattedString, Tag
+from bs4.element import CData, NavigableString, PreformattedString, Tag
 
 VERSION = "1.2"
 
@@ -197,13 +197,14 @@ def _collapse(text: str) -> str:
 
 def segment_html(fragment: str):
     """HTML fragment -> (soup, [(element_or_None, text), ...]) in document
-    order: one segment per block-bounded text run, attributed to the block
-    whose boundary opened it (None for bare text between/before blocks).
-    Empty segments are dropped. "\\n\\n".join of the texts IS html_to_text —
-    block boundaries read as paragraph breaks either way; the attribution is
-    what lets run_item stamp the narrated element for the reader's
+    order: one segment per block-bounded text run, attributed to the
+    innermost still-open block element (None outside any block). Empty
+    segments are dropped. "\\n\\n".join of the texts IS html_to_text — block
+    boundaries read as paragraph breaks either way; the attribution is what
+    lets run_item stamp the narrated element for the reader's
     highlight-follow. Attribute text (alt, URLs) is never included; comments
-    and other non-text strings are skipped (get_text parity)."""
+    and other non-text strings are skipped, CDATA text is kept (get_text
+    parity)."""
     soup = BeautifulSoup(fragment or "", "html.parser")
     for t in soup(list(DROP_TAGS)):
         t.decompose()
@@ -211,6 +212,11 @@ def segment_html(fragment: str):
         br.replace_with("\n")
     segs = [[None, []]]  # [owning element or None, text parts]
 
+    # Recurses one Python frame per nesting level (unlike the old iterative
+    # get_text) and so can hit RecursionError on a pathologically deep
+    # fragment (~1000+ levels). Survivable, not handled here: it's an
+    # Exception, so main()'s run_item backstop catches it and emits the item
+    # unchanged — that article loses its narration, never the article itself.
     def walk(node, cur):
         for child in node.children:
             if isinstance(child, Tag):
@@ -220,8 +226,9 @@ def segment_html(fragment: str):
                     segs.append([cur, []])  # text after it re-attributes to cur
                 else:
                     walk(child, cur)
-            elif isinstance(child, NavigableString) and not isinstance(
-                    child, PreformattedString):
+            elif isinstance(child, NavigableString) and (
+                    not isinstance(child, PreformattedString)
+                    or isinstance(child, CData)):
                 segs[-1][1].append(str(child))
 
     walk(soup, None)
