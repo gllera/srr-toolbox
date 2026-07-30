@@ -149,6 +149,46 @@ for _ in range(3000):
 check("fuzz: no leak, no crash, cap respected (3000 documents)",
       fuzz_bad[:3], [])
 
+# --- segment_html ---------------------------------------------------------
+# The walker behind html_to_text: (soup, [(element|None, text), ...]) in
+# document order. Joining the texts with "\n\n" IS html_to_text — the
+# equivalence every existing expectation above depends on.
+
+soup, segs = tts.segment_html("<p>One.</p><p>Two.</p>")
+check("segments: one per block", [t for _, t in segs], ["One.", "Two."])
+check_true("segments: elements are the blocks",
+           [e.name for e, _ in segs] == ["p", "p"])
+
+soup, segs = tts.segment_html("lead text<p>para</p>")
+check("bare leading text is a segment without an element",
+      [(e.name if e is not None else None, t) for e, t in segs],
+      [(None, "lead text"), ("p", "para")])
+
+soup, segs = tts.segment_html("<div>intro<p>para</p>outro</div>")
+check("nested blocks: text attributes to its innermost opening block",
+      [(e.name if e is not None else None, t) for e, t in segs],
+      [("div", "intro"), ("p", "para"), ("div", "outro")])
+
+soup, segs = tts.segment_html("<p>a<br><br>b</p>")
+check("br-only breaks stay one segment (one element, one highlight)",
+      [t for _, t in segs], ["a\n\nb"])
+
+soup, segs = tts.segment_html("<p>a<!-- comment --></p>")
+check("comments are not narrated (get_text parity)",
+      [t for _, t in segs], ["a"])
+
+check("empty blocks yield no segment",
+      [t for _, t in tts.segment_html("<p>x</p><p>  </p><p>y</p>")[1]],
+      ["x", "y"])
+
+# The equivalence contract, spelled out: html_to_text == join(segments).
+for frag in ["<p>One.</p><p>Two.</p>", "lead<div>intro<p>p1</p>outro</div>",
+             "<ul><li>a</li><li>b</li></ul>", "a<br>b<br><br>c",
+             "<blockquote><p>q</p></blockquote>tail"]:
+    check("join equivalence: %r" % frag,
+          "\n\n".join(t for _, t in tts.segment_html(frag)[1]),
+          tts.html_to_text(frag))
+
 print()
 if failures:
     raise SystemExit("FAILED: %d test(s): %s" % (len(failures), ", ".join(failures)))

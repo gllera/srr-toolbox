@@ -112,6 +112,7 @@ import time
 import wave
 
 from bs4 import BeautifulSoup
+from bs4.element import NavigableString, PreformattedString, Tag
 
 VERSION = "1.2"
 
@@ -181,22 +182,62 @@ BLOCK_TAGS = ("p", "div", "li", "ul", "ol", "blockquote", "pre", "table",
               "dl", "dt", "dd", "td", "th", "caption")
 
 
-def html_to_text(fragment: str) -> str:
-    """HTML fragment -> plain text. Attribute text (alt, URLs) is never
-    included; block boundaries become paragraph breaks so piper phrases them
-    as pauses."""
+_BLOCK_SET = frozenset(BLOCK_TAGS)
+
+_WS_RUN = re.compile(r"[ \t\r\f\v]+")
+_NL_PAD = re.compile(r" ?\n ?")
+_NL_RUN = re.compile(r"\n{3,}")
+
+
+def _collapse(text: str) -> str:
+    text = _WS_RUN.sub(" ", text)
+    text = _NL_PAD.sub("\n", text)
+    return _NL_RUN.sub("\n\n", text).strip()
+
+
+def segment_html(fragment: str):
+    """HTML fragment -> (soup, [(element_or_None, text), ...]) in document
+    order: one segment per block-bounded text run, attributed to the block
+    whose boundary opened it (None for bare text between/before blocks).
+    Empty segments are dropped. "\\n\\n".join of the texts IS html_to_text —
+    block boundaries read as paragraph breaks either way; the attribution is
+    what lets run_item stamp the narrated element for the reader's
+    highlight-follow. Attribute text (alt, URLs) is never included; comments
+    and other non-text strings are skipped (get_text parity)."""
     soup = BeautifulSoup(fragment or "", "html.parser")
     for t in soup(list(DROP_TAGS)):
         t.decompose()
     for br in soup.find_all("br"):
         br.replace_with("\n")
-    for t in soup.find_all(list(BLOCK_TAGS)):
-        t.insert_before("\n\n")
-        t.insert_after("\n\n")
-    text = soup.get_text()
-    text = re.sub(r"[ \t\r\f\v]+", " ", text)
-    text = re.sub(r" ?\n ?", "\n", text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    segs = [[None, []]]  # [owning element or None, text parts]
+
+    def walk(node, cur):
+        for child in node.children:
+            if isinstance(child, Tag):
+                if child.name in _BLOCK_SET:
+                    segs.append([child, []])
+                    walk(child, child)
+                    segs.append([cur, []])  # text after it re-attributes to cur
+                else:
+                    walk(child, cur)
+            elif isinstance(child, NavigableString) and not isinstance(
+                    child, PreformattedString):
+                segs[-1][1].append(str(child))
+
+    walk(soup, None)
+    out = []
+    for el, parts in segs:
+        text = _collapse("".join(parts))
+        if text:
+            out.append((el, text))
+    return soup, out
+
+
+def html_to_text(fragment: str) -> str:
+    """HTML fragment -> plain text. Thin join over segment_html — one code
+    path, so the narrated text and the per-segment attribution can never
+    disagree."""
+    return "\n\n".join(t for _, t in segment_html(fragment)[1])
 
 
 def extract_text(title: str, content_html: str) -> str:
