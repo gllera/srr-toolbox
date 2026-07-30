@@ -39,13 +39,17 @@ def check_true(name, cond, detail=""):
         failures.append(name)
 
 
-def fake_synthesize(voice_obj, text, dest):
+def fake_synthesize(voice_obj, texts, dest):
+    """New contract: texts is the kept-segment list; returns their start
+    offsets. 2 seconds per segment keeps the fake table predictable."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with wave.open(dest, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(22050)
-        w.writeframes(b"\x00\x00" * 100)
+        for _ in texts:
+            w.writeframes(b"\x00\x00" * 44100)
+    return [round(i * 2.0, 2) for i in range(len(texts))]
 
 
 # --- parse_argv -----------------------------------------------------------
@@ -215,19 +219,24 @@ check("--lang-voice keys fold too", tts.resolve_voice(cfg2, "pt"),
 
 # --- synthesize (the real function — atomic-write path) --------------------
 class FakeVoice:
-    def synthesize_wav(self, text, w):
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(22050)
-        w.writeframes(b"\x00\x00" * 50)
+    class config:
+        sample_rate = 22050
+
+    def synthesize(self, text):
+        class Chunk:
+            audio_int16_bytes = b"\x00\x00" * 22050  # 1s per segment
+        yield Chunk()
 
 
 with tempfile.TemporaryDirectory() as d:
-    dest = os.path.join(d, "out.wav")
-    tts.synthesize(FakeVoice(), "x", dest)
+    dest = os.path.join(d, "tts", "x.wav")
+    starts = tts.synthesize(FakeVoice(), ["a", "b", "c"], dest)
+    check("synthesize: one start per segment, exact frame math",
+          starts, [0.0, 1.0, 2.0])
     check_true("synthesize: file exists non-empty",
-               os.path.exists(dest) and os.path.getsize(dest) > 0)
-    leftover = [n for n in os.listdir(d) if ".part" in n]
+               os.path.getsize(dest) > 0)
+    leftover = [f for f in os.listdir(os.path.dirname(dest))
+                if f.endswith(".part")]
     check_true("synthesize: no leftover .part files", leftover == [], leftover)
 
 # --- ensure_voice (staged download; piper faked out of sys.modules) --------
@@ -449,31 +458,59 @@ with tempfile.TemporaryDirectory() as store:
         item = dict(BASE)
         check("synthesis failure -> pass through", tts.run_item(item, cfg), BASE)
 
-        # Success: audio prepended, wav landed, other fields echoed verbatim.
+        # Success: audio prepended with the timing table, blocks stamped,
+        # wav + sidecar landed, other fields echoed verbatim.
         tts.ensure_voice = lambda v, d: object()
         tts.synthesize = fake_synthesize
         item = dict(BASE)
         out = tts.run_item(item, cfg)
         text = tts.extract_text(BASE["title"], BASE["content"])
         rel = tts.audio_name(tts.LANG_VOICES["es"], text)
-        want_prefix = tts.AUDIO_HTML % ("#/" + rel)
-        check_true("audio tag prepended", out["content"].startswith(want_prefix),
+        # Segments: title (0) + one <p> (1) -> table "0,2" from the fake.
+        want_prefix = tts.AUDIO_HTML % (' data-tts-t="0,2"', "#/" + rel)
+        check_true("audio tag prepended with table",
+                   out["content"].startswith(want_prefix), out["content"])
+        check_true("block stamped with its segment index",
+                   '<p data-tts="1">Hola mundo.</p>' in out["content"],
                    out["content"])
-        check_true("original content preserved after the tag",
-                   out["content"].endswith(BASE["content"]))
-        check_true("wav file landed", os.path.getsize(os.path.join(store, rel)) > 0)
+        check_true("wav file landed",
+                   os.path.getsize(os.path.join(store, rel)) > 0)
+        with open(os.path.join(store, rel + ".json")) as fh:
+            check("sidecar holds the table", json.load(fh),
+                  {"v": 1, "starts": [0.0, 2.0]})
         for k in ("guid", "title", "link", "published", "lang", "raw"):
             check("field %s echoed" % k, out[k], BASE[k])
 
-        # Cache hit: file reused, mtime refreshed, synthesize NOT called again.
+        # Cache hit: both files reused, mtimes refreshed, no synthesis.
         dest = os.path.join(store, rel)
         os.utime(dest, (1, 1))
+        os.utime(dest + ".json", (1, 1))
         def explode(*a):
             raise AssertionError("synthesize called on a cache hit")
         tts.synthesize = explode
         out2 = tts.run_item(dict(BASE), cfg)
         check("cache hit -> same content", out2["content"], out["content"])
-        check_true("cache hit refreshes mtime", os.path.getmtime(dest) > 1)
+        check_true("cache hit refreshes wav mtime", os.path.getmtime(dest) > 1)
+        check_true("cache hit refreshes sidecar mtime",
+                   os.path.getmtime(dest + ".json") > 1)
+
+        # Pre-upgrade cache: wav present, no sidecar -> plain tag (no table,
+        # no stamps), and NEVER a re-synthesis.
+        os.remove(dest + ".json")
+        out3 = tts.run_item(dict(BASE), cfg)
+        check_true("sidecar-less hit degrades to a plain tag",
+                   out3["content"].startswith(
+                       tts.AUDIO_HTML % ("", "#/" + rel)), out3["content"])
+        check_true("sidecar-less hit keeps original content verbatim",
+                   out3["content"].endswith(BASE["content"]))
+
+        # No title: segment 0 is the first block, so it takes data-tts="0".
+        tts.synthesize = fake_synthesize
+        item = dict(BASE, title="", content="<p>Uno.</p><p>Dos.</p>")
+        out4 = tts.run_item(item, cfg)
+        check_true("titleless: first block is segment 0",
+                   '<p data-tts="0">Uno.</p><p data-tts="1">Dos.</p>'
+                   in out4["content"], out4["content"])
     finally:
         tts.ensure_voice = orig_ensure_voice
         tts.synthesize = orig_synthesize
