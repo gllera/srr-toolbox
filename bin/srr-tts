@@ -27,10 +27,12 @@ start offset is known (piper yields per-sentence chunks; counting frames
 costs nothing). The audio tag carries the table as
 data-tts-t="0,4.2,11.8,..." and every narrated block is stamped
 data-tts="<segment index>" — segment 0 is the TITLE when there is one, and
-the reader highlights its own title node for it. The SRR frontend uses the
-pair to highlight the block being read and to seek on click; the backend's
-#sanitize allowlists exactly these two attributes (digits / a comma-joined
-decimal list). Start offsets are cached in a sidecar
+the reader highlights its own title node for it. The SRR reader uses the
+pair to highlight the block being read and to seek on click. The markup
+only survives into the store once the backend's #sanitize allowlists
+exactly these two attributes (digits / a comma-joined decimal list); on an
+older backend they are stripped harmlessly and the audio still plays.
+Start offsets are cached in a sidecar
 (tts/<hash>.wav.json) next to the WAV; a cached WAV without one (pre-1.3
 cache) degrades to a plain audio tag rather than re-synthesizing.
 
