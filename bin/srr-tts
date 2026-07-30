@@ -103,6 +103,7 @@ dict is built from parameters and the result is pretty-printed:
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -186,6 +187,7 @@ BLOCK_TAGS = ("p", "div", "li", "ul", "ol", "blockquote", "pre", "table",
 
 
 _BLOCK_SET = frozenset(BLOCK_TAGS)
+_DROP_SET = frozenset(DROP_TAGS)
 
 _WS_RUN = re.compile(r"[ \t\r\f\v]+")
 _NL_PAD = re.compile(r" ?\n ?")
@@ -207,12 +209,15 @@ def segment_html(fragment: str):
     lets run_item stamp the narrated element for the reader's
     highlight-follow. Attribute text (alt, URLs) is never included; comments
     and other non-text strings are skipped, CDATA text is kept (get_text
-    parity)."""
+    parity).
+
+    The returned soup is PRISTINE: the walker only READS it, never mutates
+    it (no decompose, no replace_with). run_item re-serializes this same
+    soup as the stored article content, so anything the walker skips for
+    narration purposes — a <br>, a DROP_TAGS subtree — must still be there
+    in the output: <br> as itself, not a literal newline; <video>/<audio>
+    players intact, not gone."""
     soup = BeautifulSoup(fragment or "", "html.parser")
-    for t in soup(list(DROP_TAGS)):
-        t.decompose()
-    for br in soup.find_all("br"):
-        br.replace_with("\n")
     segs = [[None, []]]  # [owning element or None, text parts]
 
     # Recurses one Python frame per nesting level (unlike the old iterative
@@ -223,6 +228,11 @@ def segment_html(fragment: str):
     def walk(node, cur):
         for child in node.children:
             if isinstance(child, Tag):
+                if child.name in _DROP_SET:
+                    continue  # never narrated — but stays in the soup as-is
+                if child.name == "br":
+                    segs[-1][1].append("\n")  # a break, not a subtree: no walk()
+                    continue
                 if child.name in _BLOCK_SET:
                     segs.append([child, []])
                     walk(child, child)
@@ -305,21 +315,34 @@ def split_kept(texts, cap):
 
 
 def _tts_attr(starts):
-    """starts -> the ' data-tts-t="…"' attribute. %g drops trailing zeros
-    ("4.0" -> "4"); values are round()ed to 2 decimals at synthesis."""
-    return ' data-tts-t="%s"' % ",".join("%g" % s for s in starts)
+    """starts -> the ' data-tts-t="…"' attribute. %.10g (not the more
+    obvious %g, which is 6 significant digits: above 10000s it silently
+    drops the second decimal, and at >=999999.5 it switches to exponent
+    notation ("1e+06"), which would fail the backend's attr regex and kill
+    the whole attribute) drops trailing zeros ("4.0" -> "4") while keeping
+    all the precision round() left at synthesis time. Unreachable at sane
+    --max-chars caps, but cheap to get right."""
+    return ' data-tts-t="%s"' % ",".join("%.10g" % s for s in starts)
 
 
 def read_sidecar(path):
-    """-> starts list, or None if absent/unreadable (pre-upgrade cache)."""
+    """-> starts list, or None if absent/unreadable/malformed (pre-upgrade
+    cache, foreign file, or a future format this version doesn't know) — any
+    of which must degrade to a plain tag, never raise. bool is checked
+    separately because bool IS an int in Python (isinstance(True, int) is
+    True) and would otherwise sneak past the numeric check."""
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
+        if data.get("v") != 1:
+            return None
         starts = data["starts"]
-        if isinstance(starts, list) and all(
-                isinstance(s, (int, float)) for s in starts) and starts:
+        if (isinstance(starts, list) and starts and all(
+                isinstance(s, (int, float)) and not isinstance(s, bool)
+                and math.isfinite(s) and s >= 0 for s in starts)
+                and all(b >= a for a, b in zip(starts, starts[1:]))):
             return starts
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     return None
 
@@ -554,14 +577,31 @@ def run_item(item: dict, cfg: dict) -> dict:
         try:
             starts = synthesize(ensure_voice(voice, cfg["voices_dir"]),
                                 kept, dest)
-            write_sidecar(sidecar, starts)
         except Exception as e:  # any failure degrades — never fails the cycle
             log("synthesis failed (%s): %s" % (voice, e))
             return item
+        try:
+            write_sidecar(sidecar, starts)
+        except Exception as e:
+            # The WAV already landed and starts is in hand — losing THIS
+            # run's table over a sidecar write failure would be needless.
+            # Only a future cache hit degrades (to a plain tag, same as the
+            # pre-upgrade-cache path above).
+            log("sidecar write failed (%s): future cache hits will degrade "
+                "to a plain tag" % e)
+    # Feed-supplied sync attrs would misdirect the reader's highlight/seek;
+    # ours are the only truth for this narration, so sweep any before
+    # stamping.
+    for el in soup.find_all(attrs={"data-tts": True}):
+        del el["data-tts"]
+    for el in soup.find_all(attrs={"data-tts-t": True}):
+        del el["data-tts-t"]
     # Stamp the narrated blocks. Indices are positions in `kept`, title
     # included; a segment whose element is gone (bare interstitial text) or
     # already claimed (a parent block that opened two runs) keeps its table
-    # entry but no stamp — the reader just skips the highlight there.
+    # entry but no stamp — the reader just skips the highlight there. (Index
+    # width is sanitize-bounded to 4 digits by the backend's attr regex —
+    # unreachable outside a pathological 10000+-block article.)
     for i, (el, _) in enumerate(narr[:len(kept)]):
         if el is not None and "data-tts" not in el.attrs:
             el["data-tts"] = str(i)
@@ -736,11 +776,13 @@ def main():
     try:
         result = run_item(item, cfg)
     except Exception as e:
-        # Absolute backstop: run_item mutates item["content"] only as its
-        # final statement, so on any raise (e.g. a cache-hit TOCTOU between
-        # the getsize/utime checks and a concurrent evictor) the item is
-        # still pristine — emit it untouched rather than exit non-zero and
-        # have srr drop the article.
+        # Absolute backstop: run_item mutates item["content"] only as the
+        # final statement of its branch (the pre-upgrade-cache plain-tag
+        # path and the stamped/tabled success path), so on any raise before
+        # that point (e.g. a cache-hit TOCTOU between the getsize/utime
+        # checks and a concurrent evictor) the item is still pristine —
+        # emit it untouched rather than exit non-zero and have srr drop the
+        # article.
         log("unexpected error: %s: passing item through" % e)
         result = item
     if pretty:

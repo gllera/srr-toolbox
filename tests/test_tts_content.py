@@ -192,6 +192,18 @@ check("tail text after a top-level block attributes to None",
       [(e.name if e is not None else None, t) for e, t in segs],
       [("p", "para"), (None, "tail")])
 
+# segment_html must never MUTATE the soup it hands back: run_item
+# re-serializes this exact soup as the stored article content, so a <br>
+# or a DROP_TAGS player must survive in the output even though the walker
+# skips them for narration.
+frag = ('<p>line one<br>line two</p>'
+        '<video src="https://e.com/v.mp4" controls></video>')
+soup, segs = tts.segment_html(frag)
+check("br is a break, video not narrated",
+      [t for _, t in segs], ["line one\nline two"])
+check_true("soup stays pristine (br + video survive serialization)",
+           "<br/>" in str(soup) and "<video" in str(soup), str(soup))
+
 # The equivalence contract, spelled out: html_to_text == join(segments).
 for frag in ["<p>One.</p><p>Two.</p>", "lead<div>intro<p>p1</p>outro</div>",
              "<ul><li>a</li><li>b</li></ul>", "a<br>b<br><br>c",

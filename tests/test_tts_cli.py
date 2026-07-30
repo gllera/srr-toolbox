@@ -239,6 +239,21 @@ with tempfile.TemporaryDirectory() as d:
                 if f.endswith(".part")]
     check_true("synthesize: no leftover .part files", leftover == [], leftover)
 
+# --- split_kept -------------------------------------------------------------
+check("split_kept: cap=0 keeps every segment whole",
+      tts.split_kept(["one", "two", "three"], 0), ["one", "two", "three"])
+check("split_kept: tiny cap hard-cuts, dropping segments the cut can't reach",
+      tts.split_kept(["Hello there.", "Another one."], 5), ["Hello"])
+check("split_kept: cap landing on a sentence boundary partial-tails the "
+      "segment it lands in, dropping the rest",
+      tts.split_kept(["First sentence here.",
+                      "Second sentence follows. Third here."], 46),
+      ["First sentence here.", "Second sentence follows."])
+
+# --- _tts_attr ----------------------------------------------------------------
+check("_tts_attr: renders the table, trailing zeros dropped",
+      tts._tts_attr([0.0, 2.0, 11.8]), ' data-tts-t="0,2,11.8"')
+
 # --- ensure_voice (staged download; piper faked out of sys.modules) --------
 # A voice is model + config, and piper's downloader skips any file that merely
 # exists and is non-empty — so a half-downloaded model must not be left in
@@ -511,6 +526,39 @@ with tempfile.TemporaryDirectory() as store:
         check_true("titleless: first block is segment 0",
                    '<p data-tts="0">Uno.</p><p data-tts="1">Dos.</p>'
                    in out4["content"], out4["content"])
+
+        # Regression guard: segment_html must hand back a PRISTINE soup —
+        # run_item re-serializes it as the stored article. A <br> must
+        # survive as itself (not collapsed to a literal newline) and a
+        # DROP_TAGS player must survive whole (not decomposed away), even
+        # though both are excluded from narration/stamping.
+        item = dict(BASE, content='<p>line one<br>line two</p>'
+                    '<video src="https://e.com/v.mp4" controls></video>')
+        out5 = tts.run_item(item, cfg)
+        check("regression: br survives, video survives, block stamped",
+              out5["content"],
+              '<p><audio controls preload="none" data-tts-t="0,2" '
+              'src="#/' + tts.audio_name(tts.LANG_VOICES["es"],
+                  "T\n\nline one\nline two") + '"></audio></p>'
+              '<p data-tts="1">line one<br/>line two</p>'
+              '<video controls="" src="https://e.com/v.mp4"></video>')
+
+        # Feed-supplied data-tts/data-tts-t must never survive into the
+        # reply — the reader must only ever see OUR table, or a stale/
+        # misleading one from the source feed could misdirect it. Distinct
+        # wording from every earlier case in this block, so the cache key
+        # is fresh and this exercises the real synthesis+stamp path (not a
+        # cache hit left in whatever state an earlier case put it in).
+        item = dict(BASE, content='<p data-tts="99" data-tts-t="1,2,3">'
+                    'Something else distinctly worded.</p>')
+        out6 = tts.run_item(item, cfg)
+        check_true("feed-supplied data-tts is swept before restamping",
+                   'data-tts="99"' not in out6["content"], out6["content"])
+        check_true("feed-supplied data-tts-t on a content element is swept",
+                   'data-tts-t="1,2,3"' not in out6["content"], out6["content"])
+        check_true("...and restamped with our own index",
+                   '<p data-tts="1">Something else distinctly worded.</p>'
+                   in out6["content"], out6["content"])
     finally:
         tts.ensure_voice = orig_ensure_voice
         tts.synthesize = orig_synthesize
