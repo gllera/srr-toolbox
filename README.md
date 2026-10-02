@@ -285,3 +285,9 @@ for t in tests/test_*.py; do uv run "$t" || break; done
 - `tg/`, `yt/`, `x/` — runtime media caches written by the strategies' `--selfhost` runs
 - `.venv/` — the uv-managed project venv
 - `docs/` — local design working notes
+
+## License
+
+[MIT](LICENSE). One dependency is copyleft: `srr-tts` imports `piper-tts`, which is
+GPL-3.0 (piper1-gpl). The toolbox's own code stays MIT; anything that distributes it
+bundled with piper is under the GPL-3.0's terms.
