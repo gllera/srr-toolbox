@@ -6,16 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Companion scripts for SRR (the Go `srr` backend + TS frontend in
 `~/ws/srr`, which has its own CLAUDE.md — backend/frontend *code* changes go there,
-not here). `bin/` holds three kinds. Exec'd by `srr` by bare name, resolved from
+not here). `bin/` holds three kinds. Exec'd by `drr` by bare name, resolved from
 `PATH`: **`srr-telegram` / `srr-youtube` / `srr-x`** (python ingest
 strategies — one process per feed, JSON stdin -> JSON stdout) and **`srr-tts`**
 (python pipeline step — one process per item, item JSON stdin -> item JSON stdout,
-prepends a piper TTS narration). Running the other way round, driving the `srr` CLI as
+prepends a piper TTS narration). Running the other way round, driving the `drr` CLI as
 a subprocess: **`drr-digest-gen`** (store tool — collects recent articles via `drr`, has
 `claude -p` write a digest, writes it to a feed file in `--out-dir`). Plus the
-`srr-uvrun` shebang wrapper. On this machine `bin/` reaches `PATH` via
-`~/.local/bin` symlinks managed from the private srr-config repo; the `srr`
-skill is the full ops runbook (this repo is destined to be public, so it only
+`srr-uvrun` shebang wrapper. On the server `bin/` reaches `PATH` as the
+`/opt/drr/bin` mirror, refreshed via `drr-update toolbox`; for dev, put
+`~/ws/srr-toolbox/bin` on `PATH` (this repo is destined to be public, so it only
 states the generic PATH contract).
 
 ## Commands
@@ -96,6 +96,5 @@ absence is deliberate (uv must install only the deps, never this repo as a packa
 - `.env` holds the Telegram `SRR_TG_*` credentials (gitignored); the session string
   is a password-equivalent. `tg/`, `yt/`, `x/` are runtime media caches; `docs/` is
   local working notes — all gitignored, none are code.
-- The srr configs (`~/.config/srr/*.yaml`) embed live secrets (Telegram session,
-  R2 keys) and ride their own PRIVATE repo — `gllera/srr-config`, cloned at
-  `~/.config/srr`. Never commit them into this repo: it is destined to be public.
+- The drr config embeds live secrets (Telegram session) and lives outside this
+  repo. Never commit it here: this repo is destined to be public.
