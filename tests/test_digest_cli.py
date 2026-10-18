@@ -1,7 +1,7 @@
-"""Tests for srr-digest-gen's modes and the srr/claude boundary: what each
+"""Tests for drr-digest-gen's modes and the drr/claude boundary: what each
 mode spawns, what it pushes, that the published feed is the only state, and
 that nothing reaches the store unless the whole run succeeded. Every
-subprocess (srr, claude) is monkeypatched.
+subprocess (drr, claude) is monkeypatched.
 
     uv run tests/test_digest_cli.py
 """
@@ -13,20 +13,24 @@ import os
 import signal
 import subprocess
 import sys
+import shlex
+import stat as _stat
+import tempfile
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(HERE, "..", "bin", "srr-digest-gen")
+SCRIPT = os.path.join(HERE, "..", "bin", "drr-digest-gen")
 
-loader = importlib.machinery.SourceFileLoader("srr_digest_gen", SCRIPT)
-spec = importlib.util.spec_from_loader("srr_digest_gen", loader)
+loader = importlib.machinery.SourceFileLoader("drr_digest_gen", SCRIPT)
+spec = importlib.util.spec_from_loader("drr_digest_gen", loader)
 dg = importlib.util.module_from_spec(spec)
 loader.exec_module(dg)
 
 failures = []
+OUT = tempfile.mkdtemp()  # --out-dir for every run that reads or writes the feed (publish/fetch are faked)
 
 
 def check(name, got, want):
@@ -72,7 +76,7 @@ HISTORY = []
 
 
 def fake_run_json(cmd):
-    return FEEDS if cmd[:3] == ["srr", "feed", "ls"] else {"articles": ARTS}
+    return FEEDS if "feed" in cmd and "ls" in cmd else {"articles": ARTS}
 
 
 def fake_run_claude(prompt, model=None):
@@ -80,11 +84,12 @@ def fake_run_claude(prompt, model=None):
     return DIGEST
 
 
-def fake_publish(name, rss):
+def fake_publish(name, rss, out_dir):
     pushed.append((name, rss))
+    return os.path.join(out_dir, f"{name}.rss")
 
 
-def fake_fetch_history(name):
+def fake_fetch_history(name, out_dir):
     fetched.append(name)
     return [dict(e) for e in HISTORY]
 
@@ -92,6 +97,7 @@ def fake_fetch_history(name):
 windows = []
 collect_kwargs = []  # so a refactor cannot silently drop since=/before= wiring
 real_collect = dg.collect
+real_publish, real_fetch_history = dg.publish, dg.fetch_history
 
 
 def spy_collect(hours, tags, feed_ids, limit, exclude_tag=dg.DEFAULT_EXCLUDE_TAG,
@@ -206,7 +212,7 @@ check("bounds: --before reaches collect",
 
 reset()
 HISTORY[:] = []
-run(["--dry-run", "--since", "48h"])
+run(["--dry-run", "--since", "48h", "--out-dir", OUT])
 check("bounds: --since reaches the publish path's collect too, bypassing "
       "the --hours/gap arithmetic", windows, [48])
 check_true("bounds: ...as the pinned instant",
@@ -216,7 +222,7 @@ check_exits("bounds: --hours and --since are one mode each, not a fallback",
             ["--dump", "--since", "48h", "--hours", "6"], "pass one of them")
 reset()
 check_exits("bounds: the contradiction dies before any store read",
-            ["--since", "48h", "--hours", "6"], "pass one of them")
+            ["--since", "48h", "--hours", "6", "--out-dir", OUT], "pass one of them")
 check("bounds: ...no history fetched for it", fetched, [])
 check_exits("bounds: a --since in the future is refused up front",
             ["--dump", "--since", "2099-01-01T00:00:00Z"], "future")
@@ -254,7 +260,7 @@ check_exits("bounds: an empty --until is refused like an empty --since",
 
 reset()
 HISTORY[:] = []
-run(["--dry-run", "--before", "123"])
+run(["--dry-run", "--before", "123", "--out-dir", OUT])
 check("bounds: --before reaches the publish path's collect too",
       [c["before"] for c in collect_kwargs], [123])
 
@@ -281,14 +287,14 @@ check("article limit: 0 (no limit) reaches collect, not a fallback to the defaul
 
 reset()
 HISTORY[:] = []
-run(["--dry-run", "--max-article-chars", "2"])
+run(["--dry-run", "--max-article-chars", "2", "--out-dir", OUT])
 check("article limit: --max-article-chars reaches the publish path's collect too",
       [c["max_chars"] for c in collect_kwargs], [2])
 
 # --- --dry-run ------------------------------------------------------------
 reset()
 HISTORY[:] = [YESTERDAY]
-out = run(["--dry-run"])
+out = run(["--dry-run", "--out-dir", OUT])
 check_true("--dry-run: prints the rss to stdout", out.startswith("<?xml version"), out[:80])
 check_true("--dry-run: the digest rides in the item", "Top:" in out, out)
 check("--dry-run: called claude once", len(claude_calls), 1)
@@ -299,12 +305,12 @@ check("--dry-run: renders today on top of the published days", out.count("<item>
 # --- default (publish) ----------------------------------------------------
 reset()
 HISTORY[:] = [YESTERDAY]
-out = run(["--name", "digest"])
+out = run(["--name", "digest", "--out-dir", OUT])
 check("publish: one push", len(pushed), 1)
-check("publish: syndication name passed through", pushed[0][0], "digest")
+check("publish: feed name passed through", pushed[0][0], "digest")
 check("publish: the feed it read back is the feed it pushes to", fetched, ["digest"])
 check_true("publish: pushed bytes are the rss", pushed[0][1].startswith("<?xml"), pushed[0][1][:80])
-check_true("publish: reports the destination", "out/digest" in out, out)
+check_true("publish: reports the destination", os.path.join(OUT, "digest.rss") in out, out)
 
 published = dg.parse_history(pushed[0][1])
 check("publish: today prepended to the days already in the feed",
@@ -315,7 +321,7 @@ check("publish: title counts the collected articles",
       published[0]["title"], f"Daily Digest — {TODAY} (1 articles)")
 
 reset()
-run(["--tz", "Europe/Madrid"])
+run(["--tz", "Europe/Madrid", "--out-dir", OUT])
 madrid = dg.parse_history(pushed[0][1])[0]
 check("publish: entry dated in --tz",
       madrid["date"],
@@ -329,23 +335,23 @@ def aged(hours_ago):
 
 reset()
 HISTORY[:] = aged(50)
-run([])
+run(["--out-dir", OUT])
 check_true("window: defaults to the gap since the last edition (a missed run "
            "is caught up, not skipped)", windows[0] in (50, 51), windows)
 
 reset()
 HISTORY[:] = aged(400)
-run(["--max-hours", "48"])
+run(["--max-hours", "48", "--out-dir", OUT])
 check("window: --max-hours caps a long outage", windows[0], 48)
 
 reset()
 HISTORY[:] = aged(50)
-run(["--hours", "6"])
+run(["--hours", "6", "--out-dir", OUT])
 check("window: --hours overrides the gap", windows[0], 6)
 
 reset()
 HISTORY[:] = []
-run([])
+run(["--out-dir", OUT])
 check("window: an empty feed falls back to the flat default",
       windows[0], dg.DEFAULT_HOURS)
 
@@ -354,25 +360,25 @@ reset()
 HISTORY[:] = [{"date": TODAY, "ts": int(NOW), "title": "Daily Digest — old run",
                "html": "<p>the version readers already have</p>"}, YESTERDAY]
 check_exits("rerun: refuses to republish a day already in the feed",
-            [], "already published")
+            ["--out-dir", OUT], "already published")
 check("rerun: refusing costs no claude call", claude_calls, [])
 check("rerun: refusing pushes nothing", pushed, [])
 
 reset()
-out = run(["--force"])
+out = run(["--force", "--out-dir", OUT])
 forced = dg.parse_history(pushed[0][1])
 check("--force: replaces the day rather than appending a second one",
       [e["date"] for e in forced], [TODAY, YESTERDAY["date"]])
 check("--force: the replacement is this run's digest", forced[0]["html"], DIGEST)
 
 reset()
-out = run(["--dry-run"])
+out = run(["--dry-run", "--out-dir", OUT])
 check_true("--dry-run: previews a rerun without needing --force", out.count("<item>") == 2, out[:200])
 
 # --- --no-history ---------------------------------------------------------
 reset()
 HISTORY[:] = [YESTERDAY]
-out = run(["--no-history"])
+out = run(["--no-history", "--out-dir", OUT])
 check("--no-history: never reads the feed back", fetched, [])
 check("--no-history: rewrites the feed with today alone",
       [e["date"] for e in dg.parse_history(pushed[0][1])], [TODAY])
@@ -382,14 +388,14 @@ reset()
 HISTORY[:] = [{"date": "2026-%02d-%02d" % (1 + i // 28, 1 + i % 28), "ts": 1767225600,
                "title": "Daily Digest — old", "html": "<p>old</p>"}
               for i in range(dg.KEEP_DAYS + 5)]
-run([])
+run(["--out-dir", OUT])
 check("publish: the feed is capped at KEEP_DAYS",
       len(dg.parse_history(pushed[0][1])), dg.KEEP_DAYS)
 
 # --- models ---------------------------------------------------------------
 reset()
 HISTORY[:] = []
-run(["--model", "opus"])
+run(["--model", "opus", "--out-dir", OUT])
 check("--model reaches the digest call", claude_calls[0][1], "opus")
 check("default: no model flag leaves the claude CLI's default",
       dg.build_parser().parse_args([]).model, None)
@@ -409,7 +415,7 @@ def fake_map_claude(prompt, model=None):
 
 dg.run_claude = fake_map_claude
 try:
-    run(["--model", "opus", "--map-model", "haiku"])
+    run(["--model", "opus", "--map-model", "haiku", "--out-dir", OUT])
 except SystemExit:  # the reduce output is notes, not html — expected here
     pass
 models = [m for _, m in claude_calls]
@@ -423,7 +429,7 @@ check("map-reduce: a reduce that comes back unusable is retried once",
 reset()
 dg.run_claude = fake_map_claude
 check_exits("--max-chunks: refuses a fan-out that was never asked for",
-            ["--max-chunks", "2"], "refusing to spend that unasked")
+            ["--max-chunks", "2", "--out-dir", OUT], "refusing to spend that unasked")
 check("--max-chunks: refused before any claude call", claude_calls, [])
 
 dg.run_claude = fake_run_claude
@@ -431,12 +437,12 @@ ARTS = [{"f": 1, "a": NOW - 60, "t": "Story", "l": "http://e/1", "c": "<p>body</
 
 # --- --lang ---------------------------------------------------------------
 reset()
-run([])
+run(["--out-dir", OUT])
 check_true("default: the prompt asks for English",
            "write the digest in English" in claude_calls[0][0], claude_calls[0][0][:300])
 check("default --lang", dg.build_parser().parse_args([]).lang, dg.DEFAULT_LANG)
 reset()
-run(["--lang", "Español"])
+run(["--lang", "Español", "--out-dir", OUT])
 check_true("--lang rides the digest prompt",
            "write the digest in Español" in claude_calls[0][0], claude_calls[0][0][:300])
 check_true("--lang rides the format rules (labels included)",
@@ -448,7 +454,7 @@ ARTS = [{"f": 1, "a": NOW - 60, "t": "S%d" % i, "l": "", "c": big}
         for i in range(dg.SINGLE_PASS_CHARS // dg.MAX_ARTICLE_CHARS + 2)]
 dg.run_claude = fake_map_claude
 try:
-    run(["--lang", "Español"])
+    run(["--lang", "Español", "--out-dir", OUT])
 except SystemExit:  # the reduce output is notes, not html — expected here
     pass
 check_true("map-reduce: --lang rides every map prompt",
@@ -464,25 +470,26 @@ ARTS = [{"f": 1, "a": NOW - 60, "t": "Story", "l": "http://e/1", "c": "<p>body</
 reset()
 
 
-def failing_publish(name, rss):
-    raise dg.DigestError("srr syndicate push failed (1): boom")
+def failing_publish(name, rss, out_dir):
+    raise dg.DigestError("cannot write /x/digest.rss: boom")
 
 
 dg.publish = failing_publish
 check_exits("publish failure: exits with the reason, not a traceback",
-            [], "srr syndicate push failed")
+            ["--out-dir", OUT], "cannot write")
 dg.publish = fake_publish
 
 reset()
 
 
 def failing_run_json(cmd):
-    raise dg.DigestError("srr: not found on PATH")
+    raise dg.DigestError("drr: not found on PATH")
 
 
 dg.run_json = failing_run_json
-check_exits("a broken srr exits with the reason, not a traceback", [], "not found on PATH")
-check("a broken srr costs no claude call", claude_calls, [])
+check_exits("a broken drr exits with the reason, not a traceback",
+            ["--out-dir", OUT], "not found on PATH")
+check("a broken drr costs no claude call", claude_calls, [])
 dg.run_json = fake_run_json
 
 # --- empty window ---------------------------------------------------------
@@ -490,19 +497,19 @@ reset()
 HISTORY[:] = []
 ARTS = []
 check_exits("empty window: an error, because that is a broken fetch loop, "
-            "not a quiet news day", [], "no articles at all")
+            "not a quiet news day", ["--out-dir", OUT], "no articles at all")
 check("empty window: nothing published", pushed, [])
 check("empty window: no claude call either", claude_calls, [])
 
 reset()
 check_exits("empty window: an explicit --since/--before window is not blamed "
-            "on the fetch loop", ["--since", "24h"], "requested window")
+            "on the fetch loop", ["--since", "24h", "--out-dir", OUT], "requested window")
 reset()
 check_exits("empty window: ...same for an explicit --until",
-            ["--until", "24h"], "requested window")
+            ["--until", "24h", "--out-dir", OUT], "requested window")
 
 reset()
-out = run(["--allow-empty"])
+out = run(["--allow-empty", "--out-dir", OUT])
 check_true("--allow-empty: takes the quiet day and exits clean",
            "no articles" in out, out)
 check("--allow-empty: still publishes nothing", pushed, [])
@@ -560,6 +567,53 @@ check("kill_children: a child that ignores SIGTERM is escalated to SIGKILL",
       rc, -signal.SIGKILL)
 check_true("kill_children: ... after the grace period, not instead of it",
            0.5 <= elapsed < 4, f"{elapsed:.2f}s")
+
+# --- file publish / history (drr port) ---
+d = tempfile.mkdtemp()
+RSS1 = dg.render_rss([YESTERDAY], None)
+p = real_publish("digest-x", RSS1, d)
+check("publish writes <out_dir>/<name>.rss", p, os.path.join(d, "digest-x.rss"))
+check("publish content round-trips", open(p).read(), RSS1)
+check("publish mode is 0644", _stat.S_IMODE(os.stat(p).st_mode), 0o644)
+check("publish leaves no temp file", sorted(os.listdir(d)), ["digest-x.rss"])
+check("fetch_history reads back what publish wrote",
+      [e["date"] for e in real_fetch_history("digest-x", d)], ["2000-01-01"])
+try:
+    real_fetch_history("nope", d)
+    check_true("missing history raises", False)
+except dg.DigestError as e:
+    check_true("missing history names --no-history", "--no-history" in str(e), str(e))
+open(os.path.join(d, "bad.rss"), "w").write("<html>404</html>")
+try:
+    real_fetch_history("bad", d)
+    check_true("corrupt history raises", False)
+except dg.DigestError as e:
+    check_true("corrupt history names the file", "bad.rss" in str(e), str(e))
+try:
+    real_publish("x", RSS1, os.path.join(d, "absent"))
+    check_true("unwritable out dir raises", False)
+except dg.DigestError as e:
+    check_true("unwritable out dir names the path", "absent" in str(e), str(e))
+check_true("unwritable out dir left nothing", not os.path.exists(os.path.join(d, "absent")))
+
+seen = []
+
+
+def spy_run_json(cmd):
+    seen.append(cmd)
+    return fake_run_json(cmd)
+
+
+dg.run_json = spy_run_json
+run(["--dump", "--drr-cmd", "sudo -n -u drr /opt/drr/bin/drr -o /srv/drr"])
+want = shlex.split("sudo -n -u drr /opt/drr/bin/drr -o /srv/drr")
+check_true("--drr-cmd prefixes every store read",
+           seen and all(c[:len(want)] == want for c in seen), str(seen[:2]))
+dg.DRR_CMD[:] = ["drr"]  # main() set it for the run above; restore the default
+dg.run_json = fake_run_json
+check_exits("--out-dir missing is a flag error before any subprocess",
+            ["--no-history"], "--out-dir")
+
 
 print()
 if failures:

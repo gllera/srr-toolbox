@@ -12,7 +12,7 @@ bin/srr-telegram    ingest strategy: Telegram channel (incl. private) -> SRR ite
 bin/srr-youtube     ingest strategy: YouTube channel Atom feed -> SRR items
 bin/srr-x           ingest strategy: X/Twitter account (via a Nitter instance) -> SRR items
 bin/srr-tts         pipeline step: prepend a piper TTS narration to the article
-bin/srr-digest-gen  store tool: Claude-written daily digest of the store, back into it
+bin/drr-digest-gen  store tool: Claude-written daily digest of the store, published as a feed file
 bin/srr-uvrun       shebang wrapper that runs the Python scripts in this repo's uv venv
 tests/              self-checking test scripts + fixtures
 pyproject.toml      shared dependencies for every bin/ script, pinned by uv.lock
@@ -161,31 +161,33 @@ srr-tts --voice es_ES-davefx-medium --asset-dir /tmp/warm article.html
 
 ## Store tools
 
-Not driven by `srr` — they drive `srr`. Everything store-shaped (where the store
-lives, its credentials, its endpoint) stays inside the backend: these scripts only
-call the CLI.
+Not driven by the reader — they drive `drr`. Everything store-shaped (where the
+store lives, its credentials) stays inside the backend: these scripts only call
+the CLI.
 
-### `srr-digest-gen`
+### `drr-digest-gen`
 
-Reads the last N hours of articles out of the store (`srr feed ls` + `srr art`),
-has `claude -p` write an editorial digest of them, and hands the resulting rolling
-14-day RSS feed back to `srr syndicate push`, which writes it into the store as
-`out/<name>.rss`. Subscribe the store to that feed's public URL and the digest shows up in
+Reads the last N hours of articles out of the store (`drr feed ls` + `drr art`),
+has `claude -p` write an editorial digest of them, and writes the resulting rolling
+14-day RSS feed atomically to `<out-dir>/<name>.rss`. Serve that directory,
+subscribe the store to the file's public URL and the digest shows up in
 the reader like any other feed — date-keyed GUIDs mean one article per day. Article
 text is untrusted, so every claude call runs with all tools disabled (`--tools ""`): a
 prompt injection in an article has nothing to reach for.
 
 ```bash
-srr-digest-gen                     # today's digest, pushed to out/digest.rss
-srr-digest-gen --dry-run           # print the RSS instead; touch nothing
-srr-digest-gen --dump              # print the collected articles as JSON; no claude call
-srr-digest-gen --hours 72 --tag news
-srr-digest-gen --no-history        # bootstrap: the feed does not exist yet
-srr-digest-gen --force             # replace a day the feed already carries
+drr-digest-gen --out-dir /srv/feeds   # today's digest, written to /srv/feeds/digest.rss
+drr-digest-gen --dry-run --no-history # print the RSS instead; touch nothing
+drr-digest-gen --dump                 # print the collected articles as JSON; no claude call
+drr-digest-gen --out-dir /srv/feeds --hours 72 --tag news
+drr-digest-gen --out-dir /srv/feeds --no-history  # bootstrap: the feed does not exist yet
+drr-digest-gen --out-dir /srv/feeds --force       # replace a day the feed already carries
+# a store owned by another user: --drr-cmd is the command prefix, split like a shell line
+drr-digest-gen --drr-cmd 'sudo -n -u drr /opt/drr/bin/drr -o /srv/drr' --out-dir /srv/feeds
 ```
 
-**It keeps no local state.** The previous days come from `srr syndicate fetch` — the
-published feed *is* the history, so any box that can reach the store can run it, and
+**It keeps no local state.** The previous days come from `<out-dir>/<name>.rss` — the
+published feed *is* the history, so any box that can read that file can run it, and
 there is no second copy to drift out of sync. `--no-history` is the one-time bootstrap
 for a feed that does not exist yet; it rewrites the feed with today alone.
 
@@ -194,7 +196,7 @@ than a fixed 24 h: a run missed at 07:00 and caught up at 19:00 covers both days
 instead of dropping one. Floored at 24 h (a same-day rerun still digests a full day),
 capped by `--max-hours` (default 72 — after a longer outage the missing days stay
 missing, loudly, rather than becoming one enormous edition). `--hours N` overrides it;
-`--dump` never computes it, so the query path needs no backend support.
+`--dump` never computes it, so the query path needs no feed file.
 
 A quiet day (≤300k chars of prompt payload) is one claude call. A busy one goes
 map-reduce: ~150k-char chunks of full-text articles are each condensed into
@@ -205,8 +207,8 @@ survivors. So full article text informs the result even on days that wouldn't fi
 context window. If a map call comes back mostly unscored the filter fails open and
 keeps everything, rather than gutting the digest on a format drift.
 
-Deployment knowledge is all flags, none of it baked in: `--name` (syndication feed
-name), `--link` (the feed's public URL, for the RSS channel's `<link>` — omitted, no
+Deployment knowledge is all flags, none of it baked in: `--name` (the feed
+name: `<out-dir>/<name>.rss`), `--link` (the feed's public URL, for the RSS channel's `<link>` — omitted, no
 `<link>` is emitted; the items deliberately get none, or every digest in the
 reader would open the raw feed file), `--tz` (which day an entry is dated, default the machine's),
 `--exclude-tag` (default `digest`, so the digest never digests itself), `--lang` (the
@@ -215,15 +217,15 @@ a language to claude; the whole edition follows it, `Top:`/`Also:` labels includ
 Run it from a timer for a daily edition.
 
 Failure discipline: any error — store unreachable, claude failure, non-HTML output,
-push refused — aborts *before* the store is touched and prints the reason, never a
-traceback. Yesterday's feed stays published, and SRR sees unchanged GUIDs and no-ops.
+file write refused — aborts *before* the feed file is touched and prints the reason, never a
+traceback. Yesterday's feed stays published, and drr sees unchanged GUIDs and no-ops.
 Four deliberate refusals to guess:
 
-- **The window is covered or the run fails.** `srr art` returns a page at a time,
+- **The window is covered or the run fails.** `drr art` returns a page at a time,
   so collection pages back until it sees an article older than the window. `--limit`
   is a safety cap, and hitting it before the window is covered is an error — a digest
   that silently omits half its day is worse than no digest.
-- **A day already in the feed is not republished** without `--force`. SRR has almost
+- **A day already in the feed is not republished** without `--force`. drr has almost
   certainly ingested that GUID already and will not re-read it, so a quiet rerun would
   look like it worked while readers kept the old version.
 - **An empty window is an error**, not a quiet day. With feeds that work, "no articles
@@ -242,17 +244,16 @@ those are the calls whose loss wastes every other call. Each run logs what it co
 (`run: 4 claude calls, 380k prompt chars, 252s`) on the way out, including when it
 failed.
 
-**Backend requirement:** `srr syndicate push` / `srr syndicate fetch`, and the output
-feed must exist as an *external* slot — SRR reserves it but never generates its bytes:
+**First run.** The feed file does not exist yet, so read-back would fail; bootstrap it once:
 
 ```bash
-srr syndicate set digest -f rss -x      # once, per deployment
-srr-digest-gen --no-history             # first run: nothing published to read back yet
+drr-digest-gen --out-dir /srv/feeds --no-history   # nothing published to read back yet
 ```
 
-Against a backend without those commands the run fails when it reads the feed back,
-before spending a claude call; `--dump` works regardless (it never touches the feed),
-and `--dry-run --no-history` exercises everything up to the push.
+Subscribe the store to the public URL of `<out-dir>/<name>.rss` afterwards. A missing
+`--out-dir` (outside `--dump` and `--dry-run --no-history`) or a missing feed file fails
+before a claude call is spent; `--dump` works regardless, and `--dry-run --no-history`
+exercises everything up to the write.
 
 ## Python setup
 

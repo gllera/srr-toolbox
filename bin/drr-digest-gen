@@ -1,36 +1,35 @@
 #!/usr/bin/env srr-uvrun
-"""srr-digest-gen — daily Claude-written digest of the SRR store.
+"""drr-digest-gen — daily Claude-written digest of the drr store.
 
-Collects the articles fetched in the last N hours via `srr art` and has
+Collects the articles fetched in the last N hours via `drr art` and has
 `claude -p` (headless, all tools disabled) write an editorial digest. A quiet
 day fits one call; a busy day goes map-reduce — chunks of full-text articles
 are condensed into relevance-scored plain-text story notes by one claude call
 each (on the cheaper --map-model, several in flight), notes below the
 relevance floor are dropped, then a final call on the default model writes the
-digest from the survivors. The result is a rolling RSS 2.0 feed handed to
-`srr syndicate push`, which writes it into the store as out/<name> under srr's
-own credentials — this script never sees the store's endpoint or keys. The
-store subscribes to the published URL as a normal feed.
+digest from the survivors. The result is a rolling RSS 2.0 feed written
+atomically to <out-dir>/<name>.rss — wherever that directory is served from,
+drr subscribes to the published URL as a normal feed. The store itself is
+reached only through the `drr` command (--drr-cmd), never opened here.
 
-The tool is stateless: the previous days come from `srr syndicate fetch`, i.e.
-the published feed IS the history, so any box that can reach the store can run
+The tool is stateless: the previous days come from <out-dir>/<name>.rss, i.e.
+the published feed IS the history, so any box that can read that file can run
 it. `--no-history` is the bootstrap for a feed that does not exist yet. That
 feed also dates the last edition, so the default window is the gap since it
 (floored at a day, capped by --max-hours) — a missed run is caught up, not
 skipped.
 
 Modes:
-  srr-digest-gen                 generate today's digest, rewrite the feed
-  srr-digest-gen --dump          print collected articles as JSON and exit
-                                 (consumed by the /srr-digest skill; no claude
-                                 call, no feed read back)
-  srr-digest-gen --dry-run       generate but print the RSS to stdout,
-                                 touching neither the store nor anything else
+  drr-digest-gen --out-dir DIR   generate today's digest, rewrite the feed file
+  drr-digest-gen --dump          print collected articles as JSON and exit
+                                 (no claude call, no feed read back)
+  drr-digest-gen --dry-run       generate but print the RSS to stdout,
+                                 writing nothing anywhere
 
 Failure discipline: any error (store unreachable, window not covered, claude
-failure, output that is not shaped like a digest, push refused) aborts BEFORE
-the store is touched — yesterday's feed stays, SRR sees unchanged GUIDs and
-no-ops. An empty window is an error too: with feeds that work, no articles at
+failure, output that is not shaped like a digest, file write refused) aborts
+BEFORE the feed file is touched — yesterday's feed stays, drr sees unchanged
+GUIDs and no-ops. An empty window is an error too: with feeds that work, no articles at
 all means the fetch loop is broken (--allow-empty says otherwise). Two
 exceptions, both deliberate: a lost map chunk (up to a third may fail and the
 day is still digested from the rest), and the calls whose loss would waste
@@ -45,6 +44,8 @@ import re
 import signal
 import subprocess
 import sys
+import shlex
+import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -58,8 +59,9 @@ from zoneinfo import ZoneInfo
 
 DEFAULT_NAME = "digest"
 DEFAULT_EXCLUDE_TAG = "digest"  # never digest the digest
-GUID_PREFIX = "srr-digest-"  # + the entry date. The dedup key SRR stores: never change it
-PAGE_SIZE = 500  # articles per `srr art` request while paging back to the cutoff
+GUID_PREFIX = "srr-digest-"  # + the entry date. The dedup key the reader stores: never change it
+DRR_CMD = ["drr"]  # the store command prefix; main() sets it from --drr-cmd
+PAGE_SIZE = 500  # articles per `drr art` request while paging back to the cutoff
 DEFAULT_HOURS = 24  # window with nothing published to measure the gap from, and its floor
 DEFAULT_MAX_HOURS = 72  # ... and its ceiling: a long outage is not worth one giant edition
 MAX_ARTICLE_CHARS = 1500
@@ -298,7 +300,7 @@ DURATION_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
 def parse_time_bound(s, now, flag="--since"):
-    """A --since/--until value, in the forms `srr art` takes: a duration
+    """A --since/--until value, in the forms `drr art` takes: a duration
     before `now` (24h, 7d, 2w, compounds like 1d12h), a bare date (local
     midnight, as the backend reads it), or an RFC3339 instant. Resolved
     against the caller's `now` rather than reading the clock here, so the
@@ -335,18 +337,18 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
     An explicit `since` (an aware datetime the caller pinned once) replaces
     the hours-derived instant as both the backend window and the belt below;
     `until` closes the window's top the same way (inclusive, belted too);
-    `before` seeds the first page's cursor (srr art -b, exclusive), and
+    `before` seeds the first page's cursor (drr art -b, exclusive), and
     paging continues downward from there.
 
     `tags` and `feed_ids` restrict collection to the union the backend builds
     from `-g`/`-i` (a feed is in when its id is listed or its tag matches);
     both empty collects every feed. The selection is validated against
-    `srr feed ls` first: a typo'd tag would otherwise collect an empty window
+    `drr feed ls` first: a typo'd tag would otherwise collect an empty window
     and the empty-window error would blame the fetch loop.
 
     The window is `--since`, so the backend does the filtering, but a page is
     still a page: this walks next_cursor until the store runs out. The
-    client-side cutoff stays as a belt — an older `srr` that ignores --since
+    client-side cutoff stays as a belt — an older `drr` that ignores --since
     would otherwise hand back the entire store. Stopping early because `limit`
     ran out would digest a silently partial window, so that is an error, not a
     truncation.
@@ -357,17 +359,17 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
     oldest seconds of the window off the last page — and the belt below, fixed
     at the start, could not see that happen.
     """
-    feeds = {f["id"]: f for f in run_json(["srr", "feed", "ls"])}
+    feeds = {f["id"]: f for f in run_json([*DRR_CMD, "feed", "ls"])}
     known_tags = {f["tag"] for f in feeds.values() if f.get("tag")}
     for tag in tags:
         if tag not in known_tags:
             raise DigestError(
-                f"unknown tag {tag!r}; srr feed ls knows: "
+                f"unknown tag {tag!r}; drr feed ls knows: "
                 f"{', '.join(sorted(known_tags)) or '(no tags at all)'}")
     for fid in feed_ids:
         if fid not in feeds:
             raise DigestError(
-                f"unknown feed id {fid}; srr feed ls knows: "
+                f"unknown feed id {fid}; drr feed ls knows: "
                 f"{', '.join(str(i) for i in sorted(feeds))}")
     if since is None:
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
@@ -380,7 +382,7 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
     cutoff = since.timestamp()
     result, cursor, covered = [], before, False
     while not covered:
-        cmd = ["srr", "art", "-l", str(PAGE_SIZE),
+        cmd = [*DRR_CMD, "art", "-l", str(PAGE_SIZE),
                "--since", since.strftime("%Y-%m-%dT%H:%M:%SZ")]
         if until is not None:
             cmd += ["--until", until.strftime("%Y-%m-%dT%H:%M:%SZ")]
@@ -431,7 +433,7 @@ def collect(hours, tags, feed_ids, limit, exclude_tag=DEFAULT_EXCLUDE_TAG,
         elif cursor == prev:
             # A cursor that does not advance would page this loop forever
             # against the store. Stop and say so rather than hammer it.
-            raise DigestError(f"srr art returned the same cursor twice ({cursor}); "
+            raise DigestError(f"drr art returned the same cursor twice ({cursor}); "
                               f"stopping rather than paging forever")
     return result
 
@@ -678,21 +680,56 @@ def summarize(articles, hours, lang=DEFAULT_LANG, model=None,
     return with_retry("reduce", lambda: clean_html(run_claude(reduce_prompt, model=model)))
 
 
-def publish(name, rss):
-    # srr owns the store: it holds the endpoint and credentials and decides
-    # where out/<name> lives. This script only hands over the bytes.
-    run_cmd(["srr", "syndicate", "push", name, "-"], stdin=rss)
+def feed_path(name, out_dir):
+    return os.path.join(out_dir, f"{name}.rss")
 
 
-def fetch_history(name):
+def publish(name, rss, out_dir):
+    """Write <out_dir>/<name>.rss atomically (temp file beside it, then
+    os.replace), so a reader never sees a half-written feed."""
+    path = feed_path(name, out_dir)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=out_dir, prefix=f".{name}.",
+                suffix=".tmp", delete=False) as f:
+            tmp = f.name
+            f.write(rss)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except OSError as e:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise DigestError(f"cannot write {path}: {e}")
+    return path
+
+
+def fetch_history(name, out_dir):
     """The published feed IS the history — read it back and parse it.
 
-    Keeping a local copy of the last 14 days would be a second source of truth
-    that can drift from the store (a restore, another box, a stale path), and
-    drift here silently truncates the feed. Round-tripping our own XML is
-    exact, so the store stays the only state.
+    Keeping a second copy of the last 14 days would be a second source of
+    truth that can drift (a restore, another box, a stale path), and drift here
+    silently truncates the feed. Round-tripping our own XML is exact, so the
+    published file stays the only state.
     """
-    return parse_history(run_cmd(["srr", "syndicate", "fetch", name]))
+    path = feed_path(name, out_dir)
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        raise DigestError(
+            f"{path} does not exist; pass --no-history for a feed's first edition")
+    except OSError as e:
+        raise DigestError(f"cannot read {path}: {e}")
+    try:
+        return parse_history(text)
+    except DigestError as e:
+        raise DigestError(f"{path}: {e}")
 
 
 def parse_history(rss):
@@ -700,6 +737,10 @@ def parse_history(rss):
         root = ET.fromstring(rss)
     except ET.ParseError as e:
         raise DigestError(f"published feed is not parsable XML ({e})")
+    if root.tag != "rss" or root.find("channel") is None:
+        # well-formed but not our feed (an HTML error page): reading it as an
+        # empty history would silently wipe every older day on the next write
+        raise DigestError("published feed is not an RSS document")
     history, seen = [], set()
     for item in root.iterfind("./channel/item"):
         guid = (item.findtext("guid") or "").strip()
@@ -798,7 +839,7 @@ def feed_id_list(value):
         except ValueError:
             raise argparse.ArgumentTypeError(
                 f"feed id {t.strip()!r} is not an integer "
-                f"(srr feed ls prints the ids)")
+                f"(drr feed ls prints the ids)")
     return ids
 
 
@@ -869,7 +910,7 @@ def build_parser():
                          "after a longer outage the missing days stay missing")
     ap.add_argument("--since",
                     help="collect from this time instead of --hours/the gap — "
-                         "the forms srr art --since takes: a duration "
+                         "the forms drr art --since takes: a duration "
                          "before now (24h, 7d, 2w), a date (2026-07-15), or "
                          "an RFC3339 instant; resolved once so pages cannot "
                          "creep")
@@ -879,16 +920,16 @@ def build_parser():
                          "--hours (or the flat %d) ending there" % DEFAULT_HOURS)
     ap.add_argument("--before", type=int,
                     help="collect only articles below this article id "
-                         "(exclusive), srr art -b; paging continues "
+                         "(exclusive), drr art -b; paging continues "
                          "downward from there")
     ap.add_argument("--tag", type=tag_list, action="extend", default=[],
                     help="restrict collection to feeds carrying one of these "
                          "tags (repeatable and comma-splittable; unions with "
-                         "--feed; srr art -g)")
+                         "--feed; drr art -g)")
     ap.add_argument("--feed", type=feed_id_list, action="extend", default=[],
                     help="restrict collection to these feed IDs, as printed "
-                         "by srr feed ls (repeatable and comma-splittable; "
-                         "unions with --tag; srr art -i)")
+                         "by drr feed ls (repeatable and comma-splittable; "
+                         "unions with --tag; drr art -i)")
     ap.add_argument("--limit", type=int, default=5000,
                     help="safety cap on articles collected (default 5000); "
                          "hitting it before the window is covered is an error, "
@@ -903,7 +944,17 @@ def build_parser():
                          "by --tag/--feed (default %(default)r — never digest "
                          "the digest); empty collects everything")
     ap.add_argument("--name", default=DEFAULT_NAME,
-                    help="syndication feed read back and pushed to (default %(default)r)")
+                    help="feed name: <out-dir>/<name>.rss is read back and "
+                         "rewritten (default %(default)r)")
+    ap.add_argument("--drr-cmd", default="drr",
+                    help="the drr command, split like a shell line, e.g. "
+                         "'sudo -n -u drr /opt/drr/bin/drr -o /srv/drr' "
+                         "(default %(default)r)")
+    ap.add_argument("--out-dir",
+                    help="directory the published feeds live in: "
+                         "<out-dir>/<name>.rss is read back as history and "
+                         "rewritten (required unless --dump, or --dry-run "
+                         "--no-history)")
     ap.add_argument("--link",
                     help="public URL the published feed is served at, for the "
                          "channel <link>; omitted emits none")
@@ -918,7 +969,7 @@ def build_parser():
                          "not exist yet — it drops every older day from it")
     ap.add_argument("--force", action="store_true",
                     help="replace today's entry if the feed already has one "
-                         "(SRR has likely ingested that GUID already and will "
+                         "(drr has likely ingested that GUID already and will "
                          "not re-read it, so readers keep the first version)")
     ap.add_argument("--lang", default=DEFAULT_LANG,
                     help="language the digest is written in (default "
@@ -936,7 +987,7 @@ def build_parser():
                          "claude call, no feed read back, plain %d-hour default"
                          % DEFAULT_HOURS)
     ap.add_argument("--dry-run", action="store_true",
-                    help="print the RSS instead of pushing it; skips the "
+                    help="print the RSS instead of writing it; skips the "
                          "already-published check, writes nothing anywhere")
     return ap
 
@@ -954,10 +1005,12 @@ def generate(args):
     # Resolved first: a --since/--hours contradiction or an inverted window is
     # a pure flag error and must die before any subprocess — behind
     # fetch_history a down store would mask it.
+    if not args.dump and not args.out_dir and not (args.dry_run and args.no_history):
+        raise DigestError("--out-dir is required to read and write the published feed")
     win = window_bounds(args)
 
     # --dump is a query, not a run: it never reads the feed back, so the skill
-    # path keeps working against a backend without `srr syndicate`.
+    # path keeps working against a backend without a published feed.
     if args.dump:
         hours = ((DEFAULT_HOURS if args.hours is None else args.hours)
                  if win is None else win[0])
@@ -969,17 +1022,18 @@ def generate(args):
         return
 
     if args.no_history:
-        log(f"--no-history: out/{args.name} will be rewritten with today alone")
+        target = feed_path(args.name, args.out_dir or "<out-dir>")
+        log(f"--no-history: {target} will be rewritten with today alone")
         history = []
     else:
-        history = fetch_history(args.name)
+        history = fetch_history(args.name, args.out_dir)
 
     now = now_local(args.tz)
     date = now.strftime("%Y-%m-%d")
     if any(e["date"] == date for e in history) and not (args.force or args.dry_run):
         raise DigestError(
-            f"{date} is already published in out/{args.name}; rerun with --force "
-            f"to replace it (SRR has probably ingested {GUID_PREFIX}{date} "
+            f"{date} is already published in {feed_path(args.name, args.out_dir)}; rerun with --force "
+            f"to replace it (drr has probably ingested {GUID_PREFIX}{date} "
             f"already and will not re-read a known GUID, so readers keep the "
             f"version they have)"
         )
@@ -1029,8 +1083,8 @@ def generate(args):
     if args.dry_run:
         print(rss)
         return
-    publish(args.name, rss)
-    print(f"published {date}: {len(articles)} articles -> out/{args.name}")
+    path = publish(args.name, rss, args.out_dir)
+    print(f"published {date}: {len(articles)} articles -> {path}")
 
 
 def _on_signal(signum, frame):
@@ -1044,16 +1098,17 @@ def _on_signal(signum, frame):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    DRR_CMD[:] = shlex.split(args.drr_cmd)
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, _on_signal)
     started = time.monotonic()
     try:
         return generate(args)
     except DigestError as e:
-        sys.exit(f"srr-digest-gen: {e}")
+        sys.exit(f"drr-digest-gen: {e}")
     except KeyboardInterrupt:
         kill_children()
-        sys.exit("srr-digest-gen: interrupted")
+        sys.exit("drr-digest-gen: interrupted")
     finally:
         # what the run cost, on the way out either way — a failed run's bill is
         # exactly the number you want in the journal

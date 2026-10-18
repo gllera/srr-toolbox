@@ -1,6 +1,6 @@
-"""Tests for srr-digest-gen's pure logic: collection windowing and paging,
+"""Tests for drr-digest-gen's pure logic: collection windowing and paging,
 note filtering, chunking, RSS rendering and reading the published feed back
-as history. No claude, no srr, no network — `srr` is stubbed by
+as history. No claude, no drr, no network — `drr` is stubbed by
 monkeypatching run_json.
 
     uv run tests/test_digest_content.py
@@ -13,10 +13,10 @@ import time
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(HERE, "..", "bin", "srr-digest-gen")
+SCRIPT = os.path.join(HERE, "..", "bin", "drr-digest-gen")
 
-loader = importlib.machinery.SourceFileLoader("srr_digest_gen", SCRIPT)
-spec = importlib.util.spec_from_loader("srr_digest_gen", loader)
+loader = importlib.machinery.SourceFileLoader("drr_digest_gen", SCRIPT)
+spec = importlib.util.spec_from_loader("drr_digest_gen", loader)
 dg = importlib.util.module_from_spec(spec)
 loader.exec_module(dg)
 
@@ -55,7 +55,7 @@ FEEDS = [
     {"id": 2, "title": "Daily Digest", "tag": "digest"},
     {"id": 3, "title": "Untagged"},
 ]
-ARTS = [  # newest first, as `srr art` returns them
+ARTS = [  # newest first, as `drr art` returns them
     {"f": 1, "a": NOW - 60, "t": "Fresh story", "l": "http://e/1",
      "c": "<p>Body <b>text</b>\n  here</p>"},
     {"f": 2, "a": NOW - 120, "t": "Yesterday's digest", "l": "", "c": "<p>self</p>"},
@@ -69,7 +69,7 @@ calls = []
 
 def fake_run_json(cmd):
     calls.append(cmd)
-    if cmd[:3] == ["srr", "feed", "ls"]:
+    if "feed" in cmd and "ls" in cmd:
         return FEEDS
     return {"articles": ARTS}
 
@@ -85,7 +85,7 @@ check("collect: link kept", got[0]["link"], "http://e/1")
 check("collect: blank title falls back to the body", got[1]["title"], "untitled body")
 
 check("collect: the window is the backend's --since, a page at a time",
-      calls[1][:4], ["srr", "art", "-l", str(dg.PAGE_SIZE)])
+      calls[1][:4], ["drr", "art", "-l", str(dg.PAGE_SIZE)])
 check_true("collect: --since is an instant, not a duration that creeps "
            "forward from page to page",
            abs(datetime.strptime(calls[1][5], "%Y-%m-%dT%H:%M:%SZ")
@@ -93,7 +93,7 @@ check_true("collect: --since is an instant, not a duration that creeps "
                - (time.time() - 24 * 3600)) < 60)
 calls.clear()
 dg.collect(24, ["news/tech"], [], 5)
-check("collect: --tag reaches srr art", calls[1][6:], ["-g", "news/tech"])
+check("collect: --tag reaches drr art", calls[1][6:], ["-g", "news/tech"])
 calls.clear()
 dg.collect(24, ["news/tech", "digest"], [], 5)
 check("collect: several tags become repeated -g flags",
@@ -112,13 +112,13 @@ check("collect: tags and feeds ride one query — the backend unions them",
 calls.clear()
 check_raises("collect: an unknown tag is an error naming the known ones",
              lambda: dg.collect(24, ["newz"], [], 5),
-             "unknown tag 'newz'; srr feed ls knows: digest, news/tech")
+             "unknown tag 'newz'; drr feed ls knows: digest, news/tech")
 check("collect: the unknown tag was refused before any article query",
       len(calls), 1)
 calls.clear()
 check_raises("collect: an unknown feed id is an error naming the known ones",
              lambda: dg.collect(24, [], [9], 5),
-             "unknown feed id 9; srr feed ls knows: 1, 2, 3")
+             "unknown feed id 9; drr feed ls knows: 1, 2, 3")
 check("collect: the unknown feed id was refused before any article query",
       len(calls), 1)
 
@@ -154,7 +154,7 @@ check("collect: the blank-title fallback reads the uncapped text, not the "
       dg.collect(24, [], [], 1000, max_chars=2)[0]["title"], "x" * 80)
 ARTS = ARTS_SAVE
 
-# --- parse_time_bound: the forms `srr art --since` takes ----------------
+# --- parse_time_bound: the forms `drr art --since` takes ----------------
 T0 = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
 check("parse_time_bound: hours duration", dg.parse_time_bound("24h", T0),
       T0 - timedelta(hours=24))
@@ -194,7 +194,7 @@ check("collect: the explicit since drives the client-side belt too",
       ["Tech News"])
 calls.clear()
 dg.collect(24, [], [], 1000, before=77)
-check("collect: --before seeds the first page's cursor (srr art -b)",
+check("collect: --before seeds the first page's cursor (drr art -b)",
       calls[1][6:], ["-b", "77"])
 
 until = datetime.fromtimestamp(NOW - 100, timezone(timedelta(hours=2)))
@@ -220,7 +220,7 @@ PAGES = {
 
 def paged_run_json(cmd):
     calls.append(cmd)
-    if cmd[:3] == ["srr", "feed", "ls"]:
+    if "feed" in cmd and "ls" in cmd:
         return FEEDS
     cursor = int(cmd[cmd.index("-b") + 1]) if "-b" in cmd else None
     return PAGES[cursor]
@@ -233,7 +233,7 @@ check("collect: keeps paging past a page boundary inside the window", len(paged)
 check("collect: pages with the returned cursor",
       [c[c.index("-b") + 1] for c in calls if "-b" in c], ["900"])
 check("collect: stops paging at the first article past the cutoff",
-      len([c for c in calls if c[:2] == ["srr", "art"]]), 2)
+      len([c for c in calls if c[:2] == ["drr", "art"]]), 2)
 
 # store exhausted before the window is: no cursor, no error, no infinite loop
 EXHAUSTED = {None: {"articles": ARTS[:1]}}
@@ -249,7 +249,7 @@ check_raises("collect: --limit reached mid-window aborts the run",
 
 
 def stuck_run_json(cmd):
-    if cmd[:3] == ["srr", "feed", "ls"]:
+    if "feed" in cmd and "ls" in cmd:
         return FEEDS
     return {"articles": ARTS[:1], "next_cursor": 7}  # same cursor, forever
 
