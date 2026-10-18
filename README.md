@@ -1,7 +1,7 @@
 # srr-toolbox
 
-Companion `srr-*` scripts for **SRR** (Static RSS Reader — the Go `srr` backend +
-TypeScript frontend living in `~/ws/srr`): the ingest strategies that teach `srr` to
+The ingest and pipeline toolbox for **drr** (and formerly **srr**, its static-RSS-reader
+predecessor): `srr-*` scripts with the ingest strategies that teach the reader to
 read sources that don't speak usable RSS, a pipeline step, and a tool that drives the
 `srr` CLI from the outside.
 
