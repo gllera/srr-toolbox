@@ -37,11 +37,10 @@ srr-tts --voice en_US-lessac-medium --asset-dir /tmp/store article.html
 drr-digest-gen --dump --hours 2      # collected articles as JSON
 drr-digest-gen --dry-run --no-history  # full run, RSS to stdout, nothing written
 
-# Run the backend directly (nothing wraps it). There is ONE srr: ~/.config/srr/srr.yaml
-# is the only config and also the SRR_CONFIG-unset default, so bare `srr` operates on
-# the live deployment — point SRR_CONFIG at a scratch config when experimenting.
-srr ...                    # deployed backend (what the srr-fetch service runs)
-~/ws/srr/dist/srr ...      # live dev build, for testing backend changes
+# Run the reader's CLI directly (nothing wraps it). On the server it is drr's binary
+# as the drr user against the live data dir (read commands need no config):
+sudo -u drr /opt/drr/bin/drr -o /srv/drr ...   # live store on the server — reads only
+~/ws/drr/dist/drr -o <scratch-dir> ...         # dev build against a scratch data dir
 ```
 
 There is no build/lint step. The Python scripts have no `.py` extension; tests import
