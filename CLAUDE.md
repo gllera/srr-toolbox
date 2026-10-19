@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Companion scripts for SRR (the Go `srr` backend + TS frontend in
 `~/ws/srr`, which has its own CLAUDE.md — backend/frontend *code* changes go there,
 not here). `bin/` holds three kinds. Exec'd by `drr` by bare name, resolved from
-`PATH`: **`srr-telegram` / `srr-youtube` / `srr-x`** (python ingest
+`PATH`: **`srr-telegram` / `srr-youtube` / `srr-x` / `srr-sitemap`** (python ingest
 strategies — one process per feed, JSON stdin -> JSON stdout) and **`srr-tts`**
 (python pipeline step — one process per item, item JSON stdin -> item JSON stdout,
 prepends a piper TTS narration). Running the other way round, driving the `drr` CLI as
@@ -48,7 +48,7 @@ them by path via `importlib.machinery.SourceFileLoader`.
 
 ## Architecture
 
-**The external-ingest contract** (shared shape of all three strategies): `srr` writes
+**The external-ingest contract** (shared shape of all four strategies): `srr` writes
 one JSON request to stdin — `{url, etag, last_modified, asset_dir, max_asset_size}` —
 and reads one JSON response from stdout: `{"items": [...], "etag": …, "last_modified": …}`
 or `{"not_modified": true}`. srr persists the returned etag/last_modified cursors and

@@ -1,0 +1,511 @@
+#!/usr/bin/env srr-uvrun
+"""SRR external ingest strategy: a site's XML sitemap -> SRR items.
+
+Runs in the toolbox's shared uv project venv (repo-root pyproject.toml, via
+the srr-uvrun shebang wrapper) like every bin/ script, though it needs
+nothing beyond the standard library.
+
+For sites that publish no feed but do publish a sitemap (sitemaps.org
+`<urlset>`, or a `<sitemapindex>` of them) whose entries carry `<lastmod>`.
+The sitemap is the listing: each run takes the entries newer than the
+watermark it left last time, fetches each page ONCE for its metadata (the
+`og:*` / `article:published_time` / JSON-LD head data every CMS emits) and
+emits one item per page — title, published date, a clickable cover image and
+the page's description. The article body is NOT extracted here: put
+`#readability` (with a `selector=` pinning the site's content block) in the
+feed's pipe, exactly as for a teaser-only RSS feed.
+
+  drr feed add -t "Example" -u "https://example.com/sitemap.xml" \\
+    -i "srr-sitemap --match /posts/" \\
+    -p '#readability selector=article.post-body' -p '#default'
+
+HOW ENTRIES ARE PICKED
+----------------------
+- `<sitemapindex>`: every child sitemap is read (one level deep; a nested
+  index is skipped with a note on stderr). `--sitemap-match RE` reads only
+  the children whose URL matches RE — cheap when an index lists sections you
+  do not want (`--sitemap-match ofertas`).
+- `--match RE` keeps only the page URLs matching RE (e.g. `/posts/`).
+- Entries without `<lastmod>` are ignored: without a date there is no order
+  and no watermark, so a sitemap that carries none is not a source this
+  strategy can read.
+- The newest `--limit` entries (default 30) within the last `--since` days
+  (default 7) that are newer than the watermark are the run's batch. The
+  first run therefore ingests at most `--limit` recent pages, never a whole
+  archive; later runs see only what is new. The watermark is the newest
+  lastmod emitted, carried in the response's `etag` and echoed back by srr.
+- Pages are fetched oldest-first. A 404/410 page is skipped for good (a
+  removed entry must not wedge the feed); any other failure stops the batch
+  and leaves the watermark at the last page that succeeded, so the rest is
+  retried next run. A run that could emit nothing because of such a failure
+  exits non-zero, so the feed records the error.
+
+Each item's `guid` is fnv1a32 of the page URL; `published` is the page's
+`article:published_time` (else its JSON-LD `datePublished`, else the
+sitemap's lastmod). Sitemaps and pages are read with gzip accepted and
+capped at the request's `max_size` (what srr sends; 5 MB on a manual run).
+
+MANUAL RUNS (parameters instead of stdin)
+-----------------------------------------
+Normally srr drives this script by writing a JSON request to stdin. To test a
+sitemap by hand, pass the URL as an argument instead — the request is built
+from parameters and the result is pretty-printed:
+
+  srr-sitemap --match /posts/ "https://example.com/sitemap.xml"
+  srr-sitemap --limit 5 --since 2 "https://example.com/sitemap.xml"
+
+  <url>                     the sitemap (or sitemap index) URL
+  --match RE                keep only page URLs matching this regex
+  --sitemap-match RE        read only the index's child sitemaps matching RE
+  --limit N                 at most N pages per run (default 30)
+  --since DAYS              ignore entries older than DAYS days (default 7)
+  --ua STRING               the User-Agent to send (default below)
+  --etag <value>            the watermark from the previous run (what srr
+                            echoes back; an ISO 8601 instant)
+  --last-modified <value>   accepted for contract symmetry; unused
+  --asset-dir <dir>         accepted for contract symmetry; nothing is
+                            self-hosted (covers hotlink to the page's host)
+  --max-asset-size <bytes>  accepted for contract symmetry; unused
+"""
+import sys, re, json, html, gzip, zlib, urllib.request, urllib.error, http.client
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
+
+VERSION = "1.0"
+
+DEFAULT_UA = "Mozilla/5.0 (compatible; drr/1.0)"
+DEFAULT_MAX_SIZE = 5_000_000   # read cap when the request carries no max_size
+DEFAULT_LIMIT = 30
+DEFAULT_SINCE_DAYS = 7
+TIMEOUT = 30
+
+SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
+
+# Options (--match & co.) are per-process settings, not request fields: set by
+# main() from argv before the request is built, like srr-youtube's --selfhost.
+OPTS = {"match": None, "sitemap_match": None, "limit": DEFAULT_LIMIT,
+        "since": DEFAULT_SINCE_DAYS, "ua": DEFAULT_UA}
+
+
+def fnv1a32(s: str) -> int:
+    h = 0x811C9DC5
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def log(*a):
+    print("srr-sitemap:", *a, file=sys.stderr)
+
+
+# ---------------------------------------------------------------- dates
+
+def parse_instant(s):
+    """An ISO 8601 / W3C datetime (what <lastmod> and og meta carry) -> an
+    aware UTC datetime, or None when it does not parse. A bare date is
+    midnight UTC; a trailing Z is +00:00 (3.9's fromisoformat rejects it)."""
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith("Z") or s.endswith("z"):
+        s = s[:-1] + "+00:00"
+    try:
+        d = datetime.fromisoformat(s)
+    except ValueError:
+        # fromisoformat before 3.11 wants exactly 3 or 6 fractional digits
+        m = re.match(r"^(.*T\d\d:\d\d:\d\d)\.(\d+)(.*)$", s)
+        if not m:
+            return None
+        frac = (m.group(2) + "000000")[:6]
+        try:
+            d = datetime.fromisoformat(f"{m.group(1)}.{frac}{m.group(3)}")
+        except ValueError:
+            return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
+
+
+def rfc3339(d) -> str:
+    return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+# ---------------------------------------------------------------- HTTP
+
+def fetch_bytes(url: str, cap: int):
+    """GET url, gzip accepted, -> (body bytes, final url). Raises
+    urllib.error.HTTPError / URLError / OSError on failure. The body is cut
+    at cap bytes, before and after gzip decoding."""
+    hdr = {"User-Agent": OPTS["ua"], "Accept-Encoding": "gzip",
+           "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+    r = urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=TIMEOUT)
+    with r:
+        raw = r.read(cap)
+        final = r.geturl()
+        enc = (r.headers.get("Content-Encoding") or "").lower()
+    if enc == "gzip" or raw[:2] == b"\x1f\x8b":
+        raw = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw, cap)
+    return raw, final
+
+
+# ---------------------------------------------------------------- sitemaps
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_sitemap(body: bytes):
+    """-> ("index", [child urls]) or ("urlset", [(loc, lastmod datetime|None)]).
+    Raises ET.ParseError on malformed XML, ValueError on a non-sitemap root."""
+    root = ET.fromstring(body)
+    kind = _local(root.tag)
+    if kind == "sitemapindex":
+        return "index", [loc.strip() for sm in root if _local(sm.tag) == "sitemap"
+                         for loc in [sm.findtext(f"{{{SITEMAP_NS}}}loc") or sm.findtext("loc") or ""]
+                         if loc.strip()]
+    if kind != "urlset":
+        raise ValueError(f"not a sitemap: root element is <{kind}>")
+    entries = []
+    for u in root:
+        if _local(u.tag) != "url":
+            continue
+        loc = (u.findtext(f"{{{SITEMAP_NS}}}loc") or u.findtext("loc") or "").strip()
+        if not loc:
+            continue
+        lastmod = parse_instant(u.findtext(f"{{{SITEMAP_NS}}}lastmod") or u.findtext("lastmod"))
+        entries.append((loc, lastmod))
+    return "urlset", entries
+
+
+def collect_entries(url: str, cap: int):
+    """Read the sitemap at url — following a sitemapindex one level — and
+    return every (loc, lastmod) it lists. Sitemaps an index names that fail
+    to download are reported and skipped, so one broken shard does not hide
+    the others; the top-level document failing is the caller's error."""
+    body, _ = fetch_bytes(url, cap)
+    kind, got = parse_sitemap(body)
+    if kind == "urlset":
+        return got
+    sm_re = re.compile(OPTS["sitemap_match"]) if OPTS["sitemap_match"] else None
+    entries = []
+    for child in got:
+        if sm_re and not sm_re.search(child):
+            continue
+        try:
+            cbody, _ = fetch_bytes(child, cap)
+            ckind, cgot = parse_sitemap(cbody)
+        except (urllib.error.URLError, OSError, http.client.HTTPException,
+                ET.ParseError, ValueError) as e:
+            log(f"sitemap {child}: skipped: {e}")
+            continue
+        if ckind != "urlset":
+            log(f"sitemap {child}: nested index skipped (one level only)")
+            continue
+        entries.extend(cgot)
+    return entries
+
+
+def select_entries(entries, watermark, now=None):
+    """The run's batch: entries matching --match with a lastmod newer than
+    both the watermark and the --since horizon, the newest --limit of them,
+    oldest first (so a stop mid-batch leaves a clean watermark). Duplicate
+    locs (an index listing a page twice) collapse to their newest lastmod."""
+    now = now or datetime.now(timezone.utc)
+    horizon = now - timedelta(days=OPTS["since"])
+    m_re = re.compile(OPTS["match"]) if OPTS["match"] else None
+    newest = {}
+    for loc, lastmod in entries:
+        if lastmod is None or lastmod <= horizon:
+            continue
+        if watermark is not None and lastmod <= watermark:
+            continue
+        if m_re and not m_re.search(loc):
+            continue
+        if loc not in newest or newest[loc] < lastmod:
+            newest[loc] = lastmod
+    ranked = sorted(newest.items(), key=lambda e: e[1], reverse=True)[:OPTS["limit"]]
+    ranked.reverse()
+    return ranked
+
+
+# ---------------------------------------------------------------- pages
+
+class HeadParser(HTMLParser):
+    """Collects what the item needs from a page: <meta name|property=… content=…>,
+    <title>, the first <h1> and every JSON-LD script's text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.meta = {}
+        self.title = ""
+        self.h1 = ""
+        self.ldjson = []
+        self._in = None   # "title" | "h1" | "ld" | None
+        self._buf = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "meta":
+            key = a.get("property") or a.get("name")
+            val = a.get("content")
+            if key and val is not None and key not in self.meta:
+                self.meta[key.lower()] = val.strip()
+        elif tag == "title" and not self.title:
+            self._in, self._buf = "title", []
+        elif tag == "h1" and not self.h1:
+            self._in, self._buf = "h1", []
+        elif tag == "script" and (a.get("type") or "").lower() == "application/ld+json":
+            self._in, self._buf = "ld", []
+
+    def handle_endtag(self, tag):
+        if self._in == "title" and tag == "title":
+            self.title = " ".join("".join(self._buf).split())
+        elif self._in == "h1" and tag == "h1":
+            self.h1 = " ".join("".join(self._buf).split())
+        elif self._in == "ld" and tag == "script":
+            self.ldjson.append("".join(self._buf))
+        else:
+            return
+        self._in = None
+
+    def handle_data(self, data):
+        if self._in:
+            self._buf.append(data)
+
+
+LD_DATE_RE = re.compile(r'"datePublished"\s*:\s*"([^"]+)"')
+
+
+def slug_title(loc: str) -> str:
+    """The last path segment as words, a trailing numeric id dropped:
+    /posts/my-first-post-123/ -> 'My first post'."""
+    seg = [s for s in loc.split("?")[0].split("#")[0].split("/") if s]
+    seg = seg[-1] if seg else loc
+    seg = re.sub(r"\.[a-z0-9]{1,5}$", "", seg, flags=re.I)
+    words = [w for w in re.split(r"[-_]+", seg) if w]
+    if len(words) > 1 and words[-1].isdigit():
+        words = words[:-1]
+    text = " ".join(words).strip()
+    return (text[:1].upper() + text[1:]) if text else loc
+
+
+def parse_page(body: bytes, loc: str, lastmod):
+    """-> {title, published (datetime|None), image, description, site}."""
+    p = HeadParser()
+    try:
+        p.feed(body.decode("utf-8", "replace"))
+        p.close()
+    except Exception as e:   # HTMLParser is lenient; anything else is a page bug
+        log(f"page {loc}: parse trouble ignored: {e}")
+    m = p.meta
+    title = m.get("og:title") or m.get("twitter:title") or p.h1 or p.title or slug_title(loc)
+    site = m.get("og:site_name") or ""
+    if site and title.endswith(site):
+        # "<headline> · <site>" / "<headline> | <site>" title tags
+        title = re.sub(r"\s*[-|·—–:]\s*$", "", title[:-len(site)]).strip() or title
+    published = parse_instant(m.get("article:published_time"))
+    if published is None:
+        for ld in p.ldjson:
+            mm = LD_DATE_RE.search(ld)
+            if mm:
+                published = parse_instant(mm.group(1))
+                if published is not None:
+                    break
+    if published is None:
+        published = lastmod
+    image = m.get("og:image") or m.get("twitter:image") or ""
+    if not re.match(r"^https?://", image):
+        image = ""
+    desc = m.get("og:description") or m.get("description") or m.get("twitter:description") or ""
+    return {"title": title, "published": published, "image": image,
+            "description": " ".join(desc.split()), "site": site}
+
+
+def build_item(loc: str, page: dict) -> dict:
+    parts = []
+    if page["image"]:
+        parts.append(f'<p><a href="{html.escape(loc)}"><img src="{html.escape(page["image"])}" '
+                     f'alt="{html.escape(page["title"])}"></a></p>')
+    if page["description"]:
+        parts.append(f"<p>{html.escape(page['description'])}</p>")
+    if not parts:
+        parts.append(f'<p><a href="{html.escape(loc)}">{html.escape(loc)}</a></p>')
+    return {
+        "guid": fnv1a32(loc),
+        "title": page["title"],
+        "content": "".join(parts),
+        "link": loc,
+        "published": rfc3339(page["published"]) if page["published"] else None,
+    }
+
+
+class BatchStopped(Exception):
+    """A page failed for a reason a retry may fix; the batch stops here."""
+
+
+def fetch_page(loc: str, cap: int):
+    """-> page bytes, or None for a page that is gone for good (404/410).
+    Raises BatchStopped on any other failure."""
+    try:
+        body, _ = fetch_bytes(loc, cap)
+        return body
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            return None
+        raise BatchStopped(f"HTTP {e.code}") from e
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        raise BatchStopped(str(e)) from e
+
+
+# ---------------------------------------------------------------- the run
+
+def run_ingest(req):
+    cap = int(req.get("max_size") or 0) or DEFAULT_MAX_SIZE
+    watermark = parse_instant(req.get("etag"))
+    if req.get("etag") and watermark is None:
+        log(f"etag {req['etag']!r} is not an instant; starting from scratch")
+    entries = collect_entries(req["url"], cap)
+    batch = select_entries(entries, watermark)
+    if not batch:
+        log(f"{len(entries)} entries, nothing newer than the watermark")
+        return {"not_modified": True}
+
+    items, site, failure = [], "", None
+    new_mark = watermark
+    for loc, lastmod in batch:
+        try:
+            body = fetch_page(loc, cap)
+        except BatchStopped as e:
+            failure = f"page {loc}: {e}"
+            break
+        if body is None:
+            log(f"page {loc}: gone (404/410), skipped")
+        else:
+            page = parse_page(body, loc, lastmod)
+            site = page["site"] or site
+            items.append(build_item(loc, page))
+        if new_mark is None or lastmod > new_mark:
+            new_mark = lastmod
+    if failure:
+        if not items:
+            raise BatchStopped(failure)
+        log(f"{failure}; stopping the batch after {len(items)} item(s), "
+            f"the rest is retried next run")
+    log(f"{len(entries)} entries, {len(batch)} in batch, {len(items)} item(s)")
+    out = {"items": items, "etag": rfc3339(new_mark) if new_mark else ""}
+    if site:
+        out["title"] = site
+    return out
+
+
+# ---------------------------------------------------------------- CLI
+
+CLI_PARAMS = {"--etag": "etag", "--last-modified": "last_modified",
+              "--asset-dir": "asset_dir", "--max-asset-size": "max_asset_size"}
+OPT_PARAMS = {"--match": "match", "--sitemap-match": "sitemap_match",
+              "--limit": "limit", "--since": "since", "--ua": "ua"}
+
+
+def parse_options(argv):
+    """Split the strategy's own options out of argv into OPTS (validated),
+    returning the rest (the request parameters and the URL)."""
+    rest, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in OPT_PARAMS:
+            if i + 1 >= len(argv):
+                sys.exit(f"srr-sitemap: {a} needs a value")
+            key, val = OPT_PARAMS[a], argv[i + 1]
+            if key in ("limit", "since"):
+                try:
+                    val = int(val)
+                except ValueError:
+                    val = -1
+                if val < 1:
+                    sys.exit(f"srr-sitemap: {a} must be a positive integer, got {argv[i + 1]!r}")
+            elif key in ("match", "sitemap_match"):
+                try:
+                    re.compile(val)
+                except re.error as e:
+                    sys.exit(f"srr-sitemap: {a} is not a valid regex: {e}")
+            elif not val:
+                sys.exit(f"srr-sitemap: {a} needs a non-empty value")
+            OPTS[key] = val
+            i += 2
+        else:
+            rest.append(a)
+            i += 1
+    return rest
+
+
+def request_from_argv(argv):
+    """CLI parameters -> the same request dict srr sends as JSON on stdin."""
+    req, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in CLI_PARAMS:
+            if i + 1 >= len(argv):
+                sys.exit(f"srr-sitemap: {a} needs a value")
+            req[CLI_PARAMS[a]] = argv[i + 1]
+            i += 2
+        elif a.startswith("-"):
+            sys.exit(f"srr-sitemap: unknown option {a!r} (see --help)")
+        elif "url" in req:
+            sys.exit(f"srr-sitemap: more than one sitemap URL given "
+                     f"({req['url']!r}, {a!r})")
+        else:
+            req["url"] = a
+            i += 1
+    if "url" not in req:
+        sys.exit("srr-sitemap: missing sitemap URL (see --help)")
+    if "max_asset_size" in req:
+        try:
+            req["max_asset_size"] = int(req["max_asset_size"])
+        except ValueError:
+            sys.exit(f"srr-sitemap: --max-asset-size must be a byte count, "
+                     f"got {req['max_asset_size']!r}")
+    return req
+
+
+def cmd_ingest(req=None):
+    # req is built from CLI parameters (manual run) or, when None, read as the
+    # JSON request srr writes to stdin (the SRR external-ingest contract).
+    pretty = req is not None
+    if req is None:
+        try:
+            req = json.load(sys.stdin)
+        except json.JSONDecodeError as e:
+            sys.exit(f"srr-sitemap: could not parse request on stdin: {e}")
+    try:
+        result = run_ingest(req)
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        sys.exit(f"srr-sitemap: sitemap fetch failed: {e}")
+    except ET.ParseError as e:
+        sys.exit(f"srr-sitemap: sitemap is not valid XML: {e}")
+    except ValueError as e:
+        sys.exit(f"srr-sitemap: {e}")
+    except BatchStopped as e:
+        sys.exit(f"srr-sitemap: {e}")
+    if pretty:
+        # manual run: readable for a human, not byte-compatible with srr's
+        json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+    else:
+        json.dump(result, sys.stdout)
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if argv and argv[0] in ("version", "--version", "-V"):
+        print("srr-sitemap", VERSION)
+        return
+    argv = parse_options(argv)
+    cmd_ingest(request_from_argv(argv) if argv else None)
+
+
+if __name__ == "__main__":
+    main()

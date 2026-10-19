@@ -11,6 +11,7 @@ read sources that don't speak usable RSS, a pipeline step, and a tool that drive
 bin/srr-telegram    ingest strategy: Telegram channel (incl. private) -> SRR items
 bin/srr-youtube     ingest strategy: YouTube channel Atom feed -> SRR items
 bin/srr-x           ingest strategy: X/Twitter account (via a Nitter instance) -> SRR items
+bin/srr-sitemap     ingest strategy: a site's XML sitemap (no feed) -> SRR items
 bin/srr-tts         pipeline step: prepend a piper TTS narration to the article
 bin/drr-digest-gen  store tool: Claude-written daily digest of the store, published as a feed file
 bin/srr-uvrun       shebang wrapper that runs the Python scripts in this repo's uv venv
@@ -28,7 +29,7 @@ wrong.
 
 Each is an executable that `srr` drives through the external-ingest contract: a JSON
 request on stdin, SRR items as JSON on stdout. Subscribe a channel to one with
-`-i "<strategy> [flags]"`; all three also accept the URL as a CLI argument for manual
+`-i "<strategy> [flags]"`; all four also accept the URL as a CLI argument for manual
 testing (the result is pretty-printed).
 
 ### `srr-telegram`
@@ -86,6 +87,27 @@ for measured per-instance quirks (rate limits, an HTTP/2-only WAF, whitelisting)
 
 ```bash
 srr feed add -t "NASA" -u "https://x.com/NASA" -i "srr-x"
+```
+
+### `srr-sitemap`
+
+For a site that publishes no feed at all but does publish a sitemap whose entries carry
+`<lastmod>` (most CMSes do). The sitemap — or a sitemap index, read one level deep,
+`--sitemap-match RE` to read only some of its children — is the listing; `--match RE`
+keeps the page URLs you want. Each run takes the entries newer than the watermark it
+left last time (the newest lastmod emitted, carried in the response's `etag`), at most
+`--limit` (30) within `--since` days (7), fetches each page once for its head metadata
+and emits title, published date (`article:published_time`, else JSON-LD
+`datePublished`, else the lastmod), a clickable cover (`og:image`) and the description.
+The body is not extracted here: put `#readability` with a `selector=` in the feed's
+pipe, as for a teaser-only RSS feed. Pages are fetched oldest first; a 404/410 is
+skipped for good, any other failure stops the batch at the last success so the rest is
+retried next run. Stdlib only; sitemaps are read gzip-encoded.
+
+```bash
+drr feed add -t "Example" -u "https://example.com/sitemap.xml" \
+  -i "srr-sitemap --sitemap-match posts --match /posts/" \
+  -p '#readability selector=article.post-body' -p '#default'
 ```
 
 ## Pipeline steps
