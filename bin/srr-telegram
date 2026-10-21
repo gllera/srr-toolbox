@@ -104,6 +104,9 @@ ENVIRONMENT
   SRR_TG_API_HASH      (required) API hash from my.telegram.org
   SRR_TG_SESSION       StringSession string from `srr-telegram login`
   SRR_TG_SESSION_FILE  alternative: path to a file holding that string
+  SRR_TG_LOCK_FILE     lock serialising account-mode polls (default: the session file
+                       path + ".lock", else ~/.cache/srr-telegram.lock); each poll
+                       holds a blocking flock on it for its whole run (DNEW-H4)
   SRR_TG_BACKFILL      first-run: how many recent messages to ingest (default 20)
   SRR_TG_MAX_BATCH     max messages (albums count as members) per fetch (default 200)
 
@@ -116,6 +119,7 @@ This is protocol boilerplate around Telethon; the SRR external-ingest contract i
 documented in the srr backend's README (Ingest Strategies).
 """
 import asyncio
+import fcntl
 import html as htmllib
 import http.client
 import json
@@ -187,6 +191,40 @@ def load_session():
             return fh.read().strip()
     sys.exit("srr-telegram: no session — set SRR_TG_SESSION (or SRR_TG_SESSION_FILE) "
              "from the output of `srr-telegram login`")
+
+
+def lock_path():
+    """The lock file serialising every poll on one session: SRR_TG_LOCK_FILE, else
+    the session file's path + ".lock", else ~/.cache/srr-telegram.lock (the session
+    came in through SRR_TG_SESSION)."""
+    explicit = (os.environ.get("SRR_TG_LOCK_FILE") or "").strip()
+    if explicit:
+        return explicit
+    sf = (os.environ.get("SRR_TG_SESSION_FILE") or "").strip()
+    if sf:
+        return sf + ".lock"
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(cache, "srr-telegram.lock")
+
+
+def _acquire(path):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)   # blocking; released when fd closes
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+async def hold_session_lock():
+    """Block (off the event loop) until this process owns the session; returns the
+    fd to os.close() when the poll ends. One Telethon client per session at a time,
+    across feeds, callers and processes (a duplicated auth key can be invalidated)."""
+    return await asyncio.to_thread(_acquire, lock_path())
 
 
 # --- entity resolution ------------------------------------------------------
@@ -503,6 +541,14 @@ async def run_ingest(req):
     except (TypeError, ValueError):
         cursor = 0
 
+    lock_fd = await hold_session_lock()
+    try:
+        return await _poll(session, api_id, api_hash, req, asset_dir, max_media, cursor)
+    finally:
+        os.close(lock_fd)
+
+
+async def _poll(session, api_id, api_hash, req, asset_dir, max_media, cursor):
     client = TelegramClient(StringSession(session), api_id, api_hash)
     await client.connect()
     try:

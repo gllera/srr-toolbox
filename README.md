@@ -44,7 +44,7 @@ Two modes:
 - **Account (MTProto) mode — the default**: private *and* public channels through your
   own user account (Telethon). Needs a one-time login: get an API id/hash from
   <https://my.telegram.org>, then `srr-telegram login` mints a session string; keep the
-  three `SRR_TG_*` values where the fetch loop can see them. (A user account, not a
+  three `SRR_TG_*` values where the fetch loop can see them. Every poll holds a blocking `flock` on a lock file beside the session (`SRR_TG_SESSION_FILE` + `.lock`, or `SRR_TG_LOCK_FILE`), so only one client uses the session at a time. (A user account, not a
   bot, because bots can't read pre-join history and cap media at ~20 MB.)
 - **Web mode — `--no-auth`**: public channels via the public preview (`t.me/s/<name>`),
   no credentials at all. Media is linked out by default (the preview CDN's URLs are
