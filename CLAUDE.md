@@ -85,7 +85,7 @@ absence is deliberate (uv must install only the deps, never this repo as a packa
 **The fetch loop** (`srr-fetch` user service) runs `srr` directly with
 `SRR_CONFIG=…/srr.yaml` in its unit — restart it after a backend or config update.
 
-**One Telethon client per session** (DNEW-H4): account-mode `srr-telegram` takes a
+**One Telethon client per session** (drr D103): account-mode `srr-telegram` takes a
 blocking `fcntl.flock` on `lock_path()` (`SRR_TG_LOCK_FILE`, else the session file +
 `.lock`, else `~/.cache/srr-telegram.lock`) for the whole poll, so concurrent feeds,
 previews and CLI runs queue instead of sharing the StringSession. Web mode needs none.

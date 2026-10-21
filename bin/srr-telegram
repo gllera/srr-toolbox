@@ -106,7 +106,7 @@ ENVIRONMENT
   SRR_TG_SESSION_FILE  alternative: path to a file holding that string
   SRR_TG_LOCK_FILE     lock serialising account-mode polls (default: the session file
                        path + ".lock", else ~/.cache/srr-telegram.lock); each poll
-                       holds a blocking flock on it for its whole run (DNEW-H4)
+                       holds a blocking flock on it for its whole run (drr D103)
   SRR_TG_BACKFILL      first-run: how many recent messages to ingest (default 20)
   SRR_TG_MAX_BATCH     max messages (albums count as members) per fetch (default 200)
 
