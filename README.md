@@ -119,8 +119,8 @@ entries, read with one request per run; the ranking, not reaction counts, decide
 is kept, and its order is the order of selection. `--lang en,es` keeps only articles
 whose declared language is in the set (an article with no declared language is
 dropped); without it every language is kept. Each article is sent once: the ids already
-sent travel in the response's `etag` and are dropped from it after 31 days, by when an
-article has left the ranking. Each new article costs one request for its body, and the
+sent travel in the response's `etag`; an id is dropped 31 days after the article's
+publication date, when it can no longer be in the month's ranking. Each new article costs one request for its body, and the
 item is its title, a cover image when it has one and the full body, so no `#readability`
 step is needed. It carries no date: drr drops items dated before its watermark, and a
 ranking is not in date order. A 404/410 body is skipped for good; any other failure
