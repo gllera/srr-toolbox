@@ -5,8 +5,7 @@ Runs in the toolbox's shared uv project venv (repo-root pyproject.toml, via
 the srr-uvrun shebang wrapper) like every bin/ script, though it needs
 nothing beyond the standard library.
 
-dev.to's public API ranks articles by reactions; `top=30` is the last 30
-days. Each run asks for that ranking ONCE, drops what an earlier run already
+dev.to's public API ranks the last 30 days (`top=30`) by its own score. Each run asks for that ranking ONCE, drops what an earlier run already
 sent, and fetches the body of each remaining article (one request each) to
 emit one item per article: title, link, the cover image and the full HTML
 body. Nothing else is carried (no author, reactions, comments or tags).
@@ -59,6 +58,10 @@ by hand, pass the URL as an argument; the result is pretty-printed:
   srr-devto --top 3 "https://dev.to/"
   srr-devto --top 3 --lang en "https://dev.to/"
 
+A request without an asset_dir (this manual run without --asset-dir, or drr's
+Preview and URL check) is a probe: at most 5 bodies are fetched, whatever --top
+says. `--top 3` is unaffected.
+
   <url>                     must be https://dev.to/ (or https://dev.to)
   --lang CODES              comma-separated language codes to keep
   --top N                   candidates asked of the ranking (default 500)
@@ -80,6 +83,7 @@ MAX_TOP = 1000
 TIMEOUT = 30
 TIME_BUDGET_S = 300
 PAUSE_S = 0.2
+PROBE_BODIES = 5               # body cap for a request without asset_dir
 KEEP_DAYS = 31
 API = "https://dev.to/api/articles"
 
@@ -149,9 +153,10 @@ def fetch_json(url: str, cap: int):
 
 # ---------------------------------------------------------------- state
 
-def parse_state(etag: str, today: int) -> dict:
-    """The etag -> {id: day}, entries older than KEEP_DAYS dropped. Anything
-    that is not this strategy's state is an empty state."""
+def parse_state(etag: str, today: int, keep=()) -> dict:
+    """The etag -> {id: day}, entries older than KEEP_DAYS dropped unless
+    their id is in keep (still ranked). Anything that is not this strategy's
+    state is an empty state."""
     if not etag:
         return {}
     try:
@@ -162,7 +167,7 @@ def parse_state(etag: str, today: int) -> dict:
     except (ValueError, TypeError, OverflowError):
         log("etag is not srr-devto state; starting from scratch")
         return {}
-    return {k: v for k, v in sent.items() if v >= today - KEEP_DAYS}
+    return {k: v for k, v in sent.items() if v >= today - KEEP_DAYS or k in keep}
 
 
 def encode_state(sent: dict) -> str:
@@ -227,7 +232,8 @@ def fetch_body(article_id: int, cap: int):
         if e.code in (404, 410):
             return None
         raise BatchStopped(f"article {article_id}: HTTP {e.code}") from e
-    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError,
+            zlib.error) as e:
         raise BatchStopped(f"article {article_id}: {e}") from e
     if not isinstance(body, dict):
         raise BatchStopped(f"article {article_id}: unexpected response")
@@ -242,15 +248,24 @@ def run_ingest(req, now=None, clock=time.monotonic, sleep=time.sleep):
     cap = int(req.get("max_size") or 0) or DEFAULT_MAX_SIZE
     today = int((time.time() if now is None else now) // 86400)
     etag = req.get("etag") or ""
-    sent = parse_state(etag, today)
-    listing = fetch_json(list_url(OPTS["top"]), cap)
+    try:
+        listing = fetch_json(list_url(OPTS["top"]), cap)
+    except (ValueError, zlib.error) as e:
+        raise ValueError(f"listing: {e}") from e
     if not isinstance(listing, list):
-        raise ValueError("the article listing is not a JSON array")
+        raise ValueError("listing: the article listing is not a JSON array")
+    ranked = {a["id"] for a in listing if isinstance(a, dict) and isinstance(a.get("id"), int)}
+    sent = parse_state(etag, today, ranked)
+    probe = not req.get("asset_dir")
+    if probe:
+        log(f"probe (no asset_dir): at most {PROBE_BODIES} bodies")
     batch = select(listing, sent, OPTS["lang"])
 
     new_sent = dict(sent)
     items, failure, fetched = [], None, 0
     for n, a in enumerate(batch):
+        if probe and fetched >= PROBE_BODIES:
+            break
         if clock() - started >= TIME_BUDGET_S:
             log(f"time budget reached; {len(batch) - n} article(s) left for the next run")
             break
@@ -364,8 +379,8 @@ def cmd_ingest(req=None):
     try:
         result = run_ingest(req)
     except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
-        sys.exit(f"srr-devto: listing fetch failed: {e}")
-    except ValueError as e:
+        sys.exit(f"srr-devto: listing: {e}")
+    except (ValueError, zlib.error) as e:
         sys.exit(f"srr-devto: {e}")
     except BatchStopped as e:
         sys.exit(f"srr-devto: {e}")

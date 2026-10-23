@@ -5,7 +5,6 @@ Run: python3 tests/test_devto_select.py
 import importlib.machinery
 import importlib.util
 import os
-import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "bin", "srr-devto")
@@ -41,6 +40,9 @@ check("state: pruned",
       mod.parse_state(mod.encode_state({5: TODAY, 6: TODAY - 40}), TODAY), {5: TODAY})
 check("state: kept at the edge", mod.parse_state(mod.encode_state({7: TODAY - 31}), TODAY),
       {7: TODAY - 31})
+check("state: old id kept when in keep",
+      mod.parse_state(mod.encode_state({5: TODAY, 6: TODAY - 40, 8: TODAY - 40}), TODAY, {6}),
+      {5: TODAY, 6: TODAY - 40})
 check("state: another strategy's watermark", mod.parse_state("2026-10-01T00:00:00Z", TODAY), {})
 check("state: garbage", mod.parse_state("{bad", TODAY), {})
 check("state: wrong shape", mod.parse_state('{"v":2,"sent":{}}', TODAY), {})
