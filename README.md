@@ -127,12 +127,16 @@ ranking is not in date order. A 404/410 body is skipped for good; any other fail
 stops the batch with the articles already fetched kept (and the run fails if there are
 none, so drr records the error). No body request starts after 300 s into a run; the
 rest is fetched next run. The script spaces nothing itself: how often the ranking is
-scanned is the feed's "Check at most every" in drr (`--check-minutes`, D135). Stdlib
+scanned is drr's per-feed `--check-minutes` (the feed editor's "Check at most every"). Stdlib
 only; the feed URL must be `https://dev.to/`.
 
 ```bash
-drr feed add -t "dev.to top" -u "https://dev.to/" -i "srr-devto --lang en" --check-minutes 60
+drr feed add -t "dev.to top" -u "https://dev.to/" -i "srr-devto --lang en" \
+  -p '#embed' -p '#default' --check-minutes 60
 ```
+
+dev.to renders YouTube and Vimeo tags as iframes, which `#sanitize` removes; drr's
+`#embed`, placed before `#default`, turns them into links first.
 
 ## Pipeline steps
 
