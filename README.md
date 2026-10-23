@@ -12,6 +12,7 @@ bin/srr-telegram    ingest strategy: Telegram channel (incl. private) -> SRR ite
 bin/srr-youtube     ingest strategy: YouTube channel Atom feed -> SRR items
 bin/srr-x           ingest strategy: X/Twitter account (via a Nitter instance) -> SRR items
 bin/srr-sitemap     ingest strategy: a site's XML sitemap (no feed) -> SRR items
+bin/srr-devto       ingest strategy: dev.to's top-of-the-month ranking -> SRR items
 bin/srr-tts         pipeline step: prepend a piper TTS narration to the article
 bin/drr-digest-gen  store tool: Claude-written daily digest of the store, published as a feed file
 bin/srr-uvrun       shebang wrapper that runs the Python scripts in this repo's uv venv
@@ -29,7 +30,7 @@ wrong.
 
 Each is an executable that `srr` drives through the external-ingest contract: a JSON
 request on stdin, SRR items as JSON on stdout. Subscribe a channel to one with
-`-i "<strategy> [flags]"`; all four also accept the URL as a CLI argument for manual
+`-i "<strategy> [flags]"`; all five also accept the URL as a CLI argument for manual
 testing (the result is pretty-printed).
 
 ### `srr-telegram`
@@ -108,6 +109,29 @@ retried next run. Stdlib only; sitemaps are read gzip-encoded.
 drr feed add -t "Example" -u "https://example.com/sitemap.xml" \
   -i "srr-sitemap --sitemap-match posts --match /posts/" \
   -p '#readability selector=article.post-body' -p '#default'
+```
+
+### `srr-devto`
+
+For dev.to, which has a feed per author or tag but no feed of what the whole site ranks
+highest. The listing is dev.to's own top-of-the-month ranking, the first `--top` (500)
+entries, read with one request per run; the ranking, not reaction counts, decides what
+is kept, and its order is the order of selection. `--lang en,es` keeps only articles
+whose declared language is in the set (an article with no declared language is
+dropped); without it every language is kept. Each article is sent once: the ids already
+sent travel in the response's `etag` and are dropped from it after 31 days, by when an
+article has left the ranking. Each new article costs one request for its body, and the
+item is its title, a cover image when it has one and the full body, so no `#readability`
+step is needed. It carries no date: drr drops items dated before its watermark, and a
+ranking is not in date order. A 404/410 body is skipped for good; any other failure
+stops the batch with the articles already fetched kept (and the run fails if there are
+none, so drr records the error). No body request starts after 300 s into a run; the
+rest is fetched next run. The script spaces nothing itself: how often the ranking is
+scanned is the feed's "Check at most every" in drr (`--check-minutes`, D135). Stdlib
+only; the feed URL must be `https://dev.to/`.
+
+```bash
+drr feed add -t "dev.to top" -u "https://dev.to/" -i "srr-devto --lang en" --check-minutes 60
 ```
 
 ## Pipeline steps
