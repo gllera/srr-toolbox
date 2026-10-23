@@ -273,7 +273,7 @@ def run_ingest(req, now=None, clock=time.monotonic, sleep=time.sleep):
     state = encode_state(new_sent)
     changed = state != etag and (etag or new_sent)
     if failure:
-        if not items and not changed:
+        if not items:
             raise BatchStopped(failure)
         log(f"{failure}; stopping the batch after {len(items)} item(s), "
             f"the rest is retried next run")

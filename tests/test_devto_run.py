@@ -154,6 +154,19 @@ try:
 except mod.BatchStopped:
     check("URLError first: raises", True, True)
 
+f = Fake(lst(1, 2), bodies={1: http_error(404), 2: http_error(500)})
+try:
+    run(f)
+    check("404 then 500: raises", "returned", "raised")
+except mod.BatchStopped:
+    check("404 then 500: raises", True, True)
+f = Fake(lst(1), bodies={1: http_error(500)})
+try:
+    run(f, "2026-10-01T00:00:00Z")
+    check("foreign etag + 500 first: raises", "returned", "raised")
+except mod.BatchStopped:
+    check("foreign etag + 500 first: raises", True, True)
+
 # foreign etags
 f = Fake(lst(1))
 r = run(f, "2026-10-01T00:00:00Z")
