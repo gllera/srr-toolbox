@@ -6,15 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Companion scripts for SRR (the Go `srr` backend + TS frontend in
 `~/ws/srr`, which has its own CLAUDE.md — backend/frontend *code* changes go there,
-not here). `bin/` holds three kinds. Exec'd by `drr` by bare name, resolved from
+not here). `bin/` holds two kinds. Exec'd by `drr` by bare name, resolved from
 `PATH`: **`srr-telegram` / `srr-youtube` / `srr-x` / `srr-sitemap` / `srr-devto`** (python ingest
 strategies — one process per feed, JSON stdin -> JSON stdout) and **`srr-tts`**
 (python pipeline step — one process per item, item JSON stdin -> item JSON stdout,
-prepends a piper TTS narration). Running the other way round, driving the `drr` CLI as
-a subprocess: **`drr-digest-gen`** (store tool — collects recent articles via `drr`, has
-`claude -p` write a digest, writes it to a feed file in `--out-dir`). Plus the
-`srr-uvrun` shebang wrapper. On the server `bin/` reaches `PATH` as the
-`/opt/drr/bin` mirror, refreshed via `drr-update toolbox`; for dev, put
+prepends a piper TTS narration). Plus the `srr-uvrun` shebang wrapper. On the server
+`bin/` reaches `PATH` as the `/opt/drr/bin` mirror, refreshed via `drr-update toolbox`; for dev, put
 `~/ws/srr-toolbox/bin` on `PATH` (this repo is destined to be public, so it only
 states the generic PATH contract).
 
@@ -32,10 +29,6 @@ srr-x --instance https://nitter.poast.org "@handle"
 
 # Manual run of the srr-tts pipeline step (HTML file instead of the stdin item JSON):
 srr-tts --voice en_US-lessac-medium --asset-dir /tmp/store article.html
-
-# Manual run of the digest generator without spending claude calls or touching the store:
-drr-digest-gen --dump --hours 2      # collected articles as JSON
-drr-digest-gen --dry-run --no-history  # full run, RSS to stdout, nothing written
 
 # Run the reader's CLI directly (nothing wraps it). On the server it is drr's binary
 # as the drr user against the live data dir (read commands need no config):
@@ -62,18 +55,6 @@ survive srr's `#sanitize` (img src / a href allowlisted; no iframes/scripts),
 asset_dir (e.g. `srr preview`) means hotlink/placeholder, never download. Each
 script also maps CLI parameters onto the *same* request dict for manual testing —
 keep the two entry paths building identical requests.
-
-**Store tools drive the CLI, never the store** (`drr-digest-gen`): they read through
-`drr feed ls` / `drr art`, and publish by writing `<out-dir>/<name>.rss` atomically
-(`--out-dir`; no syndication). `--drr-cmd` is the command prefix (default `drr`), for a
-store owned by another user, e.g. `sudo -n -u drr /opt/drr/bin/drr -o /srv/drr`. The
-store's location and credentials are the backend's business — a script here must never
-open the store's config or database, or learn a credential. Whatever the deployment
-still needs to say (public feed URL, timezone, feed name, out dir) is a flag with a
-generic default or none at all; nothing in this repo names the owner's infrastructure.
-They also keep **no local state**: what was already published is read back out of the
-feed file, so that file stays the single source of truth and the tool runs from any box
-that can read it.
 
 **Python env plumbing**: one root `pyproject.toml` declares deps for every `bin/`
 script, pinned by the committed `uv.lock`. Shebangs are `#!/usr/bin/env srr-uvrun`;
