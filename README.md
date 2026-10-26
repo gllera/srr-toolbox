@@ -2,7 +2,7 @@
 
 The ingest and pipeline toolbox for **drr** (and formerly **srr**, its static-RSS-reader
 predecessor): `srr-*` scripts with the ingest strategies that teach the reader to
-read sources that don't speak usable RSS, and a pipeline step. (`drr-digest-gen`, a tool that
+read sources that don't speak usable RSS, and two pipeline steps. (`drr-digest-gen`, a tool that
 drove the `drr` CLI to write a daily digest, was removed: drr writes the digest itself.)
 
 ## Layout
@@ -14,6 +14,7 @@ bin/srr-x           ingest strategy: X/Twitter account (via a Nitter instance) -
 bin/srr-sitemap     ingest strategy: a site's XML sitemap (no feed) -> SRR items
 bin/srr-devto       ingest strategy: dev.to's top-of-the-month ranking -> SRR items
 bin/srr-tts         pipeline step: prepend a piper TTS narration to the article
+bin/srr-gtproxy     pipeline step: the full article, read through Google Translate's site proxy
 bin/srr-uvrun       shebang wrapper that runs the Python scripts in this repo's uv venv
 tests/              self-checking test scripts + fixtures
 pyproject.toml      shared dependencies for every bin/ script, pinned by uv.lock
@@ -142,6 +143,30 @@ dev.to renders YouTube and Vimeo tags as iframes, which `#sanitize` removes; drr
 Pipeline steps run once per *item*, not once per *feed*: `srr` execs any non-`#builtin`
 `pipe` entry with the item JSON on stdin and reads the (possibly modified) item back on
 stdout — a different contract from the ingest strategies above.
+
+### `srr-gtproxy`
+
+For a teaser-only feed whose pages refuse drr's own HTTP client from every address it has
+(a bot check that `#readability` cannot pass, so it keeps the teaser). Google Translate's
+website proxy fetches a page from Google's servers and answers with the page's own text (the
+translation runs in the visitor's browser), so the step asks it for the item's link
+(`https://www.example.com/a` → `https://www-example-com.translate.goog/a?_x_tr_sl=auto&…`),
+keeps the inner HTML of each element `--selector` matches, removes what `--drop` matches
+inside them, and makes that the content. The proxy routes the page's links through itself;
+every URL in the kept HTML is turned back into the original, so the stored article never
+depends on the proxy. Only https links are read; stdlib fetch plus bs4/html5lib.
+
+```bash
+drr feed upd <id> -p "srr-gtproxy --selector 'article.post-body' --drop '.gallery .more'" -p '#default'
+srr-gtproxy --selector 'article.post-body' https://www.example.com/a   # manual run
+```
+
+The proxy is a free Google service with no contract: if it changes, or the site starts
+refusing it, the step finds no body and the item keeps its teaser. Like `srr-tts`, the
+step never exits non-zero on the fetch path (drr would drop the article for good): any failure,
+a typo'd flag included, is logged to stderr and the item passes through unchanged. A manual
+run (a URL argument) reports failures with a non-zero exit. `--timeout` (30 s) bounds the
+proxy request, `--ua` sets its User-Agent.
 
 ### `srr-tts`
 

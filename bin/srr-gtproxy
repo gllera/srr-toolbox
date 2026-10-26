@@ -1,0 +1,311 @@
+#!/usr/bin/env srr-uvrun
+"""drr external pipeline step: replace a teaser with the full article, read
+through Google Translate's website proxy.
+
+drr execs any non-#builtin `pipe` entry once per item, writing the item JSON
+to stdin and reading the (possibly modified) item JSON back from stdout:
+
+    {guid, title, content, link, published, lang?, raw, drop?}
+
+WHY A PROXY
+-----------
+Some sites serve a teaser-only feed and put their pages behind a bot check
+that refuses drr's own HTTP client from every address it has (`#readability`
+then keeps the teaser). Google Translate's website proxy fetches a page from
+Google's servers, which those checks let through, and answers with the page's
+own text: the translation runs in the visitor's browser, from a script the
+proxy adds, so the HTML it returns is the original. This step asks the proxy
+for the item's link,
+
+    https://www.example.com/a/b?x=1
+ -> https://www-example-com.translate.goog/a/b?x=1&_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en
+
+(the host's '-' doubled, then its '.' turned into '-'), keeps the inner HTML
+of each element `--selector` matches, in document order, removes what `--drop`
+matches inside them, and makes that the item's content. The proxy rewrites the
+page's links to go through itself; every URL attribute in the kept HTML is
+turned back into the original (`translate.google.com/website?...&u=<url>` to
+<url>, `<host>.translate.goog` to <host> without its `_x_tr_*` parameters), so
+the stored article never depends on the proxy. Only https links are read.
+
+Opt a feed in (before #default, so the body rides the normal sanitize path):
+
+    drr feed upd <id> -p "srr-gtproxy --selector 'article.post-body'" -p '#default'
+
+The proxy is a free Google service with no contract: it can change or start
+refusing, and the site can start refusing it. Either way the step finds no
+body and the teaser stays.
+
+ON THE FETCH PATH THIS STEP NEVER EXITS NON-ZERO. drr drops an item whose
+pipe step fails and keeps its guid, so the article would be gone for good —
+worse than keeping the teaser. Every failure (the proxy unreachable, a non-200
+answer, a selector that matches nothing or only whitespace, a typo'd flag in
+the feed's `pipe`) is reported on stderr, and the step emits nothing, which
+drr reads as "leave the item unchanged". --help/--version print on STDERR for
+the same reason: stdout is the protocol channel. Run the step manually (a URL
+argument) to have failures reported with a non-zero exit.
+
+KNOBS
+-----
+  --selector <css>   required: the elements whose inner HTML is the body
+                     (a comma-separated list is one selector; bs4's select)
+  --drop <css>       elements removed from the kept HTML (a gallery's
+                     "+4 more" tile, hidden slides)
+  --timeout <s>      the proxy request's timeout (default 30)
+  --ua <string>      the User-Agent sent to the proxy (default a desktop
+                     Chrome's)
+
+MANUAL RUNS (a URL instead of stdin)
+------------------------------------
+    srr-gtproxy --selector 'article.post-body' https://www.example.com/a/b
+
+builds the item drr would send for that link and pretty-prints the result.
+"""
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+from bs4 import BeautifulSoup
+
+VERSION = "1.0"
+
+PROXY_DOMAIN = "translate.goog"
+# sl=auto/tl=en is accepted for a page in any language (sl == tl is a 400)
+# and changes nothing in the returned HTML: the text is translated in the
+# browser, never by the proxy.
+PROXY_PARAMS = (("_x_tr_sl", "auto"), ("_x_tr_tl", "en"), ("_x_tr_hl", "en"))
+DEFAULT_TIMEOUT = 30.0
+DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
+MAX_BODY = 8 << 20   # the same cap as drr's #readability fetch
+
+# Attributes holding one URL, and the ones holding a srcset list.
+URL_ATTRS = ("href", "src", "poster", "cite", "data-src", "data-embed")
+SRCSET_ATTRS = ("srcset", "data-srcset")
+
+
+def log(*a):
+    print("srr-gtproxy:", *a, file=sys.stderr)
+
+
+def fnv1a32(s: str) -> int:
+    h = 0x811C9DC5
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def encode_host(host: str) -> str:
+    return host.replace("-", "--").replace(".", "-")
+
+
+def decode_host(label: str) -> str:
+    # Read left to right: "--" is a hyphen, a lone "-" a dot.
+    out, i = [], 0
+    while i < len(label):
+        if label.startswith("--", i):
+            out.append("-")
+            i += 2
+        elif label[i] == "-":
+            out.append(".")
+            i += 1
+        else:
+            out.append(label[i])
+            i += 1
+    return "".join(out)
+
+
+def proxy_url(link: str):
+    """The proxy's URL for an https link, or None when it cannot be proxied."""
+    u = urllib.parse.urlsplit(link)
+    if u.scheme != "https" or not u.hostname or u.port is not None:
+        return None
+    q = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
+    q += list(PROXY_PARAMS)
+    return urllib.parse.urlunsplit((
+        "https", encode_host(u.hostname) + "." + PROXY_DOMAIN,
+        u.path or "/", urllib.parse.urlencode(q), ""))
+
+
+def unwrap_url(url: str) -> str:
+    """The original URL behind a proxy-rewritten one; anything else as is."""
+    s = url.strip()
+    try:
+        u = urllib.parse.urlsplit(s)
+    except ValueError:
+        return url
+    host = (u.hostname or "").lower()
+    if host == "translate.google.com" and u.path in ("/website", "/translate"):
+        target = dict(urllib.parse.parse_qsl(u.query)).get("u")
+        return target if target else url
+    suffix = "." + PROXY_DOMAIN
+    if host.endswith(suffix) and len(host) > len(suffix):
+        q = [(k, v) for k, v in urllib.parse.parse_qsl(u.query, keep_blank_values=True)
+             if not k.startswith("_x_tr_")]
+        return urllib.parse.urlunsplit((
+            u.scheme or "https", decode_host(host[:-len(suffix)]), u.path,
+            urllib.parse.urlencode(q), u.fragment))
+    return url
+
+
+def unwrap_srcset(value: str) -> str:
+    parts = []
+    for cand in value.split(","):
+        bits = cand.strip().split(None, 1)
+        if not bits:
+            continue
+        bits[0] = unwrap_url(bits[0])
+        parts.append(" ".join(bits))
+    return ", ".join(parts)
+
+
+def extract(page, selector: str, drop: str = "", charset=None):
+    """The kept body HTML for a page (bytes in `charset`, else detected; or
+    str), or None when the selector matches nothing with text in it."""
+    if isinstance(page, bytes) and charset:
+        soup = BeautifulSoup(page, "html5lib", from_encoding=charset)
+    else:
+        soup = BeautifulSoup(page, "html5lib")
+    matches = soup.select(selector)
+    ids = {id(m) for m in matches}
+    # A match inside another match is already in the outer one's HTML.
+    kept = [m for m in matches if not any(id(p) in ids for p in m.parents)]
+    if not kept:
+        return None
+    for m in kept:
+        if drop:
+            for d in m.select(drop):
+                d.decompose()
+        for tag in m.find_all(True):
+            for a in URL_ATTRS:
+                v = tag.get(a)
+                if isinstance(v, str):
+                    tag[a] = unwrap_url(v)
+            for a in SRCSET_ATTRS:
+                v = tag.get(a)
+                if isinstance(v, str):
+                    tag[a] = unwrap_srcset(v)
+    if not any(m.get_text().strip() for m in kept):
+        return None
+    return "".join(m.decode_contents() for m in kept)
+
+
+def fetch(url: str, cfg: dict):
+    """(body bytes, the charset the response declares or None)."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": cfg["ua"],
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en",
+    })
+    with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
+        if r.status != 200:
+            raise OSError("HTTP %d" % r.status)
+        body = r.read(MAX_BODY + 1)
+        charset = r.headers.get_content_charset()
+    if len(body) > MAX_BODY:
+        raise OSError("page over %d bytes" % MAX_BODY)
+    return body, charset
+
+
+def run_item(item: dict, cfg: dict):
+    """The item with its content replaced, or None to leave it unchanged.
+    Raises only for a manual run to report; the caller decides."""
+    link = item.get("link") or ""
+    url = proxy_url(link)
+    if url is None:
+        raise ValueError("not an https link without a port: %r" % link)
+    body, charset = fetch(url, cfg)
+    content = extract(body, cfg["selector"], cfg["drop"], charset)
+    if content is None:
+        raise ValueError("selector %r matched nothing with text on %s"
+                         % (cfg["selector"], link))
+    item["content"] = content
+    return item
+
+
+def parse_argv(argv):
+    """(cfg, url, errors): url is the manual run's positional, else None."""
+    cfg = {"selector": "", "drop": "", "timeout": DEFAULT_TIMEOUT, "ua": DEFAULT_UA}
+    errors, urls = [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--selector", "--drop", "--timeout", "--ua"):
+            if i + 1 >= len(argv):
+                errors.append("%s needs a value" % a)
+                break
+            cfg[a[2:]] = argv[i + 1]
+            i += 2
+        elif a.startswith("-"):
+            errors.append("unknown option %r (see --help)" % a)
+            i += 1
+        else:
+            urls.append(a)
+            i += 1
+    if not cfg["selector"].strip():
+        errors.append("--selector is required")
+    try:
+        cfg["timeout"] = float(cfg["timeout"])
+        if cfg["timeout"] <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors.append("--timeout must be a positive number, got %r" % cfg["timeout"])
+        cfg["timeout"] = DEFAULT_TIMEOUT
+    if len(urls) > 1:
+        errors.append("more than one URL (%s)" % ", ".join(repr(u) for u in urls))
+    if cfg["selector"].strip() and not errors:
+        # A selector bs4 cannot parse fails here, once, not per item.
+        try:
+            BeautifulSoup("", "html5lib").select(cfg["selector"])
+            if cfg["drop"]:
+                BeautifulSoup("", "html5lib").select(cfg["drop"])
+        except Exception as e:
+            errors.append("bad selector: %s" % e)
+    return cfg, (urls[0] if urls else None), errors
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__, file=sys.stderr)
+        return
+    if argv and argv[0] in ("version", "--version", "-V"):
+        print("srr-gtproxy", VERSION, file=sys.stderr)
+        return
+    cfg, url, errors = parse_argv(argv)
+    if url is not None:
+        # A manual run: the item drr would send for this link, failures loud.
+        if errors:
+            sys.exit("srr-gtproxy: " + errors[0])
+        item = {"guid": fnv1a32(url), "title": "", "content": "", "link": url,
+                "published": None}
+        try:
+            result = run_item(item, cfg)
+        except Exception as e:
+            sys.exit("srr-gtproxy: %s" % e)
+        json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+        return
+    if errors:
+        log("%s: passing items through unchanged" % errors[0])
+        return
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="strict")
+        item = json.load(sys.stdin)
+    except (ValueError, RecursionError) as e:
+        log("could not parse item on stdin (%s): emitting nothing" % e)
+        return
+    try:
+        result = run_item(item, cfg)
+        # `raw` is restored by drr over whatever comes back: never echo it.
+        result.pop("raw", None)
+        out = json.dumps(result, allow_nan=False)
+    except Exception as e:
+        log("%s: keeping the item as it is" % e)
+        return
+    sys.stdout.write(out)
+
+
+if __name__ == "__main__":
+    main()

@@ -8,9 +8,10 @@ Companion scripts for SRR (the Go `srr` backend + TS frontend in
 `~/ws/srr`, which has its own CLAUDE.md — backend/frontend *code* changes go there,
 not here). `bin/` holds two kinds. Exec'd by `drr` by bare name, resolved from
 `PATH`: **`srr-telegram` / `srr-youtube` / `srr-x` / `srr-sitemap` / `srr-devto`** (python ingest
-strategies — one process per feed, JSON stdin -> JSON stdout) and **`srr-tts`**
-(python pipeline step — one process per item, item JSON stdin -> item JSON stdout,
-prepends a piper TTS narration). Plus the `srr-uvrun` shebang wrapper. On the server
+strategies — one process per feed, JSON stdin -> JSON stdout) and **`srr-tts`** /
+**`srr-gtproxy`** (python pipeline steps — one process per item, item JSON stdin -> item
+JSON stdout; srr-tts prepends a piper TTS narration, srr-gtproxy replaces a teaser with the
+page's body read through Google Translate's website proxy). Plus the `srr-uvrun` shebang wrapper. On the server
 `bin/` reaches `PATH` as the `/opt/drr/bin` mirror, refreshed via `drr-update toolbox`; for dev, put
 `~/ws/srr-toolbox/bin` on `PATH` (this repo is destined to be public, so it only
 states the generic PATH contract).
