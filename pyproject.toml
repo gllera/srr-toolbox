@@ -14,6 +14,9 @@ dependencies = [
     "telethon>=1.43,<2",   # srr-telegram: MTProto account mode
     "cryptg>=0.4",         # srr-telegram: fast Telethon crypto
     "beautifulsoup4>=4.12", # srr-telegram web (no-auth) mode + srr-x: HTML parsing
+    # srr-tts: bs4's HTML5 parser, so the blocks it stamps are the ones the
+    # backend and the browser build (html.parser nests unclosed <p>s).
+    "html5lib>=1.1",
     "httpx[http2]>=0.27",   # srr-x: feed fetch over HTTP/2 (nitter.poast.org 403s HTTP/1.1)
     # srr-tts: local TTS. >=1.5 is the floor actually exercised — the script
     # uses PiperVoice.synthesize_wav + piper.download_voices.download_voice.

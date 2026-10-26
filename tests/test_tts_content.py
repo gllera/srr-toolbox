@@ -182,7 +182,8 @@ check("empty blocks yield no segment",
       ["x", "y"])
 
 soup, segs = tts.segment_html("<p>a<![CDATA[x]]>b</p>")
-check("CDATA text is narrated (get_text parity)", [t for _, t in segs], ["axb"])
+check("CDATA outside svg/math is a comment: never shown, never narrated",
+      [t for _, t in segs], ["ab"])
 
 soup, segs = tts.segment_html("<p>One.</p><p>Two.</p>")
 check_true("segment elements are live nodes of the returned soup",
@@ -202,7 +203,32 @@ soup, segs = tts.segment_html(frag)
 check("br is a break, video not narrated",
       [t for _, t in segs], ["line one\nline two"])
 check_true("soup stays pristine (br + video survive serialization)",
-           "<br/>" in str(soup) and "<video" in str(soup), str(soup))
+           "<br/>" in tts.fragment_html(soup)
+           and "<video" in tts.fragment_html(soup), tts.fragment_html(soup))
+
+# The parse is HTML5's, as in the backend and the browser. drr's #minify
+# drops optional end tags; html.parser nested each unclosed <p> inside the
+# one before and wrote every </p> at the end, so the backend stored one
+# empty <p></p> per paragraph after the article.
+soup, segs = tts.segment_html(
+    "<p>top<h3>IA</h3><p>one<p>two<hr><p>also<ul><li>x<li>y</ul>")
+check("minified: unclosed blocks are siblings, as the reader shows them",
+      [(e.name, t) for e, t in segs],
+      [("p", "top"), ("h3", "IA"), ("p", "one"), ("p", "two"), ("p", "also"),
+       ("li", "x"), ("li", "y")])
+check("minified: serialized with every end tag in place, nothing trailing",
+      tts.fragment_html(soup),
+      "<p>top</p><h3>IA</h3><p>one</p><p>two</p><hr/><p>also</p>"
+      "<ul><li>x</li><li>y</li></ul>")
+check("minified: 3000 unclosed paragraphs walk flat (no RecursionError)",
+      len(tts.segment_html("<p>x" * 3000)[1]), 3000)
+
+check("fragment_html keeps a leading <style> in place (html5lib's head)",
+      tts.fragment_html(tts.segment_html("<style>p{}</style><p>a</p>")[0]),
+      "<style>p{}</style><p>a</p>")
+check("fragment_html drops a doctype, which is not content",
+      tts.fragment_html(tts.segment_html("<!DOCTYPE html><p>a</p>")[0]),
+      "<p>a</p>")
 
 # The equivalence contract, spelled out: html_to_text == join(segments).
 for frag in ["<p>One.</p><p>Two.</p>", "lead<div>intro<p>p1</p>outro</div>",

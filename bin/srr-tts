@@ -129,9 +129,9 @@ import time
 import wave
 
 from bs4 import BeautifulSoup
-from bs4.element import CData, NavigableString, PreformattedString, Tag
+from bs4.element import NavigableString, PreformattedString, Tag
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 DEFAULT_MAX_CHARS = 32_768  # roomy backstop, not timeout-proof: an article
 # filling it outruns the default --cmd-timeout on the fetch-loop box class
@@ -224,23 +224,32 @@ def segment_html(fragment: str):
     boundaries read as paragraph breaks either way; the attribution is what
     lets run_item stamp the narrated element for the reader's
     highlight-follow. Attribute text (alt, URLs) is never included; comments
-    and other non-text strings are skipped, CDATA text is kept (get_text
-    parity).
+    and other non-text strings are skipped (a CDATA section outside svg/math
+    is a comment in HTML, so it is skipped too).
+
+    The parse is HTML5's, the one the backend and the browser run (html5lib),
+    so the blocks stamped here are the blocks the reader shows. Python's
+    html.parser is not: it never closes a <p> by implication, so the
+    optional end tags a minifier leaves out (drr's #minify drops </p> and
+    </li>) nested every paragraph inside the one before and wrote all their
+    </p> at the end, which the backend's re-parse stored as one empty <p>
+    each.
 
     The returned soup is PRISTINE: the walker only READS it, never mutates
     it (no decompose, no replace_with). run_item re-serializes this same
-    soup as the stored article content, so anything the walker skips for
-    narration purposes — a <br>, a DROP_TAGS subtree — must still be there
-    in the output: <br> as itself, not a literal newline; <video>/<audio>
-    players intact, not gone."""
-    soup = BeautifulSoup(fragment or "", "html.parser")
+    soup (fragment_html) as the stored article content, so anything the
+    walker skips for narration purposes — a <br>, a DROP_TAGS subtree — must
+    still be there in the output: <br> as itself, not a literal newline;
+    <video>/<audio> players intact, not gone."""
+    soup = BeautifulSoup(fragment or "", "html5lib")
     segs = [[None, []]]  # [owning element or None, text parts]
 
     # Recurses one Python frame per nesting level (unlike the old iterative
     # get_text) and so can hit RecursionError on a pathologically deep
-    # fragment (~1000+ levels). Survivable, not handled here: it's an
-    # Exception, so main()'s run_item backstop catches it and emits the item
-    # unchanged — that article loses its narration, never the article itself.
+    # fragment (~1000+ levels of real nesting; HTML5's parse keeps unclosed
+    # paragraphs siblings). Survivable, not handled here: it's an Exception,
+    # so main()'s run_item backstop catches it and emits the item unchanged —
+    # that article loses its narration, never the article itself.
     def walk(node, cur):
         for child in node.children:
             if isinstance(child, Tag):
@@ -255,9 +264,8 @@ def segment_html(fragment: str):
                     segs.append([cur, []])  # text after it re-attributes to cur
                 else:
                     walk(child, cur)
-            elif isinstance(child, NavigableString) and (
-                    not isinstance(child, PreformattedString)
-                    or isinstance(child, CData)):
+            elif (isinstance(child, NavigableString)
+                  and not isinstance(child, PreformattedString)):
                 segs[-1][1].append(str(child))
 
     walk(soup, None)
@@ -267,6 +275,16 @@ def segment_html(fragment: str):
         if text:
             out.append((el, text))
     return soup, out
+
+
+def fragment_html(soup) -> str:
+    """segment_html's soup -> the fragment it parsed, as HTML. html5lib builds
+    a whole document, so the fragment is head's contents (whatever came
+    before the first body content, e.g. a leading <style>) followed by
+    body's, in their order. A doctype and comments outside <html> are
+    dropped: neither is article content."""
+    return "".join(part.decode_contents()
+                   for part in (soup.head, soup.body) if part is not None)
 
 
 def html_to_text(fragment: str) -> str:
@@ -624,7 +642,7 @@ def run_item(item: dict, cfg: dict) -> dict:
     item["content"] = (AUDIO_HTML
                        % (_tts_attr(starts),
                           html.escape("#/" + rel, quote=True))
-                       + str(soup))
+                       + fragment_html(soup))
     return item
 
 
