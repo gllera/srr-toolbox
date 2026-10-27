@@ -268,8 +268,14 @@ def https_url(u):
 
 
 def render_text(tweet: dict) -> str:
-    """The post's text as HTML paragraphs, t.co links expanded."""
-    text = tweet["text"]
+    """The post's text as HTML paragraphs, t.co links expanded.
+
+    X's text is HTML-escaped (&amp; &lt; &gt;) but its display_text_range and
+    entity indices count the UNESCAPED code points, so the text is unescaped
+    first and every plain piece escaped as it is emitted. An entity whose
+    indices do not select its own t.co url (the other coordinate system, or
+    an edit) is found by that url instead: text is never cut or garbled."""
+    text = html.unescape(tweet["text"])
     rng = tweet.get("display_text_range")
     start, end = 0, len(text)
     if (isinstance(rng, list) and len(rng) == 2 and all(isinstance(n, int) for n in rng)
@@ -277,25 +283,49 @@ def render_text(tweet: dict) -> str:
         start, end = rng
     ents = tweet.get("entities") or {}
     spans = []  # (from, to, html)
-    for e in ents.get("urls") or []:
-        ind = e.get("indices")
-        href = https_url(e.get("expanded_url"))
-        if isinstance(ind, list) and len(ind) == 2 and href:
-            shown = e.get("display_url") or href
-            spans.append((ind[0], ind[1], '<a href="%s">%s</a>' % (esc(href), esc(shown))))
-    for e in ents.get("media") or []:
-        ind = e.get("indices")
-        if isinstance(ind, list) and len(ind) == 2:
-            spans.append((ind[0], ind[1], ""))
+    used = set()
+
+    def locate(e):
+        ind, url = e.get("indices"), e.get("url")
+        if isinstance(ind, list) and len(ind) == 2 and all(isinstance(n, int) for n in ind) \
+                and (not isinstance(url, str) or text[ind[0]:ind[1]] == url):
+            return ind[0], ind[1]
+        if isinstance(url, str) and url:
+            at = text.find(url)
+            while at >= 0 and any(at < b and a < at + len(url) for a, b in used):
+                at = text.find(url, at + 1)
+            if at >= 0:
+                return at, at + len(url)
+        return None
+
+    for kind in ("urls", "media"):
+        for e in ents.get(kind) or []:
+            if not isinstance(e, dict):
+                continue
+            pos = locate(e)
+            if pos is None:
+                continue
+            href = https_url(e.get("expanded_url"))
+            if kind == "urls":
+                if not href:
+                    continue
+                shown = e.get("display_url") or href
+                frag = '<a href="%s">%s</a>' % (esc(href), esc(shown))
+            else:
+                frag = ""
+            used.add(pos)
+            spans.append((pos[0], pos[1], frag))
     spans.sort()
     out, pos = [], start
     for a, b, frag in spans:
-        if a < pos or b > end:
+        if a < pos:
             continue
-        out.append(esc(html.unescape(text[pos:a])))
+        if a >= end:
+            break
+        out.append(esc(text[pos:a]))
         out.append(frag)
         pos = b
-    out.append(esc(html.unescape(text[pos:end])))
+    out.append(esc(text[pos:end]) if pos < end else "")
     body = "".join(out).strip()
     paras = []
     for para in re.split(r"\n\s*\n", body):

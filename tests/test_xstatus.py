@@ -101,8 +101,17 @@ r = mod.render(photo)
 check_true("photo: author linked, name escaped",
            '<a href="https://x.com/exampleuser/status/111"><b>Example &lt;User&gt;</b> @exampleuser</a>' in r, r)
 check_true("photo: t.co expanded, media link and text escaped",
-           '<p>Read this: <a href="https://example.com/post">example.com/post</a> &lt;b&gt; &amp; more</p>' in r, r)
+           '<p>Tom &amp; Jerry &lt;3 <a href="https://example.com/post">example.com/post</a> &gt; end</p>' in r, r)
 check_true("photo: no t.co left", "t.co" not in r, r)
+# Off indices (escaped coordinates, an edit): found by the t.co url, nothing lost.
+off = json.loads(json.dumps(photo))
+off["entities"]["urls"][0]["indices"] = [3, 26]
+off["entities"]["media"][0]["indices"] = [0, 5]
+r_off = mod.render_text(off)
+check_true("fallback: anchor still made from the url", '<a href="https://example.com/post">example.com/post</a>' in r_off, r_off)
+check_true("fallback: no text lost before the url", r_off.startswith("<p>Tom &amp; Jerry &lt;3 <a"), r_off)
+nofix = {"text": "a &amp; b https://t.co/zzz tail", "entities": {"urls": [{"url": "https://t.co/qqq", "expanded_url": "https://example.com/", "indices": [0, 3]}]}}
+check("fallback: an entity whose url is not in the text changes nothing", mod.render_text(nofix), "<p>a &amp; b https://t.co/zzz tail</p>")
 check_true("photo: both images, alt escaped",
            '<img src="https://pbs.twimg.com/media/AAAA.jpg" alt="a &quot;cat&quot;">' in r
            and '<img src="https://pbs.twimg.com/media/BBBB.jpg" alt="">' in r, r)
