@@ -1,0 +1,59 @@
+{
+ "__typename": "Tweet",
+ "lang": "en",
+ "created_at": "2026-10-25T18:12:37.000Z",
+ "display_text_range": [
+  0,
+  55
+ ],
+ "entities": {
+  "urls": [
+   {
+    "display_url": "example.com/post",
+    "expanded_url": "https://example.com/post",
+    "indices": [
+     11,
+     34
+    ],
+    "url": "https://t.co/aaaaaaaaaa"
+   }
+  ],
+  "media": [
+   {
+    "display_url": "pic.x.com/bbbbbbbbbb",
+    "expanded_url": "https://x.com/exampleuser/status/111/photo/1",
+    "indices": [
+     56,
+     79
+    ],
+    "url": "https://t.co/bbbbbbbbbb"
+   }
+  ]
+ },
+ "id_str": "111",
+ "text": "Read this: https://t.co/aaaaaaaaaa &lt;b&gt; &amp; more https://t.co/bbbbbbbbbb",
+ "user": {
+  "id_str": "1",
+  "name": "Example <User>",
+  "screen_name": "exampleuser"
+ },
+ "mediaDetails": [
+  {
+   "type": "photo",
+   "media_url_https": "https://pbs.twimg.com/media/AAAA.jpg",
+   "ext_alt_text": "a \"cat\""
+  }
+ ],
+ "photos": [
+  {
+   "url": "https://pbs.twimg.com/media/AAAA.jpg",
+   "width": 800,
+   "height": 600
+  },
+  {
+   "url": "https://pbs.twimg.com/media/BBBB.jpg",
+   "width": 800,
+   "height": 600
+  }
+ ]
+}

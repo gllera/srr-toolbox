@@ -15,6 +15,7 @@ bin/srr-sitemap     ingest strategy: a site's XML sitemap (no feed) -> SRR items
 bin/srr-devto       ingest strategy: dev.to's top-of-the-month ranking -> SRR items
 bin/srr-tts         pipeline step: prepend a piper TTS narration to the article
 bin/srr-gtproxy     pipeline step: the whole page, read through Google Translate's site proxy
+bin/srr-xstatus     pipeline step: an embedded X post's link -> its text and media
 bin/srr-uvrun       shebang wrapper that runs the Python scripts in this repo's uv venv
 tests/              self-checking test scripts + fixtures
 pyproject.toml      shared dependencies for every bin/ script, pinned by uv.lock
@@ -146,6 +147,24 @@ dev.to renders YouTube and Vimeo tags as iframes, which `#sanitize` removes; drr
 Pipeline steps run once per *item*, not once per *feed*: `srr` execs any non-`#builtin`
 `pipe` entry with the item JSON on stdin and reads the (possibly modified) item back on
 stdout — a different contract from the ingest strategies above.
+
+### `srr-xstatus`
+
+For a site whose posts are only an embedded X post: a `<blockquote class="twitter-tweet">`
+(or a `<p>`, or the bare `[<a>…</a>]` that `#readability selector=` leaves) whose one content
+is a link to `x.com|twitter.com/<user>/status/<id>`. The post is drawn by X's script in the
+browser, so the stored article is a stub; the step reads the post from X's public syndication
+endpoint and replaces the stub with a blockquote of the author, the text (t.co links
+expanded), the photos, a video's poster and best mp4, and a quoted post's text. A blockquote
+that carries text or an image (a pasted post) and any other link are left alone. At most 10
+posts per item, 8 s each; any failure leaves that stub as it is, and the step never exits
+non-zero on the fetch path.
+
+```bash
+drr feed upd <id> -p '#readability selector="div.entry-content > p, div.entry-content > blockquote"' \
+  -p srr-xstatus -p '#default'
+srr-xstatus https://x.com/user/status/123   # manual run: the replacement, failures loud
+```
 
 ### `srr-gtproxy`
 

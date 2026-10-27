@@ -1,0 +1,497 @@
+#!/usr/bin/env srr-uvrun
+"""drr external pipeline step: expand an embedded X post into its text and media.
+
+drr execs any non-#builtin `pipe` entry once per item, writing the item JSON
+to stdin and reading the (possibly modified) item JSON back from stdout:
+
+    {guid, title, content, link, published, lang?, raw, drop?}
+
+WHY
+---
+Some sites publish posts that are only an embedded X post: the page holds a
+`<blockquote class="twitter-tweet">` whose one content is a link to
+`https://x.com/<user>/status/<id>` (often in `[ ]`, the handle in `<b>`). The
+post's text and media are drawn by X's script in the browser, so the stored
+article is a three-word stub. This step finds those stubs and replaces each
+with the post itself, read from X's public syndication endpoint (the one the
+embed script uses; no login, no key).
+
+WHAT IS A STUB
+--------------
+A link to a status on x.com, twitter.com or mobile.twitter.com
+(`/<user>/status/<digits>`) that is the only content of
+
+  - a `<blockquote>` or a `<p>` (nothing else in it but the link, `[ ]` and
+    whitespace; no image, video or iframe), or
+  - the content itself, at its top level: bare `[<a ...><b>u</b></a>]`, which
+    is what `#readability selector=` leaves when it renders only the matched
+    elements' children.
+
+Both shapes are found, so the step works before and after drr keeps the
+matched elements. A blockquote that carries text or an image (the site pasted
+the post, or X's own embed markup with the post's text and a date link), a
+link to anything but a status, and prose around a link are left untouched.
+
+THE REPLACEMENT
+---------------
+A `<blockquote>` with the author's name and @handle linked to the post; the
+text as paragraphs, t.co links shown as the page they point to; every photo as
+`<img>`; a video or GIF as its poster `<img>` linked to the post plus a
+`<video controls src=...>` of the best mp4 variant; a quoted post as a nested
+blockquote, text only. All text is escaped.
+
+A feed opts in with
+
+    drr feed upd <id> -p '#readability selector="div.entry-content > p, ..."' \\
+        -p srr-xstatus -p '#default'
+
+ON THE FETCH PATH THIS STEP NEVER EXITS NON-ZERO. Every failure (network, an
+HTTP status, bad JSON, a deleted post, a typo'd flag) leaves the stub or the
+whole item as it was: drr drops an item whose pipe step fails and keeps its
+guid, which is worse than a stub. Failures go to stderr; the step emits
+nothing when it changed nothing, which drr reads as "leave the item
+unchanged". --help/--version print on STDERR for the same reason: stdout is the
+protocol channel. A manual run (an X status URL) reports failures loudly.
+
+KNOBS
+-----
+  --timeout <s>      each request's timeout (default 8)
+  --endpoint <url>   the syndication endpoint (default X's public one)
+  --max <n>          posts expanded per item (default 10, the rest stay stubs)
+
+MANUAL RUNS (a URL instead of stdin)
+------------------------------------
+    srr-xstatus https://x.com/user/status/20
+
+builds the item a stub would give and pretty-prints the result.
+"""
+import html
+import json
+import math
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from bs4 import BeautifulSoup, NavigableString, Tag
+
+VERSION = "1.0"
+
+ENDPOINT = "https://cdn.syndication.twimg.com/tweet-result"
+DEFAULT_TIMEOUT = 8.0
+DEFAULT_MAX = 10
+MAX_BODY = 2 << 20
+LANG = "es"
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
+
+STATUS_HOSTS = ("x.com", "twitter.com", "mobile.twitter.com", "www.x.com", "www.twitter.com")
+STATUS_PATH = re.compile(r"^/([A-Za-z0-9_]{1,50})/status/(\d{1,25})/?$")
+# What may stand in a stub besides its link.
+BRACKETS = "[]"
+MAX_LINK_TEXT = 80
+MEDIA_TAGS = ("img", "video", "picture", "iframe", "svg", "audio", "source")
+DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def log(*a):
+    print("srr-xstatus:", *a, file=sys.stderr)
+
+
+def fnv1a32(s: str) -> int:
+    h = 0x811C9DC5
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def token(tweet_id: int) -> str:
+    """The syndication endpoint's token for a post id: what the embed script
+    computes, ((id / 1e15) * pi).toString(36) without its zeros and dot.
+    Python has no base-36 float printing, so this is V8's
+    DoubleToRadixCString (shortest digits that round-trip, rounded up with
+    carry), checked against node for 300 random ids."""
+    value = (float(tweet_id) / 1e15) * math.pi
+    integer = math.floor(value)
+    fraction = value - integer
+    delta = max(0.5 * (math.nextafter(value, math.inf) - value), 5e-324)
+    frac = []
+    if fraction >= delta:
+        while True:
+            fraction *= 36
+            delta *= 36
+            digit = int(fraction)
+            frac.append(digit)
+            fraction -= digit
+            if fraction > 0.5 or (fraction == 0.5 and digit & 1):
+                if fraction + delta > 1:
+                    while True:
+                        if not frac:
+                            integer += 1
+                            break
+                        last = frac.pop()
+                        if last + 1 < 36:
+                            frac.append(last + 1)
+                            break
+                    break
+            if not fraction >= delta:
+                break
+    ip, n = "", int(integer)
+    while n:
+        ip = DIGITS[n % 36] + ip
+        n //= 36
+    return (ip + "".join(DIGITS[d] for d in frac)).replace("0", "")
+
+
+def status_id(href):
+    """The post id of an X status URL, else None."""
+    try:
+        u = urllib.parse.urlsplit((href or "").strip())
+    except ValueError:
+        return None
+    if u.scheme not in ("http", "https") or (u.hostname or "").lower() not in STATUS_HOSTS:
+        return None
+    m = STATUS_PATH.match(u.path)
+    return m.group(2) if m else None
+
+
+# --- finding the stubs --------------------------------------------------------
+
+
+def link_only(tag) -> "Tag | None":
+    """The status link when tag holds nothing else but it, brackets and
+    whitespace; None otherwise."""
+    if tag.find(MEDIA_TAGS):
+        return None
+    anchors = tag.find_all("a")
+    if not anchors:
+        return None
+    ids = {status_id(a.get("href")) for a in anchors}
+    if len(ids) != 1 or None in ids:
+        return None
+    link_text = "".join(a.get_text() for a in anchors)
+    if len(link_text.strip()) > MAX_LINK_TEXT:
+        return None
+    anchor_text = set(id(s) for a in anchors for s in a.find_all(string=True))
+    for s in tag.find_all(string=True):
+        if id(s) in anchor_text:
+            continue
+        if s.strip().strip(BRACKETS).strip():
+            return None
+    return anchors[0]
+
+
+def is_bracket_run(text: str) -> bool:
+    return not text.strip().strip(BRACKETS).strip()
+
+
+def bare_anchor(a, root) -> bool:
+    """Whether a top-level status link stands alone: its neighbours at the top
+    level are tags, whitespace or brackets, never prose."""
+    if a.parent is not root:
+        return False
+    if a.get_text().strip() == "" or len(a.get_text().strip()) > MAX_LINK_TEXT:
+        return False
+    for sib in (a.previous_sibling, a.next_sibling):
+        if isinstance(sib, NavigableString) and not is_bracket_run(str(sib)):
+            return False
+    return True
+
+
+def candidates(soup):
+    """[(node, anchor, kind)] in document order, blocks before inner links."""
+    found, taken = [], set()
+    for tag in soup.find_all(["blockquote", "p"]):
+        if tag.name == "p" and tag.find_parent("blockquote") is not None:
+            continue
+        if any(id(p) in taken for p in tag.parents):
+            continue
+        a = link_only(tag)
+        if a is not None:
+            found.append((tag, a, "block"))
+            taken.add(id(tag))
+    for a in soup.find_all("a", recursive=False):
+        if status_id(a.get("href")) and bare_anchor(a, soup):
+            found.append((a, a, "bare"))
+    return found
+
+
+def trim_brackets(a):
+    """Drop the `[` before and `]` after a bare link."""
+    prev, nxt = a.previous_sibling, a.next_sibling
+    if isinstance(prev, NavigableString):
+        s = str(prev).rstrip()
+        if s.endswith("["):
+            prev.replace_with(s[:-1])
+    if isinstance(nxt, NavigableString):
+        s = str(nxt).lstrip()
+        if s.startswith("]"):
+            nxt.replace_with(s[1:])
+
+
+# --- fetching -----------------------------------------------------------------
+
+
+def fetch_tweet(tid: str, cfg: dict) -> dict:
+    q = urllib.parse.urlencode({"id": tid, "token": token(int(tid)), "lang": LANG})
+    sep = "&" if "?" in cfg["endpoint"] else "?"
+    req = urllib.request.Request(cfg["endpoint"] + sep + q, headers={
+        "User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
+        if r.status != 200:
+            raise OSError("HTTP %d" % r.status)
+        body = r.read(MAX_BODY + 1)
+    if len(body) > MAX_BODY:
+        raise OSError("answer over %d bytes" % MAX_BODY)
+    data = json.loads(body)
+    if not isinstance(data, dict) or data.get("__typename") != "Tweet":
+        raise ValueError("not a tweet (%s)" % (data.get("__typename") if isinstance(data, dict) else "?"))
+    user = data.get("user")
+    if not isinstance(user, dict) or not user.get("screen_name") or not isinstance(data.get("text"), str):
+        raise ValueError("unexpected tweet shape")
+    return data
+
+
+# --- rendering ----------------------------------------------------------------
+
+
+def esc(s) -> str:
+    return html.escape(str(s), quote=True)
+
+
+def https_url(u):
+    """u when it is an http(s) URL, else None."""
+    if isinstance(u, str) and u.lower().startswith(("https://", "http://")):
+        return u
+    return None
+
+
+def render_text(tweet: dict) -> str:
+    """The post's text as HTML paragraphs, t.co links expanded."""
+    text = tweet["text"]
+    rng = tweet.get("display_text_range")
+    start, end = 0, len(text)
+    if (isinstance(rng, list) and len(rng) == 2 and all(isinstance(n, int) for n in rng)
+            and 0 <= rng[0] <= rng[1] <= len(text)):
+        start, end = rng
+    ents = tweet.get("entities") or {}
+    spans = []  # (from, to, html)
+    for e in ents.get("urls") or []:
+        ind = e.get("indices")
+        href = https_url(e.get("expanded_url"))
+        if isinstance(ind, list) and len(ind) == 2 and href:
+            shown = e.get("display_url") or href
+            spans.append((ind[0], ind[1], '<a href="%s">%s</a>' % (esc(href), esc(shown))))
+    for e in ents.get("media") or []:
+        ind = e.get("indices")
+        if isinstance(ind, list) and len(ind) == 2:
+            spans.append((ind[0], ind[1], ""))
+    spans.sort()
+    out, pos = [], start
+    for a, b, frag in spans:
+        if a < pos or b > end:
+            continue
+        out.append(esc(html.unescape(text[pos:a])))
+        out.append(frag)
+        pos = b
+    out.append(esc(html.unescape(text[pos:end])))
+    body = "".join(out).strip()
+    paras = []
+    for para in re.split(r"\n\s*\n", body):
+        para = para.strip()
+        if para:
+            paras.append("<p>%s</p>" % para.replace("\n", "<br>"))
+    return "".join(paras)
+
+
+def best_mp4(tweet: dict):
+    """The highest-bitrate mp4 variant's URL, else the last plain mp4, else None."""
+    best, best_rate = None, -1
+    for m in tweet.get("mediaDetails") or []:
+        for v in ((m.get("video_info") or {}).get("variants") or []):
+            if v.get("content_type") == "video/mp4" and https_url(v.get("url")):
+                rate = v.get("bitrate") if isinstance(v.get("bitrate"), int) else 0
+                if rate > best_rate:
+                    best, best_rate = v["url"], rate
+    if best:
+        return best
+    for v in reversed(((tweet.get("video") or {}).get("variants")) or []):
+        if v.get("type") == "video/mp4" and https_url(v.get("src")):
+            return v["src"]
+    return None
+
+
+def render_media(tweet: dict, link: str) -> str:
+    out = []
+    alts = {}
+    for m in tweet.get("mediaDetails") or []:
+        if m.get("media_url_https"):
+            alts[m["media_url_https"]] = m.get("ext_alt_text") or ""
+    for p in tweet.get("photos") or []:
+        url = https_url(p.get("url"))
+        if url:
+            out.append('<p><img src="%s" alt="%s"></p>' % (esc(url), esc(alts.get(url, ""))))
+    video = tweet.get("video")
+    if isinstance(video, dict):
+        poster = https_url(video.get("poster"))
+        mp4 = best_mp4(tweet)
+        if poster:
+            out.append('<p><a href="%s"><img src="%s" alt=""></a></p>' % (esc(link), esc(poster)))
+        if mp4:
+            out.append('<p><video controls src="%s"></video></p>' % esc(mp4))
+    return "".join(out)
+
+
+def tweet_link(tweet: dict) -> str:
+    return "https://x.com/%s/status/%s" % (tweet["user"]["screen_name"], tweet.get("id_str") or "")
+
+
+def render(tweet: dict) -> str:
+    """The sanitizer-safe replacement for a stub."""
+    user = tweet["user"]
+    link = tweet_link(tweet)
+    parts = ['<blockquote><p><a href="%s"><b>%s</b> @%s</a></p>' % (
+        esc(link), esc(user.get("name") or user["screen_name"]), esc(user["screen_name"]))]
+    parts.append(render_text(tweet))
+    parts.append(render_media(tweet, link))
+    q = tweet.get("quoted_tweet")
+    if isinstance(q, dict) and isinstance(q.get("user"), dict) and q["user"].get("screen_name") \
+            and isinstance(q.get("text"), str):
+        parts.append('<blockquote><p><a href="%s"><b>%s</b> @%s</a></p>%s</blockquote>' % (
+            esc(tweet_link(q)), esc(q["user"].get("name") or q["user"]["screen_name"]),
+            esc(q["user"]["screen_name"]), render_text(q)))
+    parts.append("</blockquote>")
+    return "".join(parts)
+
+
+# --- the item -----------------------------------------------------------------
+
+
+def expand(content: str, cfg: dict):
+    """(new content, number of stubs replaced); the content itself when none."""
+    soup = BeautifulSoup(content, "html.parser")
+    done, cache = 0, {}
+    for node, anchor, kind in candidates(soup):
+        if done >= cfg["max"]:
+            break
+        tid = status_id(anchor.get("href"))
+        if tid not in cache:
+            try:
+                cache[tid] = render(fetch_tweet(tid, cfg))
+            except Exception as e:
+                log("status %s: %s: leaving the stub" % (tid, e))
+                cache[tid] = None
+        if cache[tid] is None:
+            continue
+        if kind == "bare":
+            trim_brackets(anchor)
+        node.replace_with(BeautifulSoup(cache[tid], "html.parser"))
+        done += 1
+    return (str(soup), done) if done else (content, 0)
+
+
+def run_item(item: dict, cfg: dict):
+    """The item with its stubs replaced, or None to leave it unchanged."""
+    content = item.get("content")
+    if not isinstance(content, str) or not content:
+        return None
+    new, n = expand(content, cfg)
+    if not n:
+        return None
+    item["content"] = new
+    return item
+
+
+def parse_argv(argv):
+    """(cfg, url, errors): url is the manual run's positional, else None."""
+    cfg = {"timeout": DEFAULT_TIMEOUT, "endpoint": ENDPOINT, "max": DEFAULT_MAX}
+    errors, urls = [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--timeout", "--endpoint", "--max"):
+            if i + 1 >= len(argv):
+                errors.append("%s needs a value" % a)
+                break
+            cfg[a[2:]] = argv[i + 1]
+            i += 2
+        elif a.startswith("-"):
+            errors.append("unknown option %r (see --help)" % a)
+            i += 1
+        elif a.startswith(("https://", "http://")):
+            urls.append(a)
+            i += 1
+        else:
+            errors.append("unexpected argument %r (a manual run takes an X status URL)" % a)
+            i += 1
+    try:
+        cfg["timeout"] = float(cfg["timeout"])
+        if cfg["timeout"] <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors.append("--timeout must be a positive number, got %r" % cfg["timeout"])
+        cfg["timeout"] = DEFAULT_TIMEOUT
+    try:
+        cfg["max"] = int(cfg["max"])
+        if cfg["max"] < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors.append("--max must be a non-negative integer, got %r" % cfg["max"])
+        cfg["max"] = DEFAULT_MAX
+    if not https_url(cfg["endpoint"]):
+        errors.append("--endpoint must be an http(s) URL, got %r" % cfg["endpoint"])
+        cfg["endpoint"] = ENDPOINT
+    if len(urls) > 1:
+        errors.append("more than one URL (%s)" % ", ".join(repr(u) for u in urls))
+    return cfg, (urls[0] if urls else None), errors
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__, file=sys.stderr)
+        return
+    if argv and argv[0] in ("version", "--version", "-V"):
+        print("srr-xstatus", VERSION, file=sys.stderr)
+        return
+    cfg, url, errors = parse_argv(argv)
+    if url is not None:
+        if errors:
+            sys.exit("srr-xstatus: " + errors[0])
+        tid = status_id(url)
+        if tid is None:
+            sys.exit("srr-xstatus: not an X status URL: %s" % url)
+        try:
+            content = render(fetch_tweet(tid, cfg))
+        except Exception as e:
+            sys.exit("srr-xstatus: %s" % e)
+        item = {"guid": fnv1a32(url), "title": "", "content": content, "link": url,
+                "published": None}
+        json.dump(item, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+        return
+    if errors:
+        log("%s: passing items through unchanged" % errors[0])
+        return
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="strict")
+        item = json.load(sys.stdin)
+    except (ValueError, RecursionError) as e:
+        log("could not parse item on stdin (%s): emitting nothing" % e)
+        return
+    try:
+        result = run_item(item, cfg)
+        if result is None:
+            return
+        # `raw` is restored by drr over whatever comes back: never echo it.
+        result.pop("raw", None)
+        out = json.dumps(result, allow_nan=False)
+    except Exception as e:
+        log("%s: keeping the item as it is" % e)
+        return
+    sys.stdout.write(out)
+
+
+if __name__ == "__main__":
+    main()

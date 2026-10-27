@@ -1,0 +1,31 @@
+{
+ "__typename": "Tweet",
+ "lang": "en",
+ "display_text_range": [
+  0,
+  47
+ ],
+ "entities": {},
+ "id_str": "222",
+ "text": "First line &amp; more\n\nSecond para\nwith a break",
+ "user": {
+  "id_str": "2",
+  "name": "Plain",
+  "screen_name": "plain_user"
+ },
+ "quoted_tweet": {
+  "__typename": "Tweet",
+  "id_str": "333",
+  "text": "Quoted <script>alert(1)</script>",
+  "user": {
+   "id_str": "3",
+   "name": "Q",
+   "screen_name": "quoted"
+  },
+  "photos": [
+   {
+    "url": "https://pbs.twimg.com/media/QQQQ.jpg"
+   }
+  ]
+ }
+}
