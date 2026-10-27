@@ -33,6 +33,27 @@ cap) falls back to its hotlink: unlike Telegram's token-signed preview CDN,
 i.ytimg.com URLs are public and stable, so degrading beats failing the cycle.
 `srr preview` sends no asset_dir (self-hosting off), so previews hotlink too.
 
+TRIMMING BOILERPLATE — --trim
+-----------------------------
+Some channels' descriptions are mostly boilerplate: a support/social link dump,
+merch, Patreon, hashtags, a separator line followed by promos. With --trim each
+description is cut down before rendering:
+
+  1. everything from the first separator line on is dropped (a line of 3 or more
+     of one character among ━ ─ — - _ = * ~ ═, whitespace ignored);
+  2. every paragraph that is mostly links, @handles or #hashtags is dropped (at
+     least 60 % of its tokens; a "Label:" right before a URL counts with the URL,
+     and tokens with no letter or digit, like an arrow, are not counted);
+  3. every paragraph that is only a call to action with a link is dropped (it
+     starts with an emoji or arrow, holds a URL and has at most 12 words besides).
+
+Summary paragraphs, chapter lists (lines starting 0:00 / 00:00 / 1:02:03) and prose
+with an occasional link stay. A description trimmed to nothing leaves the thumbnail
+alone. The flag works the same on the stdin path:
+
+  srr feed add -t "Veritasium" -u "https://www.youtube.com/feeds/videos.xml?channel_id=UC..." \
+    -i "srr-youtube --trim"
+
 MANUAL RUNS (parameters instead of stdin)
 -----------------------------------------
 Normally srr drives this script by writing a JSON request to stdin. To test a
@@ -61,11 +82,12 @@ NS = {
     "yt": "http://www.youtube.com/xml/schemas/2015",
 }
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 UA = {"User-Agent": "SRR-youtube"}
 MAX_FEED_BYTES = 8_000_000   # feed-XML read cap (the request carries no knob for it)
 SELFHOST = False   # set by --selfhost in main(); thumbnails download only when set
+TRIM = False       # set by --trim in main(); descriptions are trimmed only when set
 
 
 def fnv1a32(s: str) -> int:
@@ -221,6 +243,57 @@ def desc_html(text):
     return "".join(parts)
 
 
+SEPARATOR_CHARS = "━─—-_=*~═"
+TIMESTAMP_RE = re.compile(r"^\s*(?:\d{1,2}:)?\d{1,2}:\d{2}\b")
+URL_RE = re.compile(r"^(?:https?://|www\.)\S+$", re.I)
+MENTION_RE = re.compile(r"^[@#]\w\S*$")
+LINK_SHARE = 0.6    # a paragraph this share link/@handle/#tag tokens is boilerplate
+CTA_WORDS = 12      # a call to action has at most this many words besides its URL
+
+
+def is_separator(line):
+    t = "".join(line.split())
+    return len(t) >= 3 and t[0] in SEPARATOR_CHARS and t == t[0] * len(t)
+
+
+def is_link_token(tok):
+    return bool(URL_RE.match(tok) or MENTION_RE.match(tok))
+
+
+def boilerplate_paragraph(para):
+    """True for a paragraph --trim drops: mostly links/@handles/#tags, or a
+    one-line call to action with a link. Chapter lists never are."""
+    if any(TIMESTAMP_RE.match(l) for l in para.splitlines()):
+        return False
+    raw = para.split()
+    # tokens with no letter or digit (arrows, bullets, emoji) are neutral
+    toks = [t for t in raw if any(c.isalnum() for c in t)]
+    n_link = 0
+    for i, t in enumerate(toks):
+        # "Patreon: https://..." — the label belongs to the link it introduces
+        if is_link_token(t) or (t.endswith(":") and i + 1 < len(toks)
+                                and URL_RE.match(toks[i + 1])):
+            n_link += 1
+    if toks and n_link >= LINK_SHARE * len(toks):
+        return True
+    first = para.lstrip()[:1]
+    if first and not first.isalnum() and any(URL_RE.match(t) for t in raw):
+        if len([t for t in toks if not URL_RE.match(t)]) <= CTA_WORDS:
+            return True
+    return False
+
+
+def trim_description(text):
+    """--trim: the description without its boilerplate (see the module doc)."""
+    lines = (text or "").splitlines()
+    for i, l in enumerate(lines):
+        if is_separator(l):
+            lines = lines[:i]
+            break
+    paras = PARA_SPLIT_RE.split("\n".join(lines).strip())
+    return "\n\n".join(p for p in paras if p.strip() and not boilerplate_paragraph(p))
+
+
 def build_items(body, asset_dir, cap):
     items = []
     for e in ET.fromstring(body).findall("a:entry", NS):
@@ -234,6 +307,8 @@ def build_items(body, asset_dir, cap):
         thumb = (thumb_src(vid, tnode.get("url") or "", asset_dir, cap)
                  if tnode is not None else "")
         desc = g.findtext("m:description", "", NS) if g is not None else ""
+        if TRIM:
+            desc = trim_description(desc)
 
         content = (
             f'<p><a href="{html.escape(watch)}">'
@@ -325,10 +400,11 @@ def cmd_ingest(req=None):
 
 
 def main():
-    global SELFHOST
+    global SELFHOST, TRIM
     argv = sys.argv[1:]
     SELFHOST = "--selfhost" in argv
-    argv = [a for a in argv if a != "--selfhost"]
+    TRIM = "--trim" in argv
+    argv = [a for a in argv if a not in ("--selfhost", "--trim")]
     if argv and argv[0] in ("-h", "--help", "help"):
         print(__doc__)
         return

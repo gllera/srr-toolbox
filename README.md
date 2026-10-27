@@ -65,6 +65,9 @@ clickable-thumbnail + description body that survives `#sanitize`. Stdlib only.
 Thumbnails hotlink to `i.ytimg.com` by default; `--selfhost` downloads them into the
 store, falling back to the hotlink if a download fails (those URLs are public and
 stable, so degrading beats failing the cycle). The video itself is never downloaded.
+`--trim` cuts boilerplate from each description (everything after a separator line, paragraphs
+that are mostly links, @handles or #hashtags, and one-line calls to action with a link) and
+keeps summaries, chapter lists and prose; it works on the stdin path like any other flag.
 
 ```bash
 srr feed add -t "Veritasium" \
