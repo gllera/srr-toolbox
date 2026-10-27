@@ -11,7 +11,7 @@ not here). `bin/` holds two kinds. Exec'd by `drr` by bare name, resolved from
 strategies — one process per feed, JSON stdin -> JSON stdout) and **`srr-tts`** /
 **`srr-gtproxy`** (python pipeline steps — one process per item, item JSON stdin -> item
 JSON stdout; srr-tts prepends a piper TTS narration, srr-gtproxy replaces a teaser with the
-page's body read through Google Translate's website proxy). Plus the `srr-uvrun` shebang wrapper. On the server
+whole page read through Google Translate's website proxy, for drr's `#readability source=content`). Plus the `srr-uvrun` shebang wrapper. On the server
 `bin/` reaches `PATH` as the `/opt/drr/bin` mirror, refreshed via `drr-update toolbox`; for dev, put
 `~/ws/srr-toolbox/bin` on `PATH` (this repo is destined to be public, so it only
 states the generic PATH contract).

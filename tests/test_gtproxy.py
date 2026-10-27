@@ -1,6 +1,7 @@
-"""Tests for srr-gtproxy: the proxy URL and its inverse, the body it keeps
-(selector, nesting, --drop, unwrapped links), run_item with a fake fetch, and
-the protocol path, which never exits non-zero and emits nothing on failure.
+"""Tests for srr-gtproxy: the proxy URL and its inverse, the page it hands on
+(the proxy's additions removed, its links unwrapped, the site's own markup
+kept), run_item with a fake fetch, and the protocol path, which never exits
+non-zero and emits nothing on failure.
 
 Run in the repo's uv project venv (the script imports bs4 and html5lib):
     uv run tests/test_gtproxy.py
@@ -40,6 +41,7 @@ def check_true(name, cond, detail=""):
 
 
 Q = "_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
+QA = Q.replace("&", "&amp;")
 
 # --- proxy_url / unwrap_url -------------------------------------------------
 
@@ -78,45 +80,60 @@ check("unwrap: srcset",
                         "https://cdn.example.com/b.jpg 2x"),
       "https://x.example.com/a.jpg 1x, https://cdn.example.com/b.jpg 2x")
 
-# --- extract ----------------------------------------------------------------
+# --- clean ------------------------------------------------------------------
 
-PAGE = """<!doctype html><html><head><title>T</title></head><body>
-<div class="teaser">not this</div>
+# A page as the proxy answers it: the site's own head and body, with the
+# proxy's metas, scripts, font and links mixed in, as measured on a live one.
+GT = "https://www.gstatic.com/_/translate_http/_/js/k=translate_http.tr.de.x/am=A/d=1"
+PAGE = """<!DOCTYPE html><html><head>
+<base href="https://www.example.com/r/1.shtml">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-X"></script>
+<meta name="robots" content="max-image-preview:large">
+<title>T</title>
+<meta http-equiv="X-Translated-By" content="Google">
+<meta http-equiv="X-Translated-To" content="en">
+<script type="text/javascript" src=\"""" + GT + """/rs=A" data-sourceurl="https://www.example.com/r/1.shtml"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
+<script type="text/javascript" src=\"""" + GT + """/exm=corsproxy" data-proxy-url="https://www-example-com.translate.goog"></script>
+<meta name="robots" content="none">
+</head><body>
+<div class="teaser">the site's own chrome</div>
 <article itemprop="reviewBody"><p class="intro">First <b>para</b>.</p>
-<div class="gallery"><img src="https://cdn.example.com/1.jpg">
-<div class="more">+4<span>more</span></div>
-<div class="slide hidden"><img src="https://cdn.example.com/2.jpg"></div></div>
 <p>See <a href="https://translate.google.com/website?sl=auto&amp;tl=en&amp;hl=en&amp;u=https://example.org/x">this</a>
-and <a href="https://www-example-com.translate.goog/other.shtml?""" + Q.replace("&", "&amp;") + """">that</a>.
-<img srcset="https://cdn-example-com.translate.goog/s.jpg?""" + Q.replace("&", "&amp;") + """ 2x"></p>
-<article itemprop="reviewBody"><p>nested</p></article>
+and <a href="https://www-example-com.translate.goog/other.shtml?""" + QA + """">that</a>.
+<img srcset="https://cdn-example-com.translate.goog/s.jpg?""" + QA + """ 2x" src="https://news-cdn.example.com/1.jpg"></p>
 </article>
-<article itemprop="articleBody"><p>Second body.</p></article>
+<script>function gtElInit() {var lib = new google.translate.TranslateService();lib.translatePage('auto', 'en', function () {});}</script>
+<script id="google-translate-element-script">(function(){ if(!window['_DumpException']) {} })();</script>
 </body></html>"""
-SEL = "article[itemprop=reviewBody], article[itemprop=articleBody]"
 
-got = mod.extract(PAGE, SEL, ".more, .slide.hidden")
-check_true("extract: the bodies, not the teaser", got is not None and "not this" not in got, got)
-check_true("extract: both bodies in document order",
-           got is not None and got.index("First") < got.index("Second body."), got)
-check("extract: a nested match is kept once", got.count("nested"), 1)
-check_true("extract: --drop removes the tile and the hidden slide",
-           "+4" not in got and "2.jpg" not in got and "1.jpg" in got, got)
-check_true("extract: website?u= link unwrapped", 'href="https://example.org/x"' in got, got)
-check_true("extract: translate.goog link unwrapped",
+got = mod.clean(PAGE)
+check_true("clean: a page comes back", got is not None, got)
+got = got or ""
+check_true("clean: the whole page, the site's chrome and the article",
+           "the site's own chrome" in got and 'itemprop="reviewBody"' in got
+           and "<title>T</title>" in got, got)
+check_true("clean: no proxy URL or script survives",
+           "translate.goog" not in got and "translate.google" not in got
+           and "translate_http" not in got and "TranslateService" not in got
+           and "google-translate-element-script" not in got, got)
+check_true("clean: the proxy's metas and font go",
+           "X-Translated" not in got and "Material+Symbols" not in got
+           and 'content="none"' not in got, got)
+check_true("clean: the site's own script and robots meta stay",
+           "googletagmanager.com/gtag" in got and "max-image-preview:large" in got, got)
+check_true("clean: the base href (the original URL) stays",
+           '<base href="https://www.example.com/r/1.shtml"' in got, got)
+check_true("clean: website?u= link unwrapped", 'href="https://example.org/x"' in got, got)
+check_true("clean: translate.goog link unwrapped",
            'href="https://www.example.com/other.shtml"' in got, got)
-check_true("extract: srcset unwrapped",
-           'srcset="https://cdn.example.com/s.jpg 2x"' in got, got)
-check_true("extract: no proxy URL survives",
-           "translate.goog" not in got and "translate.google" not in got, got)
-check_true("extract: inner HTML, a match's own tag is not kept",
-           not got.lstrip().startswith("<article") and 'itemprop="articleBody"' not in got, got)
-check("extract: no match", mod.extract(PAGE, "main.nothing"), None)
-check("extract: a match with only whitespace",
-      mod.extract("<article class=b> <img src=x> </article>", "article.b"), None)
-check_true("extract: bytes with a declared charset",
-           "café" in (mod.extract("<p class=x>café</p>".encode("latin-1"), "p.x",
-                                  charset="iso-8859-1") or ""))
+check_true("clean: srcset unwrapped", 'srcset="https://cdn.example.com/s.jpg 2x"' in got, got)
+check_true("clean: a direct URL is kept", 'src="https://news-cdn.example.com/1.jpg"' in got, got)
+check_true("clean: the doctype is kept", got.lower().startswith("<!doctype html>"), got[:40])
+check("clean: a page with no text is none",
+      mod.clean("<html><head><title>T</title></head><body> <img src=x> </body></html>"), None)
+check_true("clean: bytes with a declared charset",
+           "café" in (mod.clean("<p>café</p>".encode("latin-1"), charset="iso-8859-1") or ""))
 
 # --- run_item with a fake fetch ----------------------------------------------
 
@@ -130,14 +147,14 @@ def fake_fetch(url, cfg):
 
 real_fetch = mod.fetch
 mod.fetch = fake_fetch
-cfg, url, errors = mod.parse_argv(["--selector", SEL])
-check("parse: no errors", errors, [])
+cfg, url, errors = mod.parse_argv([])
+check("parse: no flags is no error", errors, [])
 item = {"guid": 7, "title": "t", "content": "<p>teaser</p>",
         "link": "https://www.example.com/r/1.shtml", "published": None}
 out = mod.run_item(dict(item), cfg)
 check("run_item: asks the proxy for the link", calls,
       ["https://www-example-com.translate.goog/r/1.shtml?" + Q])
-check_true("run_item: content replaced", "First" in out["content"] and "teaser" not in out["content"])
+check("run_item: the content is the cleaned page", out["content"], mod.clean(PAGE))
 check("run_item: guid, title, link, published unchanged",
       [out[k] for k in ("guid", "title", "link", "published")],
       [item[k] for k in ("guid", "title", "link", "published")])
@@ -146,22 +163,25 @@ try:
     check_true("run_item: http link raises", False)
 except ValueError:
     check_true("run_item: http link raises", True)
-cfg2, _, _ = mod.parse_argv(["--selector", "main.nothing"])
+mod.fetch = lambda url, cfg: (b"<html><body></body></html>", "utf-8")
 try:
-    mod.run_item(dict(item), cfg2)
-    check_true("run_item: no match raises", False)
+    mod.run_item(dict(item), cfg)
+    check_true("run_item: an empty page raises", False)
 except ValueError:
-    check_true("run_item: no match raises", True)
+    check_true("run_item: an empty page raises", True)
 mod.fetch = real_fetch
 
 # --- parse_argv --------------------------------------------------------------
 
-check_true("parse: --selector is required", mod.parse_argv([])[2] != [])
-check_true("parse: unknown option", mod.parse_argv(["--selector", "p", "--sel", "x"])[2] != [])
-check_true("parse: bad timeout", mod.parse_argv(["--selector", "p", "--timeout", "0"])[2] != [])
-check_true("parse: bad selector", mod.parse_argv(["--selector", "p[["])[2] != [])
+check_true("parse: --selector is gone (drr's #readability picks the body)",
+           mod.parse_argv(["--selector", "p"])[2] != [])
+check_true("parse: --drop is gone (drr's #strip removes)",
+           mod.parse_argv(["--drop", "p"])[2] != [])
+check_true("parse: bad timeout", mod.parse_argv(["--timeout", "0"])[2] != [])
+check_true("parse: a flag without its value", mod.parse_argv(["--ua"])[2] != [])
 check("parse: a URL is a manual run",
-      mod.parse_argv(["--selector", "p", "https://example.com/a"])[1], "https://example.com/a")
+      mod.parse_argv(["https://example.com/a"])[1], "https://example.com/a")
+check_true("parse: two URLs", mod.parse_argv(["https://example.com/a", "https://example.com/b"])[2] != [])
 
 # --- the protocol path, as drr runs it ---------------------------------------
 
@@ -173,20 +193,25 @@ def run(args, stdin):
                           capture_output=True, text=True, timeout=60)
 
 
-p = run(["--selector", SEL], ITEM.replace("https://www", "http://www"))
+p = run([], ITEM.replace("https://www", "http://www"))
 check("protocol: a failing item exits 0", p.returncode, 0)
 check("protocol: and emits nothing", p.stdout, "")
 check_true("protocol: and says why on stderr", "https" in p.stderr, p.stderr)
-p = run(["--selector"], ITEM)
-check("protocol: a broken flag exits 0 with nothing on stdout",
-      (p.returncode, p.stdout), (0, ""))
-p = run(["--selector", SEL], "{not json")
+# The flags of srr-gtproxy 1.x, still in a feed's pipe: never a manual run,
+# whose non-zero exit would make drr drop the item for good.
+p = run(["--selector", "article[itemprop=reviewBody], article[itemprop=articleBody]",
+         "--drop", ".galart2_last, .galart2_img.hidden"], ITEM)
+check("protocol: 1.x flags exit 0 with nothing on stdout", (p.returncode, p.stdout), (0, ""))
+check_true("protocol: and name the old flag", "--selector" in p.stderr, p.stderr)
+check_true("parse: a value that is no URL is no manual run",
+           mod.parse_argv(["--selector", "p"])[1] is None)
+p = run([], "{not json")
 check("protocol: bad JSON exits 0 with nothing on stdout", (p.returncode, p.stdout), (0, ""))
 p = run(["--help"], ITEM)
 check_true("protocol: --help on stderr only", p.stdout == "" and "KNOBS" in p.stderr)
 p = run(["--version"], ITEM)
-check("protocol: --version on stderr only", (p.stdout, p.stderr.split()[0]), ("", "srr-gtproxy"))
-p = run(["--selector", SEL, "http://example.com/a"], "")
+check("protocol: --version on stderr only", (p.stdout, p.stderr.split()[:2]), ("", ["srr-gtproxy", "2.0"]))
+p = run(["http://example.com/a"], "")
 check_true("manual: a failure exits non-zero", p.returncode != 0 and "https" in p.stderr, p.stderr)
 
 if failures:

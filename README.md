@@ -14,7 +14,7 @@ bin/srr-x           ingest strategy: X/Twitter account (via a Nitter instance) -
 bin/srr-sitemap     ingest strategy: a site's XML sitemap (no feed) -> SRR items
 bin/srr-devto       ingest strategy: dev.to's top-of-the-month ranking -> SRR items
 bin/srr-tts         pipeline step: prepend a piper TTS narration to the article
-bin/srr-gtproxy     pipeline step: the full article, read through Google Translate's site proxy
+bin/srr-gtproxy     pipeline step: the whole page, read through Google Translate's site proxy
 bin/srr-uvrun       shebang wrapper that runs the Python scripts in this repo's uv venv
 tests/              self-checking test scripts + fixtures
 pyproject.toml      shared dependencies for every bin/ script, pinned by uv.lock
@@ -151,22 +151,26 @@ For a teaser-only feed whose pages refuse drr's own HTTP client from every addre
 website proxy fetches a page from Google's servers and answers with the page's own text (the
 translation runs in the visitor's browser), so the step asks it for the item's link
 (`https://www.example.com/a` → `https://www-example-com.translate.goog/a?_x_tr_sl=auto&…`),
-keeps the inner HTML of each element `--selector` matches, removes what `--drop` matches
-inside them, and makes that the content. The proxy routes the page's links through itself;
-every URL in the kept HTML is turned back into the original, so the stored article never
-depends on the proxy. Only https links are read; stdlib fetch plus bs4/html5lib.
+takes out what the proxy added (its metas, scripts and toolbar font), turns every URL it
+rewrote back into the original, and makes the whole page the item's content. The step only
+fetches: drr's `#readability source=content` picks the article out of that page (with a
+`selector=`, or its heuristic) and `#strip` removes what it keeps but should not. Only https
+links are read; stdlib fetch plus bs4/html5lib.
 
 ```bash
-drr feed upd <id> -p "srr-gtproxy --selector 'article.post-body' --drop '.gallery .more'" -p '#default'
-srr-gtproxy --selector 'article.post-body' https://www.example.com/a   # manual run
+drr feed upd <id> -p srr-gtproxy \
+  -p '#readability source=content selector="article.post-body"' \
+  -p '#strip select=".gallery .more"' -p '#default'
+srr-gtproxy https://www.example.com/a   # manual run: the item, the whole page in its content
 ```
 
 The proxy is a free Google service with no contract: if it changes, or the site starts
-refusing it, the step finds no body and the item keeps its teaser. Like `srr-tts`, the
-step never exits non-zero on the fetch path (drr would drop the article for good): any failure,
-a typo'd flag included, is logged to stderr and the item passes through unchanged. A manual
-run (a URL argument) reports failures with a non-zero exit. `--timeout` (30 s) bounds the
-proxy request, `--ua` sets its User-Agent.
+refusing it, the step emits nothing and the item keeps its teaser (and `#readability` notes
+that its selector matched nothing). Like `srr-tts`, the step never exits non-zero on the
+fetch path (drr would drop the article for good): any failure, a typo'd or 1.x flag
+(`--selector`, `--drop`) included, is logged to stderr and the item passes through
+unchanged. A manual run (an http(s) URL argument) reports failures with a non-zero exit.
+`--timeout` (30 s) bounds the proxy request, `--ua` sets its User-Agent.
 
 ### `srr-tts`
 
