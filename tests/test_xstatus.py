@@ -1,8 +1,8 @@
 """Tests for srr-xstatus: the syndication token, finding the stubs (a blockquote,
 a paragraph, bare top-level links; pasted tweets and other links untouched),
 the rendering of a photo, a video and a text post (recorded or hand-built
-syndication JSON in tests/fixtures_xstatus/, handles anonymised), and the
-protocol path against a local http.server: fail open, exit 0, always.
+syndication JSON in tests/fixtures_xstatus/, handles and ids anonymised), and
+the protocol path against a local http.server: fail open, exit 0, always.
 
 Run in the repo's uv project venv:
     uv run tests/test_xstatus.py
@@ -52,7 +52,7 @@ def fixture(name):
 # --- the token ----------------------------------------------------------------
 # Pairs computed with node: ((Number(id)/1e15)*Math.PI).toString(36).replace(/(0+|\.)/g,"")
 check("token: id 20", mod.token(20), "6dq1a2xwd93")
-check("token: a 2026 id", mod.token(2114419878342046044), "54in95qpl69")
+check("token: a 2026 id", mod.token(2100000000000000002), "539cekdjrf4")
 check_true("token: shape (base 36, no dot or zero)",
           all(c in mod.DIGITS and c != "0" for c in mod.token(1850000000000000000)))
 
@@ -120,9 +120,9 @@ check_true("photo: no video", "<video" not in r, r)
 video = json.loads(fixture("video.json"))
 r = mod.render(video)
 check_true("video: best mp4 (highest bitrate)",
-           '<video controls src="https://video.twimg.com/amplify_video/2114419845630418944/vid/avc1/1080x1920/m2j6zA1BomBuTrO2.mp4">' in r, r)
+           '<video controls src="https://video.twimg.com/amplify_video/2100000000000000001/vid/avc1/1080x1920/DDDDDDDDDDDDDDDD.mp4">' in r, r)
 check_true("video: poster linked to the post",
-           '<a href="https://x.com/exampleuser/status/2114419878342046044"><img src="https://pbs.twimg.com/amplify_video_thumb/' in r, r)
+           '<a href="https://x.com/exampleuser/status/2100000000000000002"><img src="https://pbs.twimg.com/amplify_video_thumb/' in r, r)
 check_true("video: the media t.co is gone from the text", "t.co" not in r and "Es mi nuevo video favorito" in r, r)
 check_true("video: no m3u8", "m3u8" not in r, r)
 
