@@ -9,7 +9,7 @@
 [project]
 name = "srr-toolbox"
 version = "2.0"
-requires-python = ">=3.9"
+requires-python = ">=3.11"   # gateway runs 3.11, dmz 3.12; 3.9 and 3.10 are EOL
 dependencies = [
     "telethon>=1.43,<2",   # srr-telegram: MTProto account mode
     "cryptg>=0.4",         # srr-telegram: fast Telethon crypto
