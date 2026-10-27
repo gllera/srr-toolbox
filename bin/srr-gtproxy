@@ -46,7 +46,10 @@ answer, a page with no text, a typo'd flag in the feed's `pipe`) is reported
 on stderr, and the step emits nothing, which drr reads as "leave the item
 unchanged". --help/--version print on STDERR for the same reason: stdout is the
 protocol channel. Run the step manually (a URL argument) to have failures
-reported with a non-zero exit.
+reported with a non-zero exit. A busy proxy (HTTP 429 or 503: it rate-limits
+an address that asks too often) is asked again after 15, 45 and 90 s, or after
+its Retry-After when that is longer (up to 90 s), well inside drr's
+cmd-timeout.
 
 KNOBS
 -----
@@ -64,12 +67,14 @@ whole pipe: drr preview <feed url> -p srr-gtproxy -p '#readability ...' ...
 """
 import json
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
 from bs4 import BeautifulSoup
 
-VERSION = "2.0"
+VERSION = "2.1"
 
 PROXY_DOMAIN = "translate.goog"
 # sl=auto/tl=en is accepted for a page in any language (sl == tl is a 400)
@@ -80,6 +85,15 @@ DEFAULT_TIMEOUT = 30.0
 DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
 MAX_BODY = 8 << 20   # the same cap as drr's #readability fetch
+
+# A busy proxy (429, or 503) is asked again after each of these waits, or
+# after its Retry-After when that is longer, up to RETRY_AFTER_MAX. The whole
+# run stays minutes under drr's cmd-timeout, past which drr would drop the
+# item for good; a proxy still busy at the end leaves the teaser.
+RETRY_STATUS = (429, 503)
+RETRY_WAITS = (15, 45, 90)
+RETRY_AFTER_MAX = 90
+sleep = time.sleep  # the tests' seam
 
 # Attributes holding a srcset list; any other attribute holding a proxy URL
 # is one URL.
@@ -211,7 +225,29 @@ def clean(page, charset=None):
 
 
 def fetch(url: str, cfg: dict):
-    """(body bytes, the charset the response declares or None)."""
+    """(body bytes, the charset the response declares or None), asking a
+    busy proxy again (RETRY_*)."""
+    for wait in RETRY_WAITS + (None,):
+        try:
+            return fetch_once(url, cfg)
+        except urllib.error.HTTPError as e:
+            e.close()
+            if e.code not in RETRY_STATUS or wait is None:
+                raise
+            pause = max(wait, min(retry_after(e.headers.get("Retry-After")), RETRY_AFTER_MAX))
+            log("HTTP %d from the proxy, asking again in %ds" % (e.code, pause))
+            sleep(pause)
+
+
+def retry_after(value) -> int:
+    """A Retry-After in seconds; 0 for none or an HTTP date."""
+    try:
+        return max(0, int((value or "").strip()))
+    except ValueError:
+        return 0
+
+
+def fetch_once(url: str, cfg: dict):
     req = urllib.request.Request(url, headers={
         "User-Agent": cfg["ua"],
         "Accept": "text/html,application/xhtml+xml",

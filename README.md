@@ -170,7 +170,10 @@ that its selector matched nothing). Like `srr-tts`, the step never exits non-zer
 fetch path (drr would drop the article for good): any failure, a typo'd or 1.x flag
 (`--selector`, `--drop`) included, is logged to stderr and the item passes through
 unchanged. A manual run (an http(s) URL argument) reports failures with a non-zero exit.
-`--timeout` (30 s) bounds the proxy request, `--ua` sets its User-Agent.
+A busy proxy (HTTP 429 or 503; it rate-limits an address that asks too often) is asked
+again after 15, 45 and 90 s, or after its longer `Retry-After` (up to 90 s), so one run stays
+minutes under drr's `cmd-timeout`. `--timeout` (30 s) bounds each proxy request, `--ua` sets
+its User-Agent.
 
 ### `srr-tts`
 

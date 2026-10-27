@@ -171,6 +171,75 @@ except ValueError:
     check_true("run_item: an empty page raises", True)
 mod.fetch = real_fetch
 
+# --- fetch: a busy proxy is asked again --------------------------------------
+
+import http.server
+import threading
+
+
+class Busy(http.server.BaseHTTPRequestHandler):
+    """Answers 429 (with Retry-After) or 503 `busy` times, then the page."""
+    busy, codes, seen = 0, (429,), []
+
+    def do_GET(self):
+        Busy.seen.append(self.path)
+        if Busy.busy > 0:
+            code = Busy.codes[(len(Busy.seen) - 1) % len(Busy.codes)]
+            Busy.busy -= 1
+            self.send_response(code)
+            if code == 429:
+                self.send_header("Retry-After", "30")
+            self.end_headers()
+            return
+        body = PAGE.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Busy)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = "http://127.0.0.1:%d/p" % srv.server_address[1]
+waits = []
+real_sleep = mod.sleep
+mod.sleep = waits.append
+cfg, _, _ = mod.parse_argv([])
+
+Busy.busy, Busy.codes, Busy.seen = 2, (429, 503), []
+body, charset = mod.fetch(base, cfg)
+check("fetch: a 429 and a 503 are asked again, then the page", (len(Busy.seen), charset), (3, "utf-8"))
+check("fetch: waits the schedule, a longer Retry-After instead", waits, [30, mod.RETRY_WAITS[1]])
+check_true("fetch: the page after the retries", b"reviewBody" in body)
+
+waits.clear()
+Busy.busy, Busy.codes, Busy.seen = 99, (429,), []
+try:
+    mod.fetch(base, cfg)
+    check_true("fetch: a proxy busy past the schedule raises", False)
+except OSError as e:
+    check_true("fetch: a proxy busy past the schedule raises", "429" in str(e), e)
+check("fetch: one try per wait, plus the first", len(Busy.seen), len(mod.RETRY_WAITS) + 1)
+# The longest run: every wait stretched to RETRY_AFTER_MAX and every request
+# at its timeout, against drr's cmd-timeout of 10 minutes.
+longest = (sum(max(w, mod.RETRY_AFTER_MAX) for w in mod.RETRY_WAITS)
+           + (len(mod.RETRY_WAITS) + 1) * mod.DEFAULT_TIMEOUT)
+check_true("fetch: the longest run stays minutes under drr's cmd-timeout", longest <= 7 * 60, longest)
+
+waits.clear()
+Busy.busy, Busy.codes, Busy.seen = 1, (404,), []
+try:
+    mod.fetch(base, cfg)
+    check_true("fetch: another status is not asked again", False)
+except OSError:
+    check("fetch: another status is not asked again", (len(Busy.seen), waits), (1, []))
+mod.sleep = real_sleep
+srv.shutdown()
+
 # --- parse_argv --------------------------------------------------------------
 
 check_true("parse: --selector is gone (drr's #readability picks the body)",
@@ -210,7 +279,7 @@ check("protocol: bad JSON exits 0 with nothing on stdout", (p.returncode, p.stdo
 p = run(["--help"], ITEM)
 check_true("protocol: --help on stderr only", p.stdout == "" and "KNOBS" in p.stderr)
 p = run(["--version"], ITEM)
-check("protocol: --version on stderr only", (p.stdout, p.stderr.split()[:2]), ("", ["srr-gtproxy", "2.0"]))
+check("protocol: --version on stderr only", (p.stdout, p.stderr.split()[:2]), ("", ["srr-gtproxy", "2.1"]))
 p = run(["http://example.com/a"], "")
 check_true("manual: a failure exits non-zero", p.returncode != 0 and "https" in p.stderr, p.stderr)
 
