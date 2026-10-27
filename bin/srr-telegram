@@ -57,6 +57,12 @@ Preview without deploying (media is NOT downloaded in preview — placeholders s
 
 WEB (NO-ACCOUNT) MODE — `--no-auth`
 -----------------------------------
+Account mode renders a post's text with its entities (message_to_html): links
+hidden behind text, bold, italic, underline, strike, code, pre and blockquote
+are kept; spoilers, custom emoji and mentions are plain text. A poll becomes
+its question plus a list of options (with vote shares when the message has
+results). Titles and guids come from the plain text, as before.
+
 Public channels need no account: with --no-auth, srr-telegram scrapes the
 channel's public web preview instead. No credentials, no setup:
 
@@ -145,7 +151,7 @@ try:
 except ModuleNotFoundError:
     bs4 = BeautifulSoup = None   # only web (no-account) mode needs it
 
-VERSION = "1.7"
+VERSION = "1.8"
 
 
 # --- config -----------------------------------------------------------------
@@ -303,17 +309,153 @@ def linkify_escape(text):
     return "".join(out)
 
 
-def text_to_html(text):
-    # Telegram separates paragraphs with a blank line (\n\n) and uses a lone \n
-    # as a soft line break. Map each paragraph to its own <p> and only soft
-    # breaks to a single <br>, so blank lines never become duplicated <br><br>.
+def paragraphs(inline_html):
+    """Inline HTML -> <p> paragraphs. Telegram separates paragraphs with a blank
+    line (\n\n) and uses a lone \n as a soft line break. Map each paragraph to
+    its own <p> and only soft breaks to a single <br>, so blank lines never
+    become duplicated <br><br>."""
     parts = []
-    for para in PARA_SPLIT_RE.split((text or "").strip()):
+    for para in PARA_SPLIT_RE.split((inline_html or "").strip()):
         para = para.strip()
         if not para:
             continue
-        parts.append("<p>%s</p>" % linkify_escape(para).replace("\n", "<br>"))
+        parts.append("<p>%s</p>" % para.replace("\n", "<br>"))
     return "".join(parts)
+
+
+def text_to_html(text):
+    return paragraphs(linkify_escape((text or "").strip()))
+
+
+SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]*:", re.I)
+SAFE_HREF_RE = re.compile(r"^(?:https?:|mailto:|tel:)", re.I)
+INLINE_TAGS = (          # outer to inner; the order only fixes the nesting
+    (types.MessageEntityBold, "strong"),
+    (types.MessageEntityItalic, "em"),
+    (types.MessageEntityUnderline, "u"),
+    (types.MessageEntityStrike, "del"),
+    (types.MessageEntityCode, "code"),
+)
+
+
+def entity_href(ent, visible):
+    """The href a link-like entity stands for, or None (not a link, or a scheme
+    #sanitize would drop anyway: tg://, javascript:, ...)."""
+    if isinstance(ent, types.MessageEntityTextUrl):
+        href = (ent.url or "").strip()
+    elif isinstance(ent, types.MessageEntityUrl):
+        href = visible.strip()
+        if href and not SCHEME_RE.match(href):
+            href = "https://" + href
+    elif isinstance(ent, types.MessageEntityEmail):
+        href = "mailto:" + visible.strip()
+    else:
+        return None
+    return href if SAFE_HREF_RE.match(href) else None
+
+
+def _u16(buf, a, b):
+    return buf[2 * a:2 * b].decode("utf-16-le", "replace")
+
+
+def _inline_html(buf, lo, hi, ents):
+    """Render UTF-16 units [lo, hi) of buf with the inline entities (a list of
+    (start, end, entity) in units). The range is cut at every entity boundary
+    and each piece is wrapped on its own, so overlapping entities still nest
+    and newlines never sit inside a tag (paragraph splitting stays valid)."""
+    cuts = {lo, hi}
+    for s, e, _ in ents:
+        cuts.update((min(max(s, lo), hi), min(max(e, lo), hi)))
+    cuts = sorted(cuts)
+    out = []
+    for a, b in zip(cuts, cuts[1:]):
+        if a == b:
+            continue
+        active = [x for x in ents if x[0] <= a and b <= x[1]]
+        href = None
+        for s, e, ent in active:
+            href = href or entity_href(ent, _u16(buf, s, e))
+        tags = [t for cls, t in INLINE_TAGS if any(isinstance(x[2], cls) for x in active)]
+        for piece in re.split(r"(\n)", _u16(buf, a, b)):
+            if not piece.strip():
+                out.append(piece)
+                continue
+            h = htmllib.escape(piece) if href else linkify_escape(piece)
+            for t in reversed(tags):
+                h = "<%s>%s</%s>" % (t, h, t)
+            if href:
+                h = '<a href="%s">%s</a>' % (htmllib.escape(href, quote=True), h)
+            out.append(h)
+    return "".join(out)
+
+
+def message_to_html(text, entities):
+    """A message's text plus its entities -> clean HTML that survives #sanitize.
+
+    Keeps hidden links (TextUrl), URL/email entities, bold, italic, underline,
+    strike, code, pre and blockquote. Spoilers, custom emoji, mentions, hashtags
+    and links with a scheme #sanitize would drop stay plain text. No entities:
+    the plain-text path (bare URLs linkified)."""
+    text = text or ""
+    if not entities:
+        return text_to_html(text)
+    buf = text.encode("utf-16-le", "surrogatepass")
+    n = len(buf) // 2
+    spans = []
+    for ent in entities:
+        s = max(int(ent.offset), 0)
+        e = min(int(ent.offset) + int(ent.length), n)
+        if e > s:
+            spans.append((s, e, ent))
+    blocks, inline, last = [], [], 0
+    for s, e, ent in sorted(spans, key=lambda x: (x[0], -x[1])):
+        if isinstance(ent, (types.MessageEntityPre, types.MessageEntityBlockquote)):
+            if s >= last:                       # blocks never nest; skip a clash
+                blocks.append((s, e, ent))
+                last = e
+        else:
+            inline.append((s, e, ent))
+    out, pos = [], 0
+    for s, e, ent in blocks + [(n, n, None)]:
+        if s > pos:
+            out.append(paragraphs(_inline_html(buf, pos, s, inline)))
+        if isinstance(ent, types.MessageEntityPre):
+            code = _u16(buf, s, e).strip("\n")
+            if code.strip():
+                out.append("<pre><code>%s</code></pre>" % htmllib.escape(code))
+        elif ent is not None:
+            quote = paragraphs(_inline_html(buf, s, e, inline))
+            if quote:
+                out.append("<blockquote>%s</blockquote>" % quote)
+        pos = e
+    return "".join(out)
+
+
+def poll_html(msg):
+    """A poll message -> its question as a paragraph and the options as a <ul>,
+    each with its vote share when the message carries results. Else ''."""
+    media = getattr(msg, "poll", None)
+    if media is None or getattr(media, "poll", None) is None:
+        return ""
+
+    def plain(x):                       # TextWithEntities (new layers) or str
+        return getattr(x, "text", x) or ""
+
+    poll = media.poll
+    results = getattr(media, "results", None)
+    votes = {}
+    for r in (getattr(results, "results", None) or []):
+        votes[bytes(r.option)] = r.voters or 0
+    total = getattr(results, "total_voters", None) or sum(votes.values())
+    items = []
+    for a in poll.answers or []:
+        label = htmllib.escape(plain(a.text))
+        if total and bytes(a.option) in votes:
+            label += " (%d%%)" % round(100 * votes[bytes(a.option)] / total)
+        items.append("<li>%s</li>" % label)
+    question = htmllib.escape(plain(poll.question)).strip()
+    return ("<p>%s</p>" % question if question else "") + (
+        "<ul>%s</ul>" % "".join(items) if items else "")
 
 
 def sticker_thumb(msg):
@@ -564,7 +706,8 @@ async def _poll(session, api_id, api_hash, req, asset_dir, max_media, cursor):
         for g in groups:
             gm = g["msgs"]
             first = gm[0]
-            caption = next((m.message for m in gm if m.message), "")
+            cm = next((m for m in gm if m.message), None)
+            caption = cm.message if cm else ""
             parts = []
             for m in gm:
                 el = await media_element(client, m, entity.id, asset_dir,
@@ -572,8 +715,9 @@ async def _poll(session, api_id, api_hash, req, asset_dir, max_media, cursor):
                 if el:
                     parts.append(el)
                 max_id = max(max_id, m.id)
-            body = text_to_html(caption)
-            content = "".join(parts) + body
+            body = message_to_html(caption, cm.entities if cm else None)
+            polls = "".join(poll_html(m) for m in gm)
+            content = "".join(parts) + body + polls
             if not content.strip():
                 content = "<p><em>(no content)</em></p>"
             date_iso = first.date.isoformat()
