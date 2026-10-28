@@ -223,9 +223,31 @@ check("minified: serialized with every end tag in place, nothing trailing",
 check("minified: 3000 unclosed paragraphs walk flat (no RecursionError)",
       len(tts.segment_html("<p>x" * 3000)[1]), 3000)
 
-check("fragment_html keeps a leading <style> in place (html5lib's head)",
+# Standards mode, as the backend parses: a <table> closes an open <p>. In
+# quirks mode (html5lib without a doctype) the table nested inside the <p>,
+# and the backend's re-parse turned the trailing </p> into an empty <p>.
+soup, segs = tts.segment_html(
+    "<p>text<table><tr><td>cell</td></tr></table><p>after")
+check("minified: a table closes an open paragraph (standards mode)",
+      [(e.name, t) for e, t in segs],
+      [("p", "text"), ("td", "cell"), ("p", "after")])
+check("minified: the table is serialized after the paragraph, not in it",
+      tts.fragment_html(soup),
+      "<p>text</p><table><tbody><tr><td>cell</td></tr></tbody></table>"
+      "<p>after</p>")
+
+# The fragment is parsed inside <body> from its first byte, as the backend
+# parses it: what comes first never goes to a <head>.
+check("fragment_html keeps a leading <style> in place",
       tts.fragment_html(tts.segment_html("<style>p{}</style><p>a</p>")[0]),
       "<style>p{}</style><p>a</p>")
+check("fragment_html keeps a leading <noscript> fallback whole",
+      tts.fragment_html(tts.segment_html(
+          '<noscript><img src="x.jpg"></noscript><p>a</p>')[0]),
+      '<noscript><img src="x.jpg"/></noscript><p>a</p>')
+check("fragment_html keeps a leading comment",
+      tts.fragment_html(tts.segment_html("<!--c--><p>a</p>")[0]),
+      "<!--c--><p>a</p>")
 check("fragment_html drops a doctype, which is not content",
       tts.fragment_html(tts.segment_html("<!DOCTYPE html><p>a</p>")[0]),
       "<p>a</p>")

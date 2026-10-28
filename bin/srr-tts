@@ -131,7 +131,7 @@ import wave
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString, PreformattedString, Tag
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 DEFAULT_MAX_CHARS = 32_768  # roomy backstop, not timeout-proof: an article
 # filling it outruns the default --cmd-timeout on the fetch-loop box class
@@ -233,7 +233,11 @@ def segment_html(fragment: str):
     optional end tags a minifier leaves out (drr's #minify drops </p> and
     </li>) nested every paragraph inside the one before and wrote all their
     </p> at the end, which the backend's re-parse stored as one empty <p>
-    each.
+    each. The parse also runs in the backend's conditions: in standards mode
+    (the doctype; without one html5lib takes quirks mode, where a <table>
+    does not close an open <p>, so a minified <p>text<table> came back with
+    a stray </p>) and inside <body> from the first byte (so a leading
+    <style>, <noscript> or comment stays where it is, not in a <head>).
 
     The returned soup is PRISTINE: the walker only READS it, never mutates
     it (no decompose, no replace_with). run_item re-serializes this same
@@ -241,7 +245,8 @@ def segment_html(fragment: str):
     walker skips for narration purposes — a <br>, a DROP_TAGS subtree — must
     still be there in the output: <br> as itself, not a literal newline;
     <video>/<audio> players intact, not gone."""
-    soup = BeautifulSoup(fragment or "", "html5lib")
+    soup = BeautifulSoup("<!DOCTYPE html><body>" + (fragment or ""),
+                         "html5lib")
     segs = [[None, []]]  # [owning element or None, text parts]
 
     # Recurses one Python frame per nesting level (unlike the old iterative
@@ -278,13 +283,10 @@ def segment_html(fragment: str):
 
 
 def fragment_html(soup) -> str:
-    """segment_html's soup -> the fragment it parsed, as HTML. html5lib builds
-    a whole document, so the fragment is head's contents (whatever came
-    before the first body content, e.g. a leading <style>) followed by
-    body's, in their order. A doctype and comments outside <html> are
-    dropped: neither is article content."""
-    return "".join(part.decode_contents()
-                   for part in (soup.head, soup.body) if part is not None)
+    """segment_html's soup -> the fragment it parsed, as HTML: the contents of
+    the <body> it was parsed in. A doctype or an <html>, <head> or <body> tag
+    inside the fragment is dropped, as in the backend's parse."""
+    return soup.body.decode_contents()
 
 
 def html_to_text(fragment: str) -> str:
